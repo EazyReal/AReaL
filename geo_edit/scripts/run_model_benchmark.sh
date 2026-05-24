@@ -62,7 +62,7 @@ JUDGE_API_BASE="${JUDGE_API_BASE:-}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-}"
 OUTPUT_ROOT="/storage/openpsi/data/lcy_image_edit/eval_results"
 EVAL_OUTPUT_ROOT="/storage/openpsi/data/lcy_image_edit/eval_output"
-ALL_DATASETS="visual_probe_easy visual_probe_medium visual_probe_hard map_trace reason_map reason_map_plus mapqa"
+ALL_DATASETS="visual_probe_easy visual_probe_medium visual_probe_hard map_trace reason_map reason_map_plus mapqa omnispatial"
 DATASETS=""
 
 # ── Parse args ────────────────────────────────────────────────────────────────
@@ -108,6 +108,7 @@ declare -A DATASET_PATHS=(
     ["reason_map"]="/storage/openpsi/data/ReasonMap/reasonmap_base_validation_dataset.parquet"
     ["reason_map_plus"]="/storage/openpsi/data/ReasonMap_plus/reasonmap_plus_test.parquet"
     ["mapqa"]="/storage/openpsi/data/lcy_image_edit/MapQA_all/mapqa_test_0418.parquet"
+    ["omnispatial"]="/storage/openpsi/data/lcy_image_edit/OmniSpatial/omnispatial.parquet"
 )
 
 declare -A DATASET_EVAL_NAMES=(
@@ -118,6 +119,7 @@ declare -A DATASET_EVAL_NAMES=(
     ["reason_map"]="reason_map"
     ["reason_map_plus"]="reason_map_plus"
     ["mapqa"]="mm_mapqa"
+    ["omnispatial"]="omnispatial"
 )
 
 # map_trace uses NDTW scoring, no LLM judge needed

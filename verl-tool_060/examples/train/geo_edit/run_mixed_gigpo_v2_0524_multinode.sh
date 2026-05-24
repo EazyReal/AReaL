@@ -2,11 +2,19 @@
 set -x
 
 # ============================================================
-# Multi-node (4×8 GPU) second-stage training for geo_edit
-# Requires an existing Ray cluster spanning all 4 nodes.
+# Multi-node (4×8 GPU) v2-0524 GiGPO training for geo_edit.
+#
+# Differences vs run_mixed_gigpo_v2_0420_multinode.sh:
+#   * train_data: full ReasonMap (RL+SFT) + v2 visual_probe/map_trace/deep_eyes
+#                 + ALL OmniSpatial train.   MapQA dropped.
+#   * val_data:   ReasonMap test 10% + new_val (vp/map_trace) + 1/10 stratified
+#                 OmniSpatial test.   MapQA dropped.
+#   * run_name:   mixed-gigpo-v2-0524
+#
+# Required Ray cluster: 4 nodes (8 GPU each, total 32 GPU).
 #
 # Environment variables:
-#   WORKSPACE        – default: /storage/openpsi/data/reasonmap_rl
+#   WORKSPACE        – default: /storage/openpsi/data/lcy_image_edit/mixed_rl_v2
 #   MODEL_PATH       – path to SFT checkpoint
 #   TOOL_SERVER_URL  – tool server URL (must be reachable from all nodes)
 #   TOOL_SERVER_IP   – tool server IP (port defaults to 30888)
@@ -14,18 +22,16 @@ set -x
 #   WANDB_API_KEY / WANDB_BASE_URL – wandb config
 # ============================================================
 
-WORKSPACE=${WORKSPACE:-/storage/openpsi/data/lcy_image_edit/mixed_rl}
+WORKSPACE=${WORKSPACE:-/storage/openpsi/data/lcy_image_edit/mixed_rl_v2}
 model_name=${MODEL_PATH:-/storage/openpsi/models/lcy_image_edit/sft_workspace/qwen3vl8b-thinking-5ds-v2-0419-ct65536/checkpoint-280}
 
-train_data="[/storage/openpsi/data/reasonmap_rl/combined_train_rl_only.parquet,$WORKSPACE/new_train.parquet]"
-val_data="[/storage/openpsi/data/reasonmap_rl/combined_test_10pct.parquet,$WORKSPACE/new_val.parquet,$WORKSPACE/mapqa_val_200.parquet]"
-run_name="mixed-gigpo-sim0_5"
-# run_name=mixed-gigpo-4B-4nodev2_0427
+train_data="[$WORKSPACE/train_v2_0524.parquet]"
+val_data="[$WORKSPACE/val_v2_0524.parquet]"
+run_name="mixed-gigpo-v2-0524"
 rl_alg=gigpo
 gigpo_sim_threshold=0.5
 # ---- Cluster topology ----
 n_gpus_per_node=8
-# n_nodes=2
 n_nodes=4
 
 # ---- Batch sizes (scaled for 4 nodes) ----
@@ -34,11 +40,11 @@ batch_size=64
 ppo_mini_batch_size=256
 
 # ---- Sequence lengths ----
-max_prompt_length=16384 
+max_prompt_length=16384
 max_response_length=32768
 max_action_length=4096
 max_obs_length=8192
-max_obs_length_image=8192 
+max_obs_length_image=8192
 max_obs_length_text=6144
 ppo_max_token_len_per_gpu=$(expr $max_prompt_length + $max_response_length)
 

@@ -285,8 +285,22 @@ def _compute_cartomapqa_score(prediction: str, ground_truth, data_source: str) -
     return compute_score(prediction, ground_truth)
 
 
-def _compute_map_trace_score(response: str, ground_truth, lo: float = 0.3, hi: float = 0.8) -> tuple[float, float]:
-    """MapTrace: linear reward based on NDTW distance. Returns (score, ndtw)."""
+def _compute_map_trace_score(
+    response: str,
+    ground_truth,
+    lo: float = 0.5,
+    hi: float = 1.0,
+    right_edge: float = 0.5,
+) -> tuple[float, float]:
+    """MapTrace: piecewise-linear reward in NDTW with hard cliff at ``hi``.
+
+    NDTW is the cumulative DTW cost (lower=better, range [0, inf)).
+
+      ndtw <= lo                    -> reward = 1.0
+      lo  <  ndtw <= hi             -> reward linearly interpolates from 1.0 down to ``right_edge``
+      ndtw >  hi                    -> reward = 0.0          (hard cliff from ``right_edge`` to 0)
+      parse failure / not_success   -> reward = 0.0
+    """
     from geo_edit.evaluation.map_trace_verifier import map_trace_score
 
     try:
@@ -297,9 +311,9 @@ def _compute_map_trace_score(response: str, ground_truth, lo: float = 0.3, hi: f
         return 0.0, -1.0
     if ndtw <= lo:
         return 1.0, ndtw
-    if ndtw >= hi:
+    if ndtw > hi:
         return 0.0, ndtw
-    return (hi - ndtw) / (hi - lo), ndtw
+    return right_edge + (1.0 - right_edge) * (hi - ndtw) / (hi - lo), ndtw
 
 
 def _compute_repetition_penalty(text: str, num_turns: int = 2) -> float:

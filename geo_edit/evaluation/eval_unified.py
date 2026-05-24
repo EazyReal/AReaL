@@ -41,6 +41,7 @@ SUPPORTED_DATASETS = [
     "visual_probe", "map_trace", "reason_map", "reason_map_plus", "mm_mapqa",
     "o3_bench", "3dsrbench",
     "visworld_eval", "babyvision", "vstar_bench", "mapeval_visual",
+    "omnispatial",
 ]
 
 
@@ -212,6 +213,15 @@ def evaluate_record(record: dict, record_id: str, dataset_name: str) -> dict:
         )
         return result
 
+    if dataset_name == "omnispatial":
+        # MCQ A/B/C/D - generic comparison + carry category for breakdown
+        result["score"] = _rule_score_generic(prediction, ground_truth)
+        result["category"] = (
+            record.get("category", "")
+            or record.get("meta_info_extra", {}).get("category", "")
+        )
+        return result
+
     if dataset_name == "babyvision":
         # Mixed MCQ (choice A/B/C/D) + free-form blank (e.g. "(4,7)")
         result["score"] = _rule_score_generic(prediction, ground_truth)
@@ -350,7 +360,7 @@ def main():
             s = qtype_stats[qt]
             lines.append(f"  {qt}: {s['correct']}/{s['n']} ({s['correct']/s['n']:.4f})" if s["n"] else f"  {qt}: 0/0")
 
-    if args.dataset_name in ("3dsrbench", "babyvision", "visworld_eval"):
+    if args.dataset_name in ("3dsrbench", "babyvision", "visworld_eval", "omnispatial"):
         cat_stats = defaultdict(lambda: {"n": 0, "correct": 0})
         for r in all_results:
             c = r.get("category", "unknown") or "unknown"
