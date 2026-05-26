@@ -23,11 +23,11 @@ set -x
 # ============================================================
 
 WORKSPACE=${WORKSPACE:-/storage/openpsi/data/lcy_image_edit/mixed_rl_v2}
-model_name=${MODEL_PATH:-/storage/openpsi/models/lcy_image_edit/sft_workspace/qwen3vl8b-thinking-5ds-v3-0520-ct65536-lr1e5}
+model_name=${MODEL_PATH:-/storage/openpsi/models/lcy_image_edit/sft_workspace/qwen3vl8b-thinking-5ds-v4-0526-ct65536-lr1e5}
 
 train_data="[$WORKSPACE/train_v2_0524.parquet]"
 val_data="[$WORKSPACE/val_v2_0524.parquet]"
-run_name="mixed-gigpo-v2-0524"
+run_name="mixed-atgigpo-v2-0526"
 rl_alg=gigpo
 gigpo_sim_threshold=0.9
 # ---- Cluster topology ----
@@ -63,7 +63,7 @@ reward_manager=geo_vision_qa
 
 # ---- Training ----
 strategy="fsdp2"
-lr=1e-6
+lr=7e-7
 kl_loss_coef=0.001
 kl_coef=0.0
 entropy_coeff=0
@@ -235,7 +235,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=mixed_rl \
     trainer.experiment_name=$run_name \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=$WORKSPACE/checkpoints/$run_name \
     trainer.n_gpus_per_node=$n_gpus_per_node \

@@ -1,10 +1,8 @@
-import math
 from collections import defaultdict
 from collections.abc import Sized
 
 import numpy as np
 from omegaconf import DictConfig
-
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 
@@ -85,7 +83,8 @@ class ATGiGPOSampler(AbstractCurriculumSampler):
         return result
 
     def __iter__(self):
-        # Allocate counts proportionally, rounding via largest-remainder
+        # MUST yield a full epoch of indices (not just one batch); DataLoader
+        # slices the stream into batches. Yielding one batch -> len(dataloader)=1.
         raw = {t: self.proportions[t] * self.batch_size for t in self.task_types}
         counts = {t: int(v) for t, v in raw.items()}
         remainder = self.batch_size - sum(counts.values())
@@ -94,16 +93,18 @@ class ATGiGPOSampler(AbstractCurriculumSampler):
             for t in by_frac[:remainder]:
                 counts[t] += 1
 
-        indices: list[int] = []
-        for task in self.task_types:
-            if counts[task] > 0:
-                indices.extend(self._draw_from_pool(task, counts[task]))
-
-        self._rng.shuffle(indices)
-        return iter(indices)
+        n_steps = max(1, len(self.data_source) // self.batch_size)
+        for _ in range(n_steps):
+            step_indices: list[int] = []
+            for task in self.task_types:
+                if counts[task] > 0:
+                    step_indices.extend(self._draw_from_pool(task, counts[task]))
+            self._rng.shuffle(step_indices)
+            yield from step_indices
 
     def __len__(self):
-        return self.batch_size
+        # MUST match the count yielded by __iter__ (drop_last=True semantics).
+        return (len(self.data_source) // self.batch_size) * self.batch_size
 
     # ------------------------------------------------------------------
     # Metrics
