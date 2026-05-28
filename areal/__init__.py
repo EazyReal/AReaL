@@ -5,18 +5,6 @@
 from .version import __version__  # noqa
 
 
-# Heavy submodules (infra, trainer) are loaded lazily via PEP 562
-# ``__getattr__`` so that ``import areal`` stays light. This is the load-
-# bearing precondition for the ``areal`` console-script's lightness
-# invariant (see ``tests/experimental/test_cli_lightness.py``): importing
-# ``areal.experimental.cli.main`` transitively runs ``areal/__init__.py``,
-# and if any eager top-level import here pulled in torch / ray / megatron
-# / fastapi, the CLI could no longer be installed on a login node without
-# the training stack.
-#
-# Backwards-compat: ``areal.RolloutController`` etc. still work because
-# attribute access triggers ``__getattr__``; only bare ``import areal``
-# changes behavior (now light).
 _INFRA_NAMES = frozenset({
     "RolloutController",
     "StalenessManager",
