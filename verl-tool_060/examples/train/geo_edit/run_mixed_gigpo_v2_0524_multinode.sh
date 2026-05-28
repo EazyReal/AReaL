@@ -25,8 +25,8 @@ set -x
 WORKSPACE=${WORKSPACE:-/storage/openpsi/data/lcy_image_edit/mixed_rl_v2}
 model_name=${MODEL_PATH:-/storage/openpsi/models/lcy_image_edit/sft_workspace/qwen3vl8b-thinking-5ds-v4-0526-ct65536-lr1e5}
 
-train_data="[$WORKSPACE/train_v2_0524.parquet]"
-val_data="[$WORKSPACE/val_v2_0524.parquet]"
+train_data="[$WORKSPACE/train_v2_0528.parquet]"
+val_data="[$WORKSPACE/val_origimg_with_omnispatial.parquet]"
 run_name="mixed-atgigpo-v2-0526"
 rl_alg=gigpo
 gigpo_sim_threshold=0.9
@@ -163,7 +163,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     data.truncation='right' \
     data.shuffle=True \
     reward_model.reward_manager=$reward_manager \
-    +reward_model.disable_sentence_rep_penalty=True \
     actor_rollout_ref.model.path=$model_name \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=$lr \
@@ -235,7 +234,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name=mixed_rl \
     trainer.experiment_name=$run_name \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=$WORKSPACE/checkpoints/$run_name \
     trainer.n_gpus_per_node=$n_gpus_per_node \

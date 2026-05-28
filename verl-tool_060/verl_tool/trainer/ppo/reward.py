@@ -144,6 +144,7 @@ def load_reward_manager(
 
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
+        config=config.reward_model,
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
