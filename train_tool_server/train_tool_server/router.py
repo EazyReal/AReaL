@@ -231,16 +231,11 @@ TOOL_TYPE_FUNCTIONS = {
         "text_ocr", "table_ocr", "formula_ocr", "chart_text_ocr",
         "text_spotting", "seal_ocr", "map_text_ocr",
     ],
-    "geo_chartr1": [
-        "chart_reasoning", "chart_data_extract", "chart_trend_analysis",
-    ],
     "geo_sam3": [
         "auto_segment", "bbox_segment", "text_segment",
         "exemplar_segment", "concept_count", "presence_check",
     ],
     "geo_grounding_dino": ["grounding_dino"],
-    "geo_multimath": ["math_latex_ocr", "math_image_describe"],
-    "geo_gllava": ["gllava"],
 }
 
 

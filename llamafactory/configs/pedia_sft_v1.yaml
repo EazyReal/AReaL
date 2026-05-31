@@ -2,7 +2,7 @@
 # Trained model + checkpoint exported under pedia_model/pedia_8b_SFT_v1/.
 # Dataset (train.json + dataset_info.json + indexed images/) lives under pedia_data.
 
-model_name_or_path: /storage/openpsi/models/Qwen3-VL-8B-Thinking
+model_name_or_path: ./pedia_model/Qwen3-VL-8B-Thinking
 image_max_pixels: 6291456
 video_max_pixels: 16384
 trust_remote_code: true
@@ -14,14 +14,14 @@ freeze_vision_tower: true
 freeze_multi_modal_projector: true
 freeze_language_model: false
 
-dataset_dir: /storage/openpsi/data/lcy_image_edit/pedia_data/pedia_sft_v1
+dataset_dir: ./pedia_data/pedia_sft_v1
 dataset: pedia_sft_v1
 template: qwen3_vl
 cutoff_len: 65536
 preprocessing_num_workers: 32
 dataloader_num_workers: 32
 
-output_dir: /storage/openpsi/data/lcy_image_edit/pedia_model/pedia_8b_SFT_v1
+output_dir: ./pedia_model/pedia_8b_SFT_v1
 logging_steps: 10
 plot_loss: true
 overwrite_output_dir: true

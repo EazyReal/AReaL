@@ -79,9 +79,9 @@ Defaults assume these paths on the host filesystem:
 
 | Tool | Path |
 |---|---|
-| geo_paddleocr | `/storage/openpsi/models/PaddleOCR-VL-1.5` |
-| geo_sam3 | `/storage/openpsi/models/sam3.1/sam3.1_multiplex.pt` |
-| geo_grounding_dino | `/storage/openpsi/models/grounding-dino-base` |
+| geo_paddleocr | `./pedia_model/PaddleOCR-VL-1.5` |
+| geo_sam3 | `./pedia_model/sam3.1/sam3.1_multiplex.pt` |
+| geo_grounding_dino | `./pedia_model/grounding-dino-base` |
 
 Edit `geo_edit/tool_definitions/agents/{paddleocr_tool,sam3,grounding_dino}.py` to
 change.

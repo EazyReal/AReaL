@@ -38,13 +38,17 @@ with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
 # =============================================================================
 
 TOOL_CATEGORIES = {
-    "general": ["image_crop", "image_label", "draw_line", "draw_path", "bounding_box", "image_highlight", "text_ocr", "auto_segment", "bbox_segment", "text_segment", "exemplar_segment", "concept_count", "presence_check", "grounding_dino","draw_path"],
-    "math": ["math_latex_ocr", "math_image_describe", "formula_ocr", "gllava", "multimath"],
+    "general": [
+        "image_crop", "image_label", "draw_line", "draw_path",
+        "bounding_box", "image_highlight",
+        "text_ocr", "auto_segment", "bbox_segment", "text_segment",
+        "exemplar_segment", "concept_count", "presence_check", "grounding_dino",
+    ],
+    "math": ["formula_ocr"],
     "table": ["table_ocr"],
-    "chart": ["chart_reasoning", "chart_data_extract", "chart_trend_analysis", "chart_text_ocr", "chartr1"],
+    "chart": ["chart_text_ocr"],
     "map": ["text_spotting", "map_text_ocr"],
     "document": ["seal_ocr"],
-    "reasoning": ["visual_reasoning"],
 }
 
 

@@ -17,14 +17,14 @@ SYSTEM_PROMPT = ""
 
 # Model configuration
 agent_config = {
-    "model_name_or_path": "/storage/openpsi/models/PaddleOCR-VL-1.5",
+    "model_name_or_path": "./pedia_model/PaddleOCR-VL-1.5",
     "max_model_len": 8192,
     "gpu_memory_utilization": 0.8,
     "temperature": 0.1,
     "max_tokens": 4096,
     "num_gpus": 1,
     "tensor_parallel_size": 1,  # Number of GPUs for tensor parallelism
-    "num_replicas": 6, 
+    "num_replicas": 2, 
 }
 
 
@@ -461,7 +461,7 @@ DECLARATIONS = {
     },
     "chart_text_ocr": {
         "name": "chart_text_ocr",
-        "description": "Chart text extraction tool. Recognizes and extracts text elements from charts and diagrams including labels, values, legends, and axis titles. Best for: bar charts, line graphs, pie charts.",
+        "description": "Chart text recognition tool. Extracts axis labels, legends, tick values, and annotations from charts/plots. Best for: bar charts, line plots, scatter plots, statistical graphics.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -493,7 +493,7 @@ DECLARATIONS = {
     },
     "seal_ocr": {
         "name": "seal_ocr",
-        "description": "Seal and stamp recognition tool. Specialized for recognizing text from official seals, stamps, and signatures. Best for: official documents, certificates, contracts with seals.",
+        "description": "Seal / stamp text recognition tool. Extracts text from circular or oval official seals and stamps, including curved layouts that ordinary OCR mis-reads. Best for: government / corporate documents, contracts, certificates.",
         "parameters": {
             "type": "object",
             "properties": {

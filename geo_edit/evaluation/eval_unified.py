@@ -287,7 +287,13 @@ def run_llm_judge(judge, results: list[dict], records_map: dict) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="Unified evaluation for all datasets.")
-    parser.add_argument("--dataset_name", type=str, required=True, choices=SUPPORTED_DATASETS)
+    parser.add_argument(
+        "--dataset", type=str, default=None,
+        help="Dataset id (auto-resolves eval template via "
+             "geo_edit.eval_datasets.DATASET_REGISTRY). If omitted, --dataset_name required.",
+    )
+    parser.add_argument("--dataset_name", type=str, default=None, choices=SUPPORTED_DATASETS,
+                        help="Eval template name (override).")
     parser.add_argument("--result_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--use_judge", action="store_true")
@@ -295,6 +301,12 @@ def main():
     parser.add_argument("--judge_api_key", type=str, default=None)
     parser.add_argument("--judge_api_base", type=str, default=None)
     args = parser.parse_args()
+
+    if args.dataset and not args.dataset_name:
+        from geo_edit.eval_datasets import resolve_dataset
+        _, args.dataset_name = resolve_dataset(args.dataset)
+    if not args.dataset_name:
+        parser.error("Either --dataset or --dataset_name must be provided.")
 
     os.makedirs(args.output_path, exist_ok=True)
 

@@ -1,0 +1,99 @@
+# verl-tool RL training environment.
+#
+#                  (provides torch 2.8.0 + CUDA 12.8 + Python 3.12 baseline)
+#
+# === One-step install (run from this repo root) ===
+#   cd verl-tool
+#
+#   # MUST unset BEFORE starting Ray — Ray workers inherit and crash with:
+#   # "ValueError: Please don't set ROCR_VISIBLE_DEVICES when HIP/CUDA_VISIBLE_DEVICES is set."
+#   unset ROCR_VISIBLE_DEVICES
+#
+#   # flash-attn is built from source against torch 2.8 (ABI lock).
+#   # The two env vars below cap parallel ninja jobs and threads inside
+#   # each nvcc call. Build is ~30 min on a 192-CPU node WITHOUT these,
+#   # ~10-15 min WITH them.
+#   # (TORCH_CUDA_ARCH_LIST is ignored by flash-attn setup.py, but listed
+#   # for completeness.)
+#   TORCH_CUDA_ARCH_LIST="8.9" MAX_JOBS=48 NVCC_THREADS=4 \
+#       pip install -r requirements.txt
+#
+# === Verification status (live smoke) ===
+#   ✓ TaskRunner started, 8 WorkerDicts created, actor+critic loaded
+#     to ~87 GB/GPU, reward manager (geo_vision_qa) ready, vLLM rollout
+#     configured, entered "Training Progress: 0/1" loop.
+#   ✗ Failed inside vllm 0.11 mm processing
+#     ("Failed to apply prompt replacement for mm_items['image'][0]") —
+#     a data/model issue (Qwen3-VL prompt tokens vs. vllm 0.11's mm
+#     pattern matcher), NOT an environment issue. Production runs that
+#     feed pre-tokenised prompts avoid it.
+#
+# === DO NOT install (verified incompatible with torch 2.8 baseline) ===
+#   deep_ep           : .so compiled against torch 2.10 — undefined symbol
+#   deep_gemm         : same root cause as deep_ep
+# Both must stay un-installed; if pulled in as transitive deps, uninstall:
+#   pip uninstall -y deep_ep deep_gemm
+
+# === Torch stack — pin so vllm wheel doesn't silently bump ===
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+
+# === Inference / model loaders ===
+# vllm 0.11.0 is the last release whose `vllm.lora.models.LoRAModel` import
+# path matches the one verl-tool/verl/verl/utils/vllm/utils.py uses.
+# vllm 0.17+ moved LoRAModel → vllm.lora.{lora_model,model_manager}.
+vllm==0.11.0
+# Exact transformers commit needed by Qwen3-VL-Thinking; not on PyPI.
+git+https://github.com/huggingface/transformers.git@b3e3c3d
+
+# === Attention backend — built from source (uses MAX_JOBS/NVCC_THREADS env vars above) ===
+--no-build-isolation
+flash-attn==2.7.4.post1
+
+# === RL / training stack ===
+accelerate
+peft
+datasets
+hydra-core
+omegaconf
+codetiming
+dill
+pyarrow
+pylatexenc
+tensordict
+torchdata
+wandb
+deepspeed
+
+# === Distributed orchestration ===
+ray[default]
+
+# === Tool server runtime (sub-process backends launched during training) ===
+fire
+fastapi
+uvicorn
+pydantic
+httpx
+httptools
+colorlog
+pyzmq==26.*
+
+# === Vision / preprocessing ===
+pillow
+timm
+iopath
+ftfy
+qwen_omni_utils
+qwen_vl_utils
+
+# === Misc helpers ===
+nvitop
+regex
+tqdm
+pyyaml
+
+# === Editable installs (vendored verl + this repo + sibling geo_edit) ===
+-e ./verl
+-e .
+-e ../geo_edit/

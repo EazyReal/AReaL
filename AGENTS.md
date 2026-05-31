@@ -1,346 +1,265 @@
-<!-- Think of this file as the go-to brief for AI coding agents working on AReaL. -->
+<!-- Project brief for AI coding agents working on this minimal repo. -->
 
-# AGENTS.md — AReaL Agent Operations Guide
+# AGENTS.md — Pedia Minimal Repo Guide
 
-## TL;DR for coding agents
+## TL;DR
 
-- **Runtime**: Designed for distributed GPU clusters (FSDP/Megatron + distributed
-  communication libraries). Assume containerized execution; no standalone local runs.
-- **Testing**: Integration and performance tests require multi-node hardware. Explain
-  skips explicitly when you cannot access the cluster.
-- **Tooling**: `.pre-commit-config.yaml` runs Ruff (lint+format), mdformat,
-  clang-format, nbstripout, and CLI doc generation; install with `pre-commit install`
-  before submitting patches.
-- **Formatting**: Ruff + Ruff-format replace Black/isort; autoflake settings remain in
-  `pyproject.toml`. Surface any formatting gaps you cannot auto-fix.
-- **Docs**: Source lives under `docs/` (Jupyter Book). Coordinate doc edits with the
-  docs build pipeline.
-- **Legacy code**: `realhf/` is deprecated—do not modify or import from it; migrate uses
-  into `areal/` equivalents instead.
-- **Collaboration**: Before editing code, outline the proposed plan and confirm it with
-  the user.
+Minimal 4-environment workspace for the **PEDIA-8B** RL+tool training & evaluation
+pipeline (paper: *"Perceive, Interact, Reason: Building Tool-Augmented Visual
+Agents for Spatial Reasoning"*). This is a derivative of
+[AReaL](https://github.com/inclusionAI/AReaL) +
+[verl-tool](https://github.com/volcengine/verl) stripped to only what we use.
 
-When unsure, leave a `TODO(agent)` comment and note the constraint in your response.
+- **Runtime**: GPU cluster (L20X 143 GB × 8 per node). Two supported launch
+  modes:
+  - **Conda envs (default going forward)**: one conda env per workspace, all
+    pinned to Python 3.12 + CUDA 12.8. See **Conda-based setup** below.
+  - **Singularity sif (legacy)**: drop into a base sif via
+    `geo_edit/scripts/launch_cantainer.sh`, then `pip install -r requirements.txt`
+    inside. Pass `IMAGE=/path/to/your.sif` to the launcher; the historical base
+    image was `pytorch280-1210-v1.sif`. This mode is being phased out.
+- **State**: paths are expressed relative to the repo root —
+  `./pedia_model/` for weights, `./pedia_data/` for SFT/RL/eval data.
+- **Install**: each env is one `pip install -r requirements.txt` (no setup scripts).
+- **Cluster ops**: start Ray
+  (`verl-tool/examples/train/geo_edit/ray_start_head.sh` + `ray_start_worker.sh`
+  for multinode; embedded in the single-node training script).
 
-## Repository map
+## Conda-based setup (recommended)
 
-- `areal/` — Core Python package housing APIs, controllers, engines, workflows, and
-  shared utilities:
-  - `areal/api/` — Contracts for workflows, engines, schedulers, IO structs, and
-    CLI/config dataclasses.
-  - `areal/controller/` — Distributed batching and controller-side dataset packing
-    helpers.
-  - `areal/core/` — Async orchestration primitives for task runners, remote inference,
-    and workflow execution.
-  - `areal/dataset/` — Stateful dataset loaders and utilities that feed rollout jobs
-    safely.
-  - `areal/engine/` — Training/inference backends (FSDP2, Megatron, PPO actors, remote
-    adapters).
-  - `areal/experimental/` — Prototype engines/workflows that evolve quickly; expect
-    breaking changes.
-  - `areal/launcher/` — Launch specs for local, Ray, and Slurm clusters plus container
-    guidance.
-  - `areal/models/` — Model-specific adapters (Megatron-Core layers, Transformers
-    wrappers, custom heads).
-  - `areal/platforms/` — Hardware/platform abstractions for CPU/GPU/NPU runtimes and
-    device adapters.
-  - `areal/reward/` — Built-in reward functions, math parsers, and helpers (wrap slow
-    logic with AsyncRewardWrapper).
-  - `areal/scheduler/` — Placement and allocation policies aligned with launcher
-    configs.
-  - `areal/tests/` — Focused unit/integration suites (many require GPUs or mocked
-    distributed backends).
-  - `areal/thirdparty/` — Vendored integrations (e.g., vLLM/SGLang shims) kept in-tree.
-  - `areal/tools/` — Developer utilities and maintenance scripts tied to the core
-    package.
-  - `areal/utils/` — Cross-cutting helpers for logging, tensor ops, stats tracking,
-    checkpoints, and recovery.
-  - `areal/workflow/` — Concrete rollout agents (`multi_turn`, `rlvr`, `vision_rlvr`)
-    implementing `RolloutWorkflow`.
-- `assets/` — Figures and other static assets referenced across docs and blogs.
-- `benchmark/` — Regression baselines, benchmark snapshots, and reference metrics (e.g.,
-  `verl_v0_3_0_post1_*`).
-- `blog/` — Release notes and update write-ups documenting project progress.
-- `csrc/` — CUDA/C++ extensions (run `build_ext --inplace` or reinstall editable wheels
-  after edits).
-- `docs/` — Jupyter Book source for https://inclusionai.github.io/AReaL/ plus CLI
-  reference generators.
-- `evaluation/` — Offline scoring pipelines (math, code, Elo) and shared
-  evaluators/utilities.
-- `examples/` — End-to-end wiring scripts for math, RLHF, VLM, multi-turn, search
-  agents, and launcher recipes.
-- `functioncall/` — Tool-calling scaffolding reused by workflows and evaluation
-  harnesses.
-- `notebook/` — Reference notebooks (outputs stripped via pre-commit) for quick
-  experimentation.
-- `patch/` — In-tree patches applied to third-party dependencies (e.g., SGLang
-  hotfixes).
-- `realhf/` — Legacy integrations kept read-only; do **not** modify or import in new
-  code.
-- `recipe/` — Deployment recipes and higher-level orchestration configs per target
-  environment.
+Each workspace is built around an incompatible combination of `torch` / `vllm` /
+`transformers`, so a single shared env is not possible. Use **three** conda
+envs (geo_edit + train_tool_server share one):
 
-## Distributed operations & tooling
+```bash
+# Prerequisites: miniconda installed, CUDA 12.8 driver on host.
+# CUDA toolchain is pulled in as pip wheels via nvidia-* packages in
+# each requirements.txt, so no host-level CUDA toolkit is required.
 
-- **Clusters & containers**: Launch configurations live under `areal/launcher/` (local,
-  Ray, Slurm). Each entrypoint documents the scheduler expectations; reuse those specs
-  instead of inventing ad-hoc run scripts.
-- **Shared images**: Platform-specific container images and startup scripts are defined
-  alongside launcher configs. Reference them or note when they are missing—do not
-  attempt to rebuild CUDA/driver stacks inline.
-- **Secrets & endpoints**: Credentials for remote inference (SGLang, vLLM, Redis, etc.)
-  are managed outside the repo. Flag their absence rather than hardcoding replacements.
-- **Testing limitations**: End-to-end tests (FSDP, Megatron, distributed RPC) require
-  multi-node clusters using distributed communication libraries. If you cannot execute
-  them, state that your validation is limited to static analysis/doc updates.
-- **Formatting & docs**: Pre-commit runs Ruff (lint+format), mdformat, clang-format,
-  nbstripout, and CLI doc generation. Run `pre-commit run --all-files` (or install the
-  hook) before submitting; keep doc edits aligned with the Jupyter Book structure in
-  `docs/`.
+# ────────────────────────────────────────────────────────────────────
+# Env 1 — SFT (llamafactory: torch 2.8 + transformers 4.57.1)
+# ────────────────────────────────────────────────────────────────────
+conda create -n pedia-sft python=3.12 -y
+conda activate pedia-sft
+cd llamafactory && pip install -r requirements.txt
 
-## Legacy `realhf/` (read-only)
+# ────────────────────────────────────────────────────────────────────
+# Env 2 — RL training (verl-tool: torch 2.8 + vllm 0.11 + flash-attn 2.7.4)
+# flash-attn must be built from source against torch 2.8 (~15 min on a
+# 192-CPU node with the env vars below).
+# ────────────────────────────────────────────────────────────────────
+conda create -n pedia-rl python=3.12 -y
+conda activate pedia-rl
+unset ROCR_VISIBLE_DEVICES                                # required for Ray
+cd verl-tool
+TORCH_CUDA_ARCH_LIST="8.9" MAX_JOBS=48 NVCC_THREADS=4 \
+    pip install -r requirements.txt
+# Sanity check: deep_ep / deep_gemm MUST stay un-installed.
+pip uninstall -y deep_ep deep_gemm 2>/dev/null || true
 
-- `realhf/` remains only for archival context. The package build explicitly excludes it
-  via `pyproject.toml`.
-- Do **not** modify files under `realhf/`, and avoid importing them in new code. Treat
-  any dependency on these modules as tech debt.
-- When you encounter a `realhf` call site, prefer migrating the logic to the matching
-  `areal/` module or partner with maintainers to port it.
-- Flag lingering `realhf` usage in reviews/issues so we can track and eliminate it.
+# ────────────────────────────────────────────────────────────────────
+# Env 3 — Tool server + inference / eval
+#         (geo_edit + train_tool_server: torch≥2.10 + vllm 0.17)
+# ────────────────────────────────────────────────────────────────────
+conda create -n pedia-tools python=3.12 -y
+conda activate pedia-tools
+cd geo_edit             && pip install -U -r requirements.txt
+cd ../train_tool_server && pip install -r requirements.txt
+```
 
-### Code style & patterns
+Activating an env later:
+```bash
+conda activate pedia-sft     # → run llamafactory/train_v1.sh
+conda activate pedia-rl      # → run verl-tool/examples/train/geo_edit/run_pedia_rl_v1_*node.sh
+conda activate pedia-tools   # → run train_tool_server/scripts/launch_tool_server.sh
+                             #    or  geo_edit/scripts/run_inference.sh / run_eval.sh
+```
 
-- **Typing & dataclasses**: Prefer explicit type hints and reuse existing dataclasses in
-  `areal/api/cli_args.py` when extending configs. When adding new configuration options,
-  extend an existing dataclass if your changes are backward-compatible or the new config
-  is a strict superset of an existing one. Create a new dataclass if the config is
-  conceptually distinct or would introduce breaking changes. Keep new configs
-  dataclass-based so Hydra/CLI integration stays consistent.
-- **Imports**: Avoid wildcard imports; keep third-party vs internal groups consistent.
-  Ruff enforces import ordering (isort rules) when hooks run. Place heavy optional deps
-  inside functions to prevent import-time side effects.
-- **Logging**: Use `areal.utils.logging.getLogger(__name__)` rather than `print`. Emit
-  structured metrics through `stats_tracker`/`StatsLogger` instead of ad-hoc counters.
-- **Async code**: Rollout workflows must stay non-blocking—prefer `await` with
-  `aiofiles`, avoid synchronous file I/O inside `arun_episode`, and guard long-running
-  CPU work with executors if needed.
-- **Tensor shapes**: Follow padded batch conventions; validate with
-  `check_trajectory_format` while developing. Use helpers in `areal.utils.data` for
-  padding/broadcasting.
-- **Config overrides**: Keep Hydra-friendly dotted names; don’t hardcode paths—expose
-  options in config dataclasses and wire via YAML.
-- **Testing**: New features should ship with targeted pytest coverage (mark GPU-heavy
-  suites appropriately). Use `pytest.skip` with a clear reason when hardware isn’t
-  guaranteed.
-- **Docs & comments**: Document non-obvious behaviors inline; prefer short module-level
-  docstrings summarizing workflows or engines you touch.
+## Repository layout (4 top-level workspaces)
 
-## Core concepts & extension points
+```
+AReaL/
+├── llamafactory/             # SFT training (LLaMA-Factory PyPI)
+├── geo_edit/                 # tool definitions + inference + eval entry
+├── train_tool_server/        # HTTP tool server for RL rollouts (forked from verl-tool)
+├── verl-tool/                # vendored verl + RL training entry (renamed from verl-tool_060)
+├── AGENTS.md                 # this file
+├── README.md                 # paper / project README
+└── LICENSE
+```
 
-1. **Rollout workflows (`areal/api/workflow_api.py`)** – Implement
-   `RolloutWorkflow.arun_episode`. Use helpers like `concat_padded_tensors` and respect
-   shape `[batch, seq_len, …]`.
-1. **Inference engines (`areal/engine/sglang_remote.py`,
-   `areal/engine/vllm_remote.py`)** – Handle async generation and weight updates.
-   Interact with workflows via `InferenceEngine.agenerate`.
-1. **Training engines (`areal/engine/ppo/actor.py`, `areal/engine/fsdp_engine.py`)** –
-   Consume rollout tensors, run PPO/GRPO updates, broadcast weight versions.
-1. **Rewards (`areal/api/reward_api.py`, `areal/reward/`)** – Wrap blocking reward code
-   in `AsyncRewardWrapper`. Standard signature:
-   `(prompt, completions, prompt_ids, completion_ids, **data)`.
-1. **Configurations** – Dataclasses in `areal/api/cli_args.py`, YAML examples in
-   `examples/**`. Launchers parse CLI overrides (Hydra-style dotted keys).
+### `llamafactory/`
+- Single-machine SFT for `qwen3vl8b-thinking` (and `pedia_8b_SFT_v1` outputs).
+- Entry: `train_v1.sh` (and `train_v2.sh`).
+- Configs: `configs/pedia_sft_v{1,2}.yaml`, `configs/ds_z2_config.json` (DeepSpeed
+  ZeRO-2).
+- Trainer: `train_no_pil_limit_direct.py` (PIL bomb guard off + drop-overlong
+  samples + nvtx workaround).
+- Install: `cd llamafactory && pip install -r requirements.txt` (pulls
+  `llamafactory[metrics,deepspeed]==0.9.4` + pinned torch 2.8.0).
 
-Reference docs:
+### `geo_edit/` (tool definitions + inference + eval)
+Owns the tool catalogue used by both the HTTP tool server and the inference
+client. Highly stripped:
+- `tool_definitions/agents/` — only 3 agents kept:
+  `paddleocr_tool.py` (7 tools), `sam3.py` (6 tools), `grounding_dino.py` (1).
+- `tool_definitions/functions/` — 6 CPU image-edit functions (`crop`, `label`,
+  `draw_line`, `draw_path`, `bbox`, `highlight`).
+- `tool_definitions/router.py` — categories, model routing.
+- `agents/` — `api_agent.py` is the OpenAI-compatible inference loop.
+- `data_preprocess/` — only the 3 user-facing scripts kept (`augment_traj_data`,
+  `convert_trajectory_to_sft`, `iterative_sampling_generate` helpers
+  `diversification`, `trajectory_filter`, `trajectory_utils`).
+- `evaluation/` — `eval_unified.py` (single entry for all 13 datasets) +
+  `map_trace_verifier`, `reason_map_verifier`, `openai_as_judge`,
+  `trajectory_judge`.
+- `models/sam3/` — vendored SAM 3.1 model code (other vendored models deleted).
+- `scripts/` — only 6 entry points kept (see below).
+- Install: `cd geo_edit && pip install -U -r requirements.txt` (also auto
+  `pip install -e .` for Ray actors).
 
-- Agents customization guide: `docs/customization/agent.md`.
-- Lite design doc: `areal/README.md`.
-- Algorithm-specific docs: `docs/algorithms/*.md`.
+Entry scripts in `geo_edit/scripts/`:
+- `iterative_sampling_generate.py` — SFT trajectory sampling
+- `async_generate_with_tool_call_api.py` — inference + tool-call (used by
+  `run_inference.sh` as the inner runner)
+- `launch_cantainer.sh` — `srun + singularity shell` to enter the container
+- `run_inference.sh` — auto-launches vLLM (DP=8 by default) in the background,
+  waits for the endpoint, then runs inference for one dataset. Default
+  `DATASET=visual_probe_easy`; override via `DATASET=<id>` for any id registered
+  in `geo_edit.eval_datasets.DATASET_REGISTRY`. vLLM is killed on exit (trap).
+- `run_eval.sh` — eval-only: scores inference outputs with rule-based +
+  LLM-judge fallback. Default `DATASET=visual_probe_easy`. Requires
+  `JUDGE_API_KEY` + `JUDGE_API_BASE`.
 
-## Common tasks for agents
+Both `run_inference.sh` and `run_eval.sh` default to
+`MODEL_PATH=./pedia_model/PEDIA_8B_v1` and `TEMPERATURE=0`.
+and require `JUDGE_API_KEY` + `JUDGE_API_BASE` env vars.
 
-### Add or adjust a rollout workflow
+### `train_tool_server/` (HTTP tool server for RL training)
+Fork of `verl-tool/verl_tool/servers/` flattened to one package. Boots a tool
+backend per agent + a tool-aware router; `verl-tool`'s rollout loop POSTs
+`/get_observation` to the router.
 
-- Start from the existing patterns in `areal/workflow/multi_turn.py`, `rlvr.py`, or
-  `vision_rlvr.py`, then add a sibling module under `areal/workflow/` that subclasses
-  `RolloutWorkflow`.
-- In `__init__`, thread through `GenerationHyperparameters`, the tokenizer, reward
-  callable, stat scope, and optional `dump_dir`; wrap the reward via
-  `AsyncRewardWrapper` exactly like `MultiTurnWorkflow` does.
-- Keep `arun_episode` async-only, drive generation through `InferenceEngine.agenerate`,
-  and emit tensors using `concat_padded_tensors` so outputs stay
-  `[batch, seq_len, ...]`.
-- Use `areal/utils/data.py` helpers for padding/broadcasting, `areal/utils/logging` for
-  logger plumbing, and `stats_tracker` for reward metrics.
-- Persist transcripts under `{dump_dir}/{engine.get_version()}/` (follow the
-  `multi_turn` implementation) when debugging is enabled.
-- Update whichever entry script or launcher references the workflow (e.g.,
-  `examples/multi-turn-math/train.py`, configs in `examples/**/conf/`, or CLI glue) so
-  Hydra can import the new module.
+- Python package `train_tool_server/` (flat — no `servers/` sublayer):
+  - `server.py` — `python -m train_tool_server.server`
+  - `router.py` — `router_factory` for uvicorn
+  - `ray_manager.py`, `utils.py`
+  - `tools/` — only `geo_edit_function`, `geo_paddleocr`, `geo_sam3`,
+    `geo_grounding_dino` plus `base.py` and `finish.py`.
+- Entry: `scripts/launch_tool_server.sh` (launches 4 backends on ports
+  30889-30892 + router on 30888).
+- Install: `cd train_tool_server && pip install -r requirements.txt`
+  (auto `pip install -e .` and `pip install -e ../geo_edit/`).
+- Verification: `image_crop` / `text_ocr` / `bbox_segment` / `grounding_dino`
+  all tested live in this env; GPUs 0-5 carry PaddleOCR-VL (DP=6, ~115 GB each),
+  GPU 6 SAM3 (4 GB), GPU 7 Grounding-DINO (1.5 GB).
 
-### Introduce a reward function
+### `verl-tool/` (RL training entry, renamed from `verl-tool_060`)
+Vendored verl + `verl_tool` integration for GiGPO/PPO-style RL with the tool
+server above.
 
-- Create `areal/reward/<name>.py` and implement a callable following
-  `areal/api/reward_api.py` (see `geometry3k_reward_fn` for reference).
-- Accept `(prompt, completions, prompt_ids, completion_ids, **data)` and return a
-  scalar; extract answers deterministically (`math_parser.math_equal`, regex, etc.) and
-  avoid blocking I/O.
-- Add the identifier to `VALID_REWARD_FN` and branch selection logic in
-  `areal/reward/__init__.py` so configs like `reward.path=...` resolve automatically.
-- When rewards rely on slow models or external services, keep the heavy code inside the
-  reward module but let workflows wrap it with `AsyncRewardWrapper` (as in
-  `MultiTurnWorkflow`).
-- Document required dataset fields or endpoints in the module docstring/README so launch
-  scripts can provision secrets or caches.
+- `verl_tool/` — server proxies + trainer + workers
+- `verl/` — upstream verl, installed editable
+- `examples/train/geo_edit/` — only what's needed for pedia 8B RL:
+  - `run_pedia_rl_v1_singlenode.sh` (1 × 8 GPU, embedded `ray start --head`)
+  - `run_pedia_rl_v1_multinode.sh` (4 × 8 GPU, expects external Ray cluster)
+  - `ray_start_head.sh`, `ray_start_worker.sh`
+- Install: see `verl-tool/requirements.txt` — must run
+  `unset ROCR_VISIBLE_DEVICES` before Ray and rebuild `flash-attn` from source
+  for torch 2.8 (`TORCH_CUDA_ARCH_LIST="8.9" MAX_JOBS=48 NVCC_THREADS=4 pip
+  install -r requirements.txt`).
+- **Do not install** `deep_ep` or `deep_gemm` (torch 2.10 ABI; will crash on
+  torch 2.8 baseline).
 
-### Wire a new dataset
+## Models in `pedia_model/`
 
-- Mirror the layout in `areal/dataset/gsm8k.py`, `clevr_count_70k.py`, etc.: create
-  `areal/dataset/<name>.py` with `get_<name>_<type>_dataset` helpers for SFT/RL
-  variants.
-- Update `areal/dataset/__init__.py` by appending the dataset to `VALID_DATASETS` and
-  adding a dispatch branch inside `_get_custom_dataset`.
-- Define the sample schema explicitly (`messages`, `answer`, `image_path`, metadata) and
-  validate it before returning; filter/trim sequences with tokenizer-aware checks when
-  `max_length` is provided.
-- Expose configuration knobs (path, split, type, max_length, processor/tokenizer
-  requirements) via the `TrainDatasetConfig` and `ValidDatasetConfig` dataclasses in
-  `areal/api/cli_args.py`, then reference them in the relevant `examples/**/conf` YAML.
-- If preprocessing or external storage is required, add a short note beside the loader
-  or under `examples/<recipe>/README.md` so other agents know how to stage data.
+| Path | Purpose |
+|---|---|
+| `pedia_model/PEDIA_8B_v1`     | 8B RL-trained model (default for eval) |
+| `pedia_model/pedia_8b_SFT_v1` | 8B SFT model (RL start) |
+| `pedia_model/pedia_4b_v1`     | 4B RL |
+| `pedia_model/pedia_2b_v1`     | 2B RL |
+| `pedia_model/PaddleOCR-VL-1.5`    | tool backend (`geo_paddleocr`) |
+| `pedia_model/sam3.1`              | tool backend (`geo_sam3`) — uses `sam3.1_multiplex.pt` |
+| `pedia_model/grounding-dino-base` | tool backend (`geo_grounding_dino`) |
 
-### Launch training / evaluation
+## Data in `pedia_data/`
 
-- Choose an existing script in `examples/**` (math, multi-turn, VLM, etc.) that mirrors
-  your use case, then replicate its launcher pairing (`areal/launcher/local.py`,
-  `ray.py`, `slurm.py`, or `sglang_server.py`).
-- Read the example README to collect scheduler requirements, container images,
-  environment variables, and any dataset preparation steps before running.
-- Keep rollout actors and inference engines version-aligned by propagating
-  `WeightUpdateMeta` (as shown in `examples/multi-turn-math/train.py`) and noting
-  skipped weight updates explicitly if clusters are unavailable.
-- Capture the Hydra/CLI overrides you used
-  (`python ... +train_dataset.path=... engine.type=...`) inside the PR/test plan so runs
-  are reproducible.
-- When cluster access is blocked, document which launcher stages were skipped and what
-  validation (unit tests, static checks) you ran instead.
+| Path | Purpose |
+|---|---|
+| `pedia_data/pedia_sft_v1.tar`  | SFT training data (extract in place to `pedia_sft_v1/`) |
+| `pedia_data/pedia_rl_v1.tar`   | RL training data (extract in place to `pedia_rl_v1/train.parquet` + `val.parquet`) |
+| `pedia_data/eval/id_data.tar`  | 6 in-distribution eval parquets |
+| `pedia_data/eval/ood_data.tar` | 7 out-of-distribution eval parquets |
 
-### Publish docs
+## Common workflows
 
-- Place prose in the right section under `docs/` (tutorial, algorithms, customization,
-  lite, etc.) and update `_toc.yml` so Jupyter Book exposes the new page.
-- Run `mdformat` (or `mdformat --check`) on edited Markdown plus `ruff format` on
-  embedded code blocks when needed.
-- Regenerate CLI docs with `python docs/generate_cli_docs.py` whenever
-  `areal/api/cli_args.py` or CLI entrypoints change, then restage
-  `docs/cli_reference.md`.
-- Coordinate a docs build (or explain why it is skipped) and capture the limitation in
-  your PR/testing notes if the hosted pipeline cannot run.
+### Run an eval (2-node minimum — tool node + inference node)
+```bash
+# ─── Node A: tool server (all 8 GPUs) ───
+conda activate peria-tools
+unset ROCR_VISIBLE_DEVICES
+ray start --head --port=6379 --num-gpus=8 --resources='{"tool_agent": 8}'
+bash train_tool_server/scripts/launch_tool_server.sh        # router on :30888
 
-### Monitor metrics & artifacts
+# ─── Node B: run_inference auto-launches vLLM DP=8 → runs inference ───
+conda activate peria-tools
+unset ROCR_VISIBLE_DEVICES
+ray start --address=<node-a-ip>:6379
+bash geo_edit/scripts/run_inference.sh                       # DATASET=visual_probe_easy
 
-- Emit rollout/training metrics through `areal/utils/stats_tracker.py`; grab a scoped
-  tracker (`stats_tracker.get("rollout")`) and log scalars so downstream `StatsLogger`
-  backends (W&B/SwanLab) pick them up automatically.
-- When debugging, pass `dump_dir` into workflows so transcripts persist under
-  `{dump_dir}/{engine.get_version()}/` like `areal/workflow/multi_turn.py`; scrub
-  sensitive data before committing artifacts.
-- Checkpoint via `areal/utils/saver.py` and resume with `areal/utils/recover.py`; note
-  the checkpoint path and version in your PR/test notes so others can reproduce the
-  exact state.
+# ─── Node B (or anywhere CPU): score outputs ───
+JUDGE_API_KEY=... JUDGE_API_BASE=... bash geo_edit/scripts/run_eval.sh
+```
 
-## Testing & validation strategy
+### Run RL training (single node)
+```bash
+bash geo_edit/scripts/launch_cantainer.sh
+bash train_tool_server/scripts/launch_tool_server.sh  # provides tool agents
+TOOL_SERVER_URL=http://127.0.0.1:30888/get_observation \
+    bash verl-tool/examples/train/geo_edit/run_pedia_rl_v1_singlenode.sh
+```
 
-### Create or extend unit tests
+### Run SFT
+```bash
+bash geo_edit/scripts/launch_cantainer.sh
+cd llamafactory && bash train_v1.sh           # 8 GPU SFT with DeepSpeed ZeRO-2
+```
 
-- Place new tests under `areal/tests/` using `test_<topic>.py` so Pytest auto-discovers
-  them (e.g., tensor helpers live in `test_utils.py`, schedulers in
-  `test_local_scheduler.py`).
-- Reuse fixtures + helpers: copy the pattern from `test_utils.py` (local fixtures
-  feeding parametrized cases) or import shared logic from `areal/tests/utils.py`
-  (`is_in_ci`, `get_bool_env_var`). Prefer `pytest.fixture` + `pytest.mark.parametrize`
-  over ad-hoc loops.
-- Keep tests hermetic by mocking engines/workflows similar to
-  `test_engine_api_workflow_resolution.py`; avoid spinning up real clusters unless you
-  are under `torchrun/` or `experimental/`.
-- For GPU/distributed requirements, gate with `pytest.mark.skipif` or custom env checks
-  (see `test_fsdp_engine_nccl.py` and `areal/tests/torchrun/`), and document the
-  hardware dependency inside the skip reason.
-- When tests need sample artifacts (configs, datasets), reuse the examples in
-  `areal/tests/sft` or `areal/tests/grpo` rather than downloading new assets. Commit
-  only lightweight fixtures.
+## Conventions
 
-### Run the right suites
+- **Path discipline**: All non-code state lives under repo-relative
+  `./pedia_model/`, `./pedia_data/`, and `./outputs/{mixed_rl,eval_results,
+  eval_logs}/`. Code never hard-codes absolute system paths; configure base
+  dirs via env vars (e.g. `PEDIA_MODEL`, `PEDIA_DATA`) if you need to point
+  elsewhere.
+- **Default runtime**: 3 conda envs (`pedia-sft` / `pedia-rl` / `pedia-tools`),
+  Python 3.12 + CUDA 12.8 via nvidia-* pip wheels. Singularity sif is legacy.
+- **No `setup_env_*.sh`**: every env install is captured in its own
+  `requirements.txt` including editable installs.
+- **No wandb**: training scripts log to console only (logger='console').
+- **Tool server bug to remember**: after flattening `servers/` we had to
+  reduce `_AREAL_ROOT` in `train_tool_server/train_tool_server/tools/
+  geo_edit_base.py` from 4 `..` to 3 `..`. Don't reintroduce the 4-level
+  assumption when refactoring.
 
-- **Unit suites**: Target the file you touched, e.g.,
-  `pytest areal/tests/test_utils.py`. If a full run is infeasible, list the exact
-  command you would have executed.
-- **Workflow smoke tests**: `areal/tests/grpo` exercises rollout loops and expects CUDA;
-  acknowledge when skipped.
-- **Distributed/FSDP suites**: `test_fsdp_*`, `test_sglang_engine.py`, RPC/torchrun
-  folders require multi-node setups and distributed communication libraries. Call out
-  the limitation explicitly.
-- **Static checks**: Pre-commit runs Ruff lint/format, mdformat, clang-format,
-  nbstripout, CLI doc regeneration, and autoflake. Note if hooks were not run locally
-  and why.
+## Things that intentionally don't exist
 
-Always mention resource requirements in PRs and in agent responses when tests are
-skipped.
+Removed from upstream AReaL/verl-tool because they aren't used:
+- AReaL `areal/`, `realhf/`, `csrc/`, `evaluation/`, `examples/`, `recipe/`,
+  `functioncall/`, `benchmark/`, `assets/`, `notebook/`, `docs/`, `wandb/`,
+  `outputs/`
+- AReaL meta files: `CONTRIBUTING.md`, `Dockerfile`, `LEGAL.md`, `MANIFEST.in`,
+  `pyproject.toml`, `README_AReaL.md`, `ROADMAP.md`
+- verl-tool: most `examples/train/*` (kept only `geo_edit/`), `assets/`,
+  `benchmarks/`, `patches/`, `scripts/`, `eval_service/`, `outputs/`, `wandb/`,
+  internal `LlamaFactory/`
+- geo_edit: `baseline/`, `tests/`, `assets/`, `qualitative_example/`, `images/`,
+  `docs/`, deprecated agent files (chartmoe, chartr1, gllava, multimath, ovr,
+  thinkmorph) + their models, dataset-specific preprocess + eval scripts (we
+  use `eval_unified.py` now)
+- Tool agents reduced from 8 to 3 (paddleocr + sam3 + grounding_dino). The
+  `geo_paddleocr` PaddleOCR-VL backend exposes 7 sub-tools.
 
-## Collaboration & review expectations
-
-- **Branches**: Use kebab-case summaries (e.g., `feature/multi-turn-metrics`,
-  `bugfix/fsdp-weight-sync`) so PR automation and reviewers can parse intent quickly.
-- **Commits**: Follow Conventional Commit prefixes (`feat:`, `fix:`, `docs:`, etc.),
-  keep the subject around 72 characters for readable logs (go longer only when the extra
-  context is essential), write in imperative voice, and put deeper reasoning in the
-  body. Squash noisy WIP commits before opening or updating a PR.
-- **Pre-merge checks**: Run the full pre-commit stack (Ruff lint+format, mdformat,
-  clang-format, nbstripout, CLI docs, autoflake). For doc-only edits, at least run
-  `mdformat --check` on touched files and call out anything you could not run locally.
-- **Surface scope upfront**: Tie the PR to a filed issue, summarize acceptance criteria,
-  highlight risk areas (breaking changes, performance regressions), and note any
-  configs, datasets, or launchers impacted.
-- **Testing evidence**: List the exact commands you executed (unit, workflow smoke, docs
-  build). When hardware is unavailable, state the skipped suites, why they were skipped,
-  and what alternative validation (static analysis, mocks) you performed.
-- **Async + resource safety**: When touching workflows/engines, confirm async code
-  awaits I/O, avoids blocking calls, and preserves weight versioning
-  (`set_version`/`update_weights`). Document memory/GPU expectations and dataset or
-  checkpoint storage requirements inside the PR/test notes.
-- **Style, config & docs**: Ensure Ruff/clang-format/autoflake output is clean. Thread
-  new options through the right dataclasses/YAMLs, update docs/CLI references, and
-  verify hyperlinks. Mention any formatting gaps you plan to address later via
-  `TODO(agent)`.
-- **Observability & cleanup**: Keep metrics flowing through `stats_tracker`/
-  `StatsLogger`, expose dump directories when debugging, and remove stray debug prints
-  or commented code. Note migrations or recovery steps when checkpoints or evaluators
-  change so reviewers know what to verify.
-
-## Reference material
-
-- **Docs portal** (`https://inclusionai.github.io/AReaL/`): Hosted Jupyter Book with the
-  full table of contents; use it to cross-check rendered diagrams, formulas, and links.
-- **Tutorials & quickstart** (`docs/tutorial/quickstart.md`): End-to-end GSM8K GRPO run
-  covering single-node LocalLauncher flows, Ray/Slurm deployment knobs, SkyPilot
-  recipes, and the legacy→lite config converter.
-- **Lite deep dive** (`docs/lite/gsm8k_grpo.md`): Architecture-level walkthrough of how
-  launchers, RemoteSGLangEngine, workflows, and FSDP PPO actors coordinate during
-  asynchronous GRPO on GSM8K; great for understanding control flow before editing
-  engines or workflows.
-- **Customization guides** (`docs/customization/*.md`): Step-by-step patterns for adding
-  datasets, authoring new `RolloutWorkflow` subclasses, or wiring custom RL algorithms
-  while keeping configs Hydra-friendly.
-- **Algorithm notes** (`docs/algorithms/*.md`): Reference math + configuration advice
-  for GRPO, DAPO/DAPO-style filters, async RL, GSPO, LitePPO, m2po, rloo, etc.,
-  including when to switch between synchronous and asynchronous modes.
-- **Best practices** (`docs/best_practices/*.md`): Practical debugging playbooks,
-  reward-drift diagnostics, OOM mitigation, and performance profiling checklists you
-  should cite when explaining skipped tests or perf limitations.
-- **CLI & doc tooling** (`docs/cli_reference.md`): Auto-generated CLI argument catalog
-  plus instructions for regenerating docs/CLI output before landing config changes.
-- **Benchmarks & reproducibility** (`docs/references/*.md`): Canonical benchmark setups,
-  dataset/model combos, and experiment-log expectations to mention in PR validation
-  notes.
-- **Version history** (`docs/version_history.md`): Release timeline noting major API
-  moves, deprecations, and migration steps from legacy AReaL to AReaL-lite.
+If you need to bring something back, check git history of the upstream
+repos — nothing here is intentionally salvaged.

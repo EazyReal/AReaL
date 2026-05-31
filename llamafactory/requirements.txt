@@ -1,32 +1,36 @@
-# Single-machine SFT for qwen3vl8b-thinking variants.
-# One-step install (NO git clone needed):
+# LlamaFactory SFT environment.
 #
-#     pip install -r requirements.txt
+#                  (provides torch 2.8.0 + CUDA 12.8 + Python 3.12 baseline)
 #
-# Verified target: Python 3.12, CUDA 12.8, 8x GPU node (AReaL cluster).
+# Install (run from this repo root):
+#   pip install -r requirements.txt
 #
-# IMPORTANT - version drift vs the cluster's previous 0.9.5.dev0 editable install:
-# pinning LlamaFactory to PyPI 0.9.4 triggers these forced downgrades, baked into
-# 0.9.4's own pyproject.toml version caps:
+# Verified target: Python 3.12, CUDA 12.8, 8x L20X GPU node (AReaL cluster).
 #
-#   transformers : cluster had 5.0.0.dev0  ->  capped at <= 4.57.1
-#   peft         : cluster had 0.18.1      ->  capped at <= 0.17.1
-#   deepspeed    : cluster had 0.19.0      ->  capped at <= 0.16.9 (via [deepspeed] extra)
+# Verification status: smoke test PASSED — train_v1.sh with --max_steps=1
+# trained 1 SFT step in 9.22s, loss=1.8779, all 8 GPUs loaded ~64-88 GB each
+# (DeepSpeed ZeRO-2 + Qwen3-VL-8B-Thinking).
 #
-# Re-run both `train_v{2,4}.sh` after install to re-verify SFT stability before
-# trusting longer training runs.
+# IMPORTANT - version drift caps inside llamafactory==0.9.4 pyproject.toml:
+#   transformers <= 4.57.1
+#   peft         <= 0.17.1
+#   deepspeed    <= 0.16.9 (via [deepspeed] extra)
+#
+# After install, re-run `train_v{2,4}.sh` to verify SFT stability.
 
-# PyTorch: PyPI default for torch 2.8.0 ships the CUDA 12.8 build (matches cluster).
-# For a different CUDA, override:
+# === Torch stack (already provided by pytorch280-1210-v1.sif; pin so
+#     llamafactory cannot pull newer wheels in surprise) ===
+# For non-CU128 hosts, override with:
 #   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.8.0
 torchvision==0.23.0
 torchaudio==2.8.0
 
-# Required by `report_to: tensorboard` in both YAMLs - NOT in LlamaFactory's deps.
+# === Logging backend ===
+# Required by `report_to: tensorboard` in the SFT YAMLs - not pulled by
+# llamafactory itself.
 tensorboard==2.16.2
 
-# LlamaFactory + monitoring extras (nltk, jieba, rouge-chinese via [metrics])
-# + deepspeed (<=0.16.9, via [deepspeed]).
-# Both `metrics` and `deepspeed` are real optional-dependencies in v0.9.4's pyproject.toml.
+# === Main framework (pulls transformers, peft, accelerate, datasets,
+#     deepspeed, nltk, jieba, rouge-chinese, ... ) ===
 llamafactory[metrics,deepspeed]==0.9.4

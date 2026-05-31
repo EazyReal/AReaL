@@ -23,7 +23,7 @@ SYSTEM_PROMPT = ""
 
 # Model configuration
 agent_config = {
-    "model_name_or_path": "/storage/openpsi/models/sam3.1/sam3.1_multiplex.pt",
+    "model_name_or_path": "./pedia_model/sam3.1/sam3.1_multiplex.pt",
     "num_gpus": 1,
 }
 

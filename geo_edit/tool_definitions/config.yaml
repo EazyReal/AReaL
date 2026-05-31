@@ -1,65 +1,31 @@
-# =============================================================================
 # Tool Enable Configuration
-# Set true/false to enable/disable each tool
-# Tools are organized by task category for easier management
-# =============================================================================
+# Only tools listed here are recognized; runtime `enable_tools` parameter
+# can further restrict which ones load.
 
-# =============================================================================
-# GENERAL TOOLS - Image editing and general-purpose tools
-# =============================================================================
-image_crop: false          # Crop image by bounding box
-image_label: false         # Add text labels to image
-draw_line: false           # Draw lines on image
-draw_path: false           # Draw multi-point connected path on image
-bounding_box: false        # Draw bounding boxes on image
-image_highlight: false     # Highlight regions on image
-text_ocr: false            # General text recognition (111 languages)
-auto_segment: false        # Automatic full-image segmentation (SAM3)
-bbox_segment: false        # Region-constrained segmentation (SAM3)
-text_segment: false        # [NEW] Text-prompted concept segmentation (SAM3)
-exemplar_segment: false    # [NEW] Visual exemplar-based segmentation (SAM3)
-concept_count: false       # [NEW] Object counting by text description (SAM3)
-presence_check: false      # [NEW] Quick concept presence verification (SAM3)
-grounding_dino: false      # Open-vocabulary object detection
+# === GENERAL TOOLS - Image editing + general-purpose ===
+image_crop: false
+image_label: false
+draw_line: false
+draw_path: false
+bounding_box: false
+image_highlight: false
+text_ocr: false
+auto_segment: false
+bbox_segment: false
+text_segment: false
+exemplar_segment: false
+concept_count: false
+presence_check: false
+grounding_dino: false
 
-# =============================================================================
-# MATH TOOLS - Mathematical expressions and geometry
-# =============================================================================
-math_latex_ocr: false      # Math expression → LaTeX conversion
-math_image_describe: false # Detailed math image description
-formula_ocr: false         # Math formula recognition (PaddleOCR)
-gllava: false              # Geometry diagram analysis (G-LLaVA)
-multimath: false           # [Legacy] Multi-purpose math tool
-ovr: false                 # RL-enhanced visual reasoning
+# === MATH TOOLS ===
+formula_ocr: false
+chart_text_ocr: false
 
-# =============================================================================
-# TABLE TOOLS - Table structure recognition
-# =============================================================================
-table_ocr: false           # Table structure and data extraction
+# === TABLE TOOLS ===
+table_ocr: false
 
-# =============================================================================
-# CHART TOOLS - Chart and diagram analysis (Chart-R1)
-# =============================================================================
-chart_reasoning: false      # [Chart-R1] Chart analysis with custom question
-chart_data_extract: false   # [Chart-R1] Extract chart data to structured format
-chart_trend_analysis: false # [Chart-R1] Analyze chart trends and patterns
-chart_text_ocr: false       # [PaddleOCR] Extract text from charts
-chartr1: false              # [Chart-R1] Legacy single-tool entry
-# chartmoe: false           # [Deprecated] Replaced by Chart-R1
-
-# =============================================================================
-# MAP TOOLS - Map and location-based tools
-# =============================================================================
-text_spotting: false       # Text localization with coordinates (recommended for maps)
-map_text_ocr: false        # Map-optimized OCR: filters numbers, merges adjacent text
-
-# =============================================================================
-# DOCUMENT TOOLS - Specialized document processing
-# =============================================================================
-seal_ocr: false            # Seal/stamp recognition
-
-# =============================================================================
-# REASONING TOOLS - Visual reasoning and auxiliary image generation
-# =============================================================================
-visual_reasoning: false    # ThinkMorph visual reasoning image generation
-
+# === MAP TOOLS ===
+text_spotting: false
+seal_ocr: false
+map_text_ocr: false

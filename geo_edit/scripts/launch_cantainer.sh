@@ -2,7 +2,8 @@
 set -euo pipefail
 
 WORKDIR=/storage/openpsi/users/lichangye.lcy/antoinegg1/AReaL
-IMAGE=/storage/openpsi/images/areal-dev-vllm-20260401.sif 
+IMAGE=/storage/openpsi/images/pytorch280-1210-v1.sif
+# IMAGE=/storage/openpsi/images/areal-dev-vllm-20260401.sif 
 # IMAGE=/storage/openpsi/images/verl-071-v1.sif
 # IMAGE=/storage/openpsi/images/llamafactory-0401-v1.sif
 # IMAGE=/storage/openpsi/images/verl-1015-v1.sif 
@@ -19,4 +20,5 @@ srun --mpi=pmi2 \
     --nv --no-home --writable-tmpfs \
     --bind /storage:/storage \
     "$IMAGE"
+
 

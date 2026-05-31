@@ -1,0 +1,49 @@
+# geo_edit inference environment.
+#
+#                  (provides torch 2.8.0 + CUDA 12.8 + Python 3.12 baseline)
+#
+# One-step install:
+#   cd geo_edit && pip install -U -r requirements.txt
+#
+# Notes:
+#   * vllm 0.17.0 requires torch 2.10+, so this file UPGRADES torch from
+#     2.8.0 in pytorch280-1210-v1.sif. To stay on torch 2.8, downgrade
+#     vllm to 0.11.x AND rebuild flash-attn against torch 2.8.
+#   * paddlepaddle-gpu is large (~700 MB); allow ~5 min for download.
+
+# === Torch upgrade (vllm 0.17.x requires torch>=2.10) ===
+torch>=2.10
+torchvision
+torchaudio
+
+# === Inference / model loaders ===
+vllm==0.17.0
+git+https://github.com/huggingface/transformers.git@b3e3c3d
+
+# === Reinforcement-learning environments (geo_edit env wrappers) ===
+gymnasium
+
+# === Vision / model APIs ===
+google-genai
+qwen_vl_utils
+qwen_omni_utils
+
+# === OCR backend used by paddleocr-based tools ===
+paddleocr
+paddlepaddle-gpu
+
+# === Vision / preprocessing helpers ===
+pillow
+iopath
+ftfy
+timm
+
+# === Numeric / classical ML used in evaluation ===
+scikit-learn
+mathruler
+
+# === Monitoring ===
+nvitop
+
+# === Editable install of this repo (Ray actors need geo_edit importable) ===
+-e .

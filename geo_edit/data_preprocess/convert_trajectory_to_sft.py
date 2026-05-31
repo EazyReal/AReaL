@@ -6,8 +6,8 @@ diversifies) and converts each trajectory into step-level ShareGPT samples.
 
 Usage:
     python -m geo_edit.data_preprocess.convert_trajectory_to_sft \
-        --src_dir /storage/openpsi/data/lcy_image_edit/reasonmap_plus_sft_selected \
-        --dst_dir /storage/openpsi/data/lcy_image_edit/reasonmap_plus_sft_selected_data 
+        --src_dir ./pedia_data/sft_selected \
+        --dst_dir ./pedia_data/sft_selected_data 
 """
 
 import argparse

@@ -1,1 +1,0 @@
-"""Multimodal projector implementations."""

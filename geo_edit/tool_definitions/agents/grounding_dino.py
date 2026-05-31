@@ -17,7 +17,7 @@ SYSTEM_PROMPT = ""
 
 # Model configuration
 agent_config = {
-    "model_name_or_path": "/storage/openpsi/models/grounding-dino-base",
+    "model_name_or_path": "./pedia_model/grounding-dino-base",
     "num_gpus": 1,
 }
 

@@ -352,14 +352,28 @@ def main():
         "--api_key", type=str, default=None, help="API key for the selected provider."
     )
     parser.add_argument(
-        "--dataset_path", type=str, required=True, help="Path to the dataset file."
+        "--dataset",
+        type=str,
+        default=None,
+        help="Dataset id (auto-resolves parquet path + eval template via "
+             "geo_edit.eval_datasets.DATASET_REGISTRY). If omitted, "
+             "--dataset_path + --dataset_name must both be supplied.",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="./pedia_data",
+        help="Root dir for registered parquets (default: ./pedia_data).",
+    )
+    parser.add_argument(
+        "--dataset_path", type=str, default=None, help="Path to the dataset file (override)."
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
-        required=True,
+        default=None,
         choices=sorted(DATASET_SPECS.keys()),
-        help="Dataset adapter name.",
+        help="Dataset adapter name (override).",
     )
     parser.add_argument(
         "--output_dir",
@@ -443,6 +457,15 @@ def main():
         "--max_output_tokens", type=int, default=None, help="Per-call max generation tokens.",
     )
     args = parser.parse_args()
+    if args.dataset:
+        from geo_edit.eval_datasets import resolve_dataset
+        parquet_path, eval_template = resolve_dataset(args.dataset, args.data_root)
+        if args.dataset_path is None:
+            args.dataset_path = parquet_path
+        if args.dataset_name is None:
+            args.dataset_name = eval_template
+    if not args.dataset_path or not args.dataset_name:
+        parser.error("Either --dataset or both --dataset_path and --dataset_name must be provided.")
     if args.model_type in {"Google", "OpenAI"} and not args.api_key:
         raise ValueError("API key must be provided for Google/OpenAI models.")
 

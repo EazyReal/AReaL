@@ -295,7 +295,7 @@ bash geo_edit/scripts/launch_vllm_generate.sh
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-model_path="/storage/openpsi/models/Qwen3-VL-235B-A22B-Thinking"
+model_path="./pedia_model/Qwen3-VL-235B-A22B-Thinking"
 echo "model: $model_path"
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=600
 mkdir -p /tmp/log/
@@ -338,7 +338,7 @@ Run the inference script on Head node. Tool Agents will be automatically created
 ```bash
 python -m geo_edit.scripts.async_generate_with_tool_call_api \
   --model_type vLLM \
-  --model_name_or_path /storage/openpsi/models/Qwen3-VL-235B-A22B-Thinking \
+  --model_name_or_path ./pedia_model/Qwen3-VL-235B-A22B-Thinking \
   --api_base http://127.0.0.1:8000 \
   --dataset_path /path/to/data.parquet \
   --dataset_name mathvisionqa \
@@ -356,7 +356,7 @@ Each Tool Agent uses 1 GPU by default. Configuration in `tool_definitions/agents
 ```python
 # chartmoe.py
 agent_config = {
-    "model_name_or_path": "/storage/openpsi/models/ChartMoE",
+    "model_name_or_path": "./pedia_model/ChartMoE",
     "max_model_len": 8192,
     "gpu_memory_utilization": 0.8,
     "temperature": 0.0,
@@ -489,7 +489,7 @@ python -m geo_edit.scripts.async_generate_with_tool_call_api \
 ```bash
 python -m geo_edit.scripts.async_generate_with_tool_call_api \
   --model_type vLLM \
-  --model_name_or_path /storage/openpsi/models/Qwen3-VL-32B-Thinking/ \
+  --model_name_or_path ./pedia_model/Qwen3-VL-32B-Thinking/ \
   --api_base http://127.0.0.1:8000 \
   --dataset_path /path/to/data.parquet \
   --dataset_name mathvisionqa \
