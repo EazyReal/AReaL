@@ -1,0 +1,62 @@
+# -------------------------------
+# build-system
+# -------------------------------
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# -------------------------------
+# project (PEP 621 metadata)
+# -------------------------------
+[project]
+name = "train-tool-server"
+description = "HTTP tool server for RL training - launches geo_edit agent backends + tool-aware router."
+license = {text = "Apache-2.0"}
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.10"
+dynamic = ["version", "dependencies", "optional-dependencies"]
+
+# -------------------------------
+# tool.ruff - Linting configuration
+# -------------------------------
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+isort = {known-first-party = ["train_tool_server"]}
+select = ["E", "F", "UP", "B", "I", "G"]
+ignore = [
+    "F405", "F403",
+    "E731",
+    "B007",
+    "UP032",
+    "G004",
+    "UP045",
+    "UP035",
+]
+
+# -------------------------------
+# tool.mypy - typechecking config
+# -------------------------------
+[tool.mypy]
+pretty = true
+ignore_missing_imports = true
+explicit_package_bases = true
+follow_imports = "skip"
+ignore_errors = true
+
+# -------------------------------
+# tool.setuptools - dynamic config
+# -------------------------------
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["train_tool_server", "train_tool_server.*"]

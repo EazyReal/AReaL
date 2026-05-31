@@ -459,6 +459,9 @@ def main():
         logger.info(f"Sampled {sample_size} examples")
 
     dataset_spec = get_dataset_spec(args.dataset_name)
+    # Dedup image saves via DatasetSpec.prepare_images() when image_dedup_key is set
+    # (e.g. reason_map: 11 unique city maps shared across 1448 rows -> 11 PIL decodes, not 1448).
+    dataset, _pre_saved_images = dataset_spec.prepare_images(dataset, output_path)
     tool_mode = args.use_tools
     if tool_mode == "direct" and dataset_spec.notool_prompt_template is None:
         logger.warning(
@@ -557,10 +560,16 @@ def main():
                 os.makedirs(task_base_dir, exist_ok=True)
                 os.makedirs(traj_save_dir, exist_ok=True)
 
-                # Save input image(s) to task_base_dir (shared across trajectories)
+                # Save input image(s) to task_base_dir (shared across trajectories).
+                # When prepare_images() already pre-saved a shared file (dedup case),
+                # reuse that path and skip the per-task decode/save entirely.
                 image_path = None
                 text_only = dataset_spec.image_key is None
-                if dataset_spec.image_key:
+                if _pre_saved_images:
+                    image_path = _pre_saved_images.get(task_id)
+                    if image_path is None:
+                        text_only = True
+                elif dataset_spec.image_key:
                     raw_image = item.get(dataset_spec.image_key)
                     images = (
                         raw_image

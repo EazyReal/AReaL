@@ -1,7 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
-from google.genai import types
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from google.genai import types
+
 from geo_edit.tool_definitions.router import ToolRouter
 
 
@@ -82,6 +85,8 @@ def build_google_agent_configs(
     system_prompt: Optional[str | None] = None,
 ) -> GoogleAgentConfigs:
     """Build Google Gemini agent configs using ToolRouter."""
+    from google.genai import types
+
     tool_mode = tool_router.tool_mode
     tool_declarations = tool_router.get_available_declarations()
     tool_names = list(tool_router.get_available_tools().keys())
@@ -142,11 +147,11 @@ def build_google_agent_configs(
 
 
 def derive_google_config(
-    base_config: types.GenerateContentConfig,
+    base_config: "types.GenerateContentConfig",
     *,
     system_prompt: Optional[str] = None,
     tool_mode: Optional[str] = None,
-) -> types.GenerateContentConfig:
+) -> "types.GenerateContentConfig":
     """Derive a new Google config by copying base_config and modifying specified fields.
 
     Args:
@@ -154,6 +159,8 @@ def derive_google_config(
         system_prompt: Override system prompt (None = keep original).
         tool_mode: "NONE"/"ANY"/"AUTO" to override, None = keep original.
     """
+    from google.genai import types
+
     # Copy all fields from base_config
     kwargs = base_config.model_dump(exclude_none=True)
 
