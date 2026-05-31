@@ -177,10 +177,20 @@ bash geo_edit/scripts/run_inference.sh
 ### 3 ─ Score outputs (CPU only)
 
 ```bash
-export JUDGE_API_KEY=<your-llm-judge-api-key>
-export JUDGE_API_BASE=<your-llm-judge-endpoint>
 bash geo_edit/scripts/run_eval.sh
 # DATASET=reason_map bash geo_edit/scripts/run_eval.sh
+```
+
+By default `run_eval.sh` does **rule-based scoring only** — fast, no external
+API, good for quick sanity checks. To reproduce the paper numbers, enable the
+LLM-judge fallback by exporting `JUDGE_API_KEY`. `JUDGE_API_BASE` defaults to
+OpenAI's official endpoint (`https://api.openai.com/v1`), so for OpenAI you
+only need the key:
+
+```bash
+export JUDGE_API_KEY=<your-openai-key>
+# export JUDGE_API_BASE=<custom-endpoint>     # only for non-OpenAI providers
+bash geo_edit/scripts/run_eval.sh
 ```
 
 Raw inference outputs land in `./outputs/eval_results/<dataset>/<model_name>/`;
@@ -294,6 +304,17 @@ TOOL_SERVER_URL=http://<node-a-ip>:30888/get_observation \
 
 Outputs land under `./outputs/mixed_rl/`.
 
+The reward manager can optionally call an LLM judge for trajectory rewards.
+This is opt-in via `JUDGE_API_KEY`; `JUDGE_API_BASE` defaults to OpenAI's
+official endpoint, so for OpenAI you only need the key:
+
+```bash
+export JUDGE_API_KEY=<your-openai-key>
+# export JUDGE_API_BASE=<custom-endpoint>     # only for non-OpenAI providers
+TOOL_SERVER_URL=http://<node-a-ip>:30888/get_observation \
+    bash verl-tool/examples/train/geo_edit/run_pedia_rl_v1_singlenode.sh
+```
+
 ### Larger multi-node training
 
 For scaling beyond a single training node (e.g. 4 × 8 GPU + tool node), we also
@@ -328,10 +349,16 @@ hf download <your-org>/ReasonMap-Plus --repo-type dataset \
 
 ### Example — synthesise SFT data from ReasonMap-Plus
 
+SFT data synthesis **requires an LLM-judge API key** — the trajectory
+filter and augmentation stages call the judge to score candidate
+trajectories, so unlike eval/RL the key is mandatory. `JUDGE_API_BASE`
+defaults to OpenAI's official endpoint; override only for non-OpenAI
+providers.
+
 ```bash
 conda activate peria-tools
-export JUDGE_API_KEY=<your-llm-judge-api-key>
-export JUDGE_API_BASE=<your-llm-judge-endpoint>
+export JUDGE_API_KEY=<your-openai-key>             # REQUIRED for data synthesis
+# export JUDGE_API_BASE=<custom-endpoint>          # only for non-OpenAI providers
 
 # 1. Start tool server on a dedicated node + serve Qwen3-VL-8B-Thinking with
 #    run_inference.sh's auto-launched vLLM (set MODEL_PATH accordingly).
