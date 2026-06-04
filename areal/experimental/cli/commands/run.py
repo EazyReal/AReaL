@@ -1,39 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""``areal run`` — detached training driver launcher."""
+"""``areal run`` — attached (foreground) training driver launcher."""
 
 from __future__ import annotations
 
 import argparse
+import os
+import sys
+import time
 from pathlib import Path
 
 
 _DESCRIPTION = """\
-Launch a training driver in the background.
+Launch a training driver in the current process (foreground / attached).
 
-Resolve the driver entry from --driver or the yaml `driver:` field, then
-spawn it as a detached subprocess. The CLI returns immediately after the
-child has been launched; the run is tracked under ~/.areal/runs/ via
-state + heartbeat (refreshed every 5 s by the wrapper process).
+The CLI process IS the driver process — it stays alive until the driver
+exits. Exit code reflects the driver outcome (0 = success, non-zero =
+failure). This is the right entry for K8s Jobs / Slurm sbatch scripts /
+any orchestrator that uses process lifecycle to detect task status.
+
+For "fire and forget" launches (login-node convenience), use `areal start`
+instead, which spawns a detached background process.
 
 Run name is derived from `experiment_name`/`trial_name` in the yaml
-(or matching Hydra overrides). The yaml MUST contain both, or the
-overrides must supply them.
+(Hydra overrides honored). The yaml MUST contain both, or the overrides
+must supply them.
+
+A background heartbeat thread updates RunState.last_heartbeat every 5 s
+so other CLIs can detect hung drivers via `areal status` (later stages).
 
 Examples:
   areal run --config experiments/grpo.yaml
   areal run --config experiments/grpo.yaml --driver examples.math.gsm8k_rl:main
   areal run --config experiments/grpo.yaml actor.lr=1e-5 trial_name=lr-sweep-3
-
-Hydra overrides (key=value, +key=value, ~key) after the parsed flags are
-forwarded verbatim to the driver.
 """
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "run",
-        help="Launch a training driver in the background.",
+        help="Launch a training driver in the foreground.",
         description=_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -50,11 +56,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _handle(args: argparse.Namespace) -> int:
+    from areal.experimental.cli._exec import run_with_wrapper
     from areal.experimental.cli.runner import (
+        refuse_if_active,
         resolve_driver,
         resolve_name,
-        start_detached,
     )
+    from areal.experimental.cli.state import RunState, run_state_path
 
     config_path = args.config.expanduser().resolve()
     if not config_path.exists():
@@ -63,9 +71,23 @@ def _handle(args: argparse.Namespace) -> int:
     overrides = args.overrides or []
     driver = resolve_driver(config_path, cli_driver=args.driver)
     name = resolve_name(config_path, overrides=overrides)
-    return start_detached(
+    refuse_if_active(name)
+
+    state = RunState(
         name=name,
-        driver_spec=driver,
-        config_path=config_path,
-        overrides=overrides,
+        driver=driver,
+        config_path=str(config_path),
+        pid=os.getpid(),
+        started_at=time.time(),
+        log_path="",
+        overrides=list(overrides),
+        last_heartbeat=time.time(),
     )
+    state.save()
+
+    print(
+        f"Run {name!r} starting (pid {os.getpid()}). "
+        f"State: {run_state_path(name)}",
+        file=sys.stderr,
+    )
+    return run_with_wrapper(name, driver, config_path, overrides)
