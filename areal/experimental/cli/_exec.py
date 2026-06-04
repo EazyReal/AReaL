@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Detached driver wrapper invoked by ``start_detached``.
+"""Driver execution wrapper.
 
-Spawned as ``python -m areal.experimental.cli._exec --name ... --driver
-MOD:FUNC --config PATH -- <overrides>``. Updates RunState heartbeat on a
-background thread, runs the driver in the main thread, writes final
-status + exit code on exit.
+``run_with_wrapper`` runs a driver in the current process with a heartbeat
+thread, SIGTERM trap, and final-state write. Used by both:
+
+  - ``areal run`` (attached / foreground): CLI process is the wrapper
+  - ``areal start`` (detached / background): wrapper is a child process
+    spawned via ``python -m areal.experimental.cli._exec`` (entry: ``main``)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 
 from areal.experimental.cli.state import RunState
 
@@ -42,6 +45,46 @@ def _install_sigterm_handler() -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
+def run_with_wrapper(
+    name: str,
+    driver_spec: str,
+    config_path: str | Path,
+    overrides: list[str],
+) -> int:
+    _install_sigterm_handler()
+
+    stop = threading.Event()
+    hb = threading.Thread(target=_heartbeat_loop, args=(name, stop), daemon=True)
+    hb.start()
+
+    rc = 0
+    try:
+        mod_path, func_name = driver_spec.split(":", 1)
+        mod = importlib.import_module(mod_path)
+        fn = getattr(mod, func_name)
+        argv = ["--config", str(config_path), *overrides]
+        result = fn(argv)
+        if isinstance(result, int):
+            rc = result
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        rc = 1
+    finally:
+        stop.set()
+        try:
+            final = RunState.load(name)
+            final.status = "completed" if rc == 0 else "failed"
+            final.exit_code = rc
+            final.last_heartbeat = time.time()
+            final.save()
+        except Exception:
+            pass
+
+    return rc
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="areal-exec", add_help=False)
     p.add_argument("--name", required=True)
@@ -59,38 +102,7 @@ def main() -> int:
     state.last_heartbeat = time.time()
     state.save()
 
-    _install_sigterm_handler()
-
-    stop = threading.Event()
-    hb = threading.Thread(target=_heartbeat_loop, args=(args.name, stop), daemon=True)
-    hb.start()
-
-    rc = 0
-    try:
-        mod_path, func_name = args.driver.split(":", 1)
-        mod = importlib.import_module(mod_path)
-        fn = getattr(mod, func_name)
-        argv = ["--config", args.config, *overrides]
-        result = fn(argv)
-        if isinstance(result, int):
-            rc = result
-    except SystemExit as e:
-        rc = e.code if isinstance(e.code, int) else (1 if e.code else 0)
-    except BaseException:
-        traceback.print_exc(file=sys.stderr)
-        rc = 1
-    finally:
-        stop.set()
-        try:
-            final = RunState.load(args.name)
-            final.status = "completed" if rc == 0 else "failed"
-            final.exit_code = rc
-            final.last_heartbeat = time.time()
-            final.save()
-        except Exception:
-            pass
-
-    return rc
+    return run_with_wrapper(args.name, args.driver, args.config, overrides)
 
 
 if __name__ == "__main__":

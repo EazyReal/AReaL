@@ -70,7 +70,7 @@ def resolve_name(config_path: Path, overrides: list[str]) -> str:
     return f"{exp}/{trial}"
 
 
-def _refuse_if_active(name: str) -> None:
+def refuse_if_active(name: str) -> None:
     p = run_state_path(name)
     if not p.exists():
         return
@@ -88,7 +88,7 @@ def _refuse_if_active(name: str) -> None:
 def start_detached(
     *, name: str, driver_spec: str, config_path: Path, overrides: list[str]
 ) -> int:
-    _refuse_if_active(name)
+    refuse_if_active(name)
 
     log_file = run_log_path(name)
     log_file.parent.mkdir(parents=True, exist_ok=True)
