@@ -87,9 +87,9 @@ class RunState:
     started_at: float
     status: str = "running"  # running | stopped | completed | failed
     log_path: str = ""
-    scheduler_type: str | None = None
     overrides: list[str] = field(default_factory=list)
-    argv: list[str] = field(default_factory=list)
+    last_heartbeat: float = 0.0
+    exit_code: int | None = None
 
     def save(self) -> None:
         atomic_write_json(run_state_path(self.name), asdict(self))
