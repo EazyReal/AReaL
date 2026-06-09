@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""``areal inf logs`` — tail the supervisor's main.log for a service."""
+"""``areal inf logs`` — tail gateway / router / model logs.
+
+Logs live under ``~/.areal/inf/logs/<service>/<component>.log``.  Phase 1
+ships ``gateway`` and ``router``; phase 3 will add ``<model-name>`` files
+when internal models are spawned.
+"""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
-from pathlib import Path
 
 
 _DESCRIPTION = __doc__
@@ -16,54 +20,35 @@ _DESCRIPTION = __doc__
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "logs",
-        help="Tail the main log for a service.",
+        help="Tail gateway / router / model logs.",
         description=_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("name", nargs="?", help="Service name (defaults to current).")
+    p.add_argument("--service", default=None, help="Service name (defaults to current).")
     p.add_argument(
-        "--component", default="main",
-        help="Log file component (default: main). Examples: main, merged, "
-             "inf-server, router, gateway. Becomes `<component>.log` in the log dir.",
+        "--component", default="gateway",
+        help="One of `gateway`, `router`, or a model name.  Becomes "
+             "`<component>.log` under the service log dir.",
     )
-    p.add_argument(
-        "-f", "--follow", action="store_true",
-        help="Follow the log (tail -F).",
-    )
-    p.add_argument(
-        "-n", "--lines", type=int, default=200,
-        help="Number of trailing lines to print (default 200).",
-    )
+    p.add_argument("-f", "--follow", action="store_true", help="Stream new lines.")
+    p.add_argument("-n", "--lines", type=int, default=200)
     p.set_defaults(func=_handle)
 
 
 def _handle(args: argparse.Namespace) -> int:
-    from areal.experimental.cli.inf_state import (
-        ServiceState,
-        get_current_service,
+    from areal.experimental.cli.commands.inf.state import (
+        resolve_service,
+        service_logs_dir,
     )
 
-    name = args.name or get_current_service()
-    if not name:
+    name = resolve_service(args.service)
+    log_dir = service_logs_dir(name)
+    log_file = log_dir / f"{args.component}.log"
+    if not log_file.exists():
         print(
-            "No service name given and no current service set. "
-            "Use `areal inf ps` to list services.",
+            f"No {args.component}.log at {log_file}.",
             file=sys.stderr,
         )
-        return 2
-
-    try:
-        state = ServiceState.load(name)
-    except FileNotFoundError:
-        print(f"No service named {name!r}.", file=sys.stderr)
-        return 1
-
-    if not state.log_dir:
-        print(f"Service {name!r} has no log_dir recorded.", file=sys.stderr)
-        return 1
-    log_file = Path(state.log_dir) / f"{args.component}.log"
-    if not log_file.exists():
-        print(f"No {args.component}.log at {log_file}.", file=sys.stderr)
         return 1
 
     cmd = ["tail", f"-n{args.lines}"]

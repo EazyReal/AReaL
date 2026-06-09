@@ -1,22 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""``areal inf stop`` — gracefully tear down a running service.
+"""``areal inf stop`` — stop a running inference service.
 
-Sends SIGTERM to the supervisor.  The supervisor's SIGTERM handler runs
-``controller.destroy()`` — the same teardown path ``PPOTrainer.close()``
-uses on normal training shutdown — so workers, router, gateway, and
-data-proxies are all released through the scheduler.
+Sends SIGTERM to the gateway, the router, and any tracked model worker
+PIDs (data proxies + inference servers, populated in phase 3).  After the
+grace period, escalates to SIGKILL.  State files are removed unless
+``--keep-state`` is passed.
 
-If the supervisor does not exit within --grace, sends SIGKILL.  Either
-way, the state file is removed so subsequent ``areal inf run`` calls
-with the same name can proceed.
+Alias: ``areal inf destroy`` (later — keeping the alias spec for design
+reference).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import signal
 import sys
 import time
 
@@ -31,69 +28,92 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         description=_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("name", help="Service name (e.g. <experiment>/<trial>).")
     p.add_argument(
-        "--grace", type=float, default=60.0,
-        help="Seconds to wait for graceful teardown before SIGKILL.",
+        "--service", default=None,
+        help="Service instance name (defaults to current).",
+    )
+    p.add_argument(
+        "--grace-period", type=float, default=10.0,
+        help="Seconds to wait before escalating to SIGKILL.",
+    )
+    p.add_argument(
+        "--keep-state", action="store_true",
+        help="Keep state files after shutdown (debugging).",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="Skip confirmations; reserved for future interactive prompts.",
     )
     p.set_defaults(func=_handle)
 
 
-def _signal(pid: int, sig: int) -> bool:
-    try:
-        os.kill(pid, sig)
-        return True
-    except ProcessLookupError:
-        return False
-
-
 def _handle(args: argparse.Namespace) -> int:
-    from areal.experimental.cli.inf_state import (
+    from areal.experimental.cli.commands.inf.gateway_client import (
+        GatewayClient,
+        GatewayUnreachable,
+    )
+    from areal.experimental.cli.commands.inf.launcher import kill_pids
+    from areal.experimental.cli.commands.inf.state import (
+        ServiceModels,
         ServiceState,
         get_current_service,
+        gateway_alive,
+        models_state_path,
+        resolve_service,
+        router_alive,
         set_current_service,
-        supervisor_alive,
     )
+
+    name = resolve_service(args.service)
 
     try:
-        state = ServiceState.load(args.name)
+        state = ServiceState.load(name)
     except FileNotFoundError:
-        print(f"No service named {args.name!r}.", file=sys.stderr)
+        print(f"No service named {name!r}.", file=sys.stderr)
         return 1
 
-    if not supervisor_alive(state):
+    pids: list[int] = [state.gateway_pid, state.router_pid]
+
+    # Pull any tracked model worker pids so we kill them in one sweep.
+    models_path = models_state_path(name)
+    if models_path.exists():
+        sm = ServiceModels.load(name)
+        for m in sm.list_all():
+            for pid in m.worker_pids:
+                if pid > 0:
+                    pids.append(pid)
+
+    alive = gateway_alive(state) or router_alive(state)
+    if not alive:
         print(
-            f"Service {args.name!r} supervisor (pid {state.supervisor_pid}) is not alive; "
-            f"removing stale state.",
+            f"Service {name!r} is already down (no live gateway/router pid). "
+            f"Cleaning up state.",
             file=sys.stderr,
         )
+    else:
+        print(
+            f"Stopping service {name!r}: gateway={state.gateway_pid}, "
+            f"router={state.router_pid} ...",
+            file=sys.stderr,
+        )
+        kill_pids(pids, grace_s=args.grace_period)
+
+        # Best-effort: confirm gateway /health stops responding within a few seconds.
+        client = GatewayClient(state.gateway_url, timeout=1.0)
+        deadline = time.time() + min(5.0, args.grace_period)
+        while time.time() < deadline:
+            try:
+                client.health()
+                time.sleep(0.3)
+            except GatewayUnreachable:
+                break
+
+    if not args.keep_state:
         state.remove()
-        if get_current_service() == state.name:
+        if models_path.exists():
+            models_path.unlink()
+        if get_current_service() == name:
             set_current_service(None)
-        return 0
 
-    print(
-        f"Sending SIGTERM to supervisor pid={state.supervisor_pid} ...",
-        file=sys.stderr,
-    )
-    _signal(state.supervisor_pid, signal.SIGTERM)
-
-    deadline = time.time() + args.grace
-    while time.time() < deadline:
-        if not supervisor_alive(state):
-            break
-        time.sleep(0.5)
-
-    if supervisor_alive(state):
-        print(
-            f"Supervisor still alive after {args.grace:.0f}s — sending SIGKILL.",
-            file=sys.stderr,
-        )
-        _signal(state.supervisor_pid, signal.SIGKILL)
-        time.sleep(1.0)
-
-    state.remove()
-    if get_current_service() == state.name:
-        set_current_service(None)
-    print(f"Service {args.name!r} stopped.")
+    print(f"Service {name!r} stopped.")
     return 0

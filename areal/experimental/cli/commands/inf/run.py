@@ -1,41 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""``areal inf run`` — launch the v2 inference service (detached).
+"""``areal inf run`` — launch the inference service (detached).
 
-Spawns an ``inf_supervisor`` subprocess that owns a ``RolloutControllerV2``,
-which in turn manages the sglang workers + router + gateway + data-proxies.
-The CLI process exits as soon as the supervisor reports ``ready``; the
-supervisor stays up until ``areal inf stop`` (SIGTERM) tears it down via the
-same ``controller.destroy()`` path that ``PPOTrainer.close()`` uses on
-normal training shutdown.
+Spawns a gateway and a router as detached subprocesses, polls the gateway's
+``/health`` until it answers, optionally registers an external model
+inline, persists ``ServiceState`` (and ``ModelState`` if a model was
+registered) under ``~/.areal/inf/``, and exits.
 
-While waiting for ready, the CLI streams the supervisor's ``main.log`` to
-stderr so the user sees real-time progress (scheduler, worker spawn, sglang
-load).  If the supervisor reports ``failed`` (init exception), the CLI exits
-with the recorded reason instead of waiting for the launch timeout.
-
-Logs follow the v2 training layout:
-    {fileroot}/logs/{user}/{experiment_name}/{trial_name}/
-        main.log               <- supervisor / driver
-        inf-server.log         <- v2 worker (sglang)
-        router.log / gateway.log / data-proxy*.log
-        merged.log
-
-Run name comes from ``experiment_name``/``trial_name`` in the yaml (or
-their Hydra overrides) — same convention as ``areal run``.
+There is **no supervisor process**.  Subsequent commands (``stop``,
+``status``, ``ps``, ``logs``) reconcile via ``pid_alive`` + gateway
+``/health``.
 
 Examples:
-  areal inf run --config experiments/grpo.yaml
-  areal inf run --config experiments/grpo.yaml --force
-  areal inf run --config experiments/grpo.yaml trial_name=infer-only
+  areal inf run
+  areal inf run --service demo --gateway-port 18080 --router-port 18081
+  areal inf run --model gpt-4o --api-url https://api.openai.com/v1 \\
+                --provider-api-key-env OPENAI_API_KEY
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -47,37 +33,90 @@ _DESCRIPTION = __doc__
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "run",
-        help="Launch the v2 inference service (detached).",
+        help="Launch the inference service (detached).",
         description=_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--config", required=True, type=Path)
+
+    # Service arguments (design 11.2)
+    p.add_argument("--service", default="default", help="Service instance name.")
+    p.add_argument("--gateway-host", default="127.0.0.1")
+    p.add_argument("--gateway-port", type=int, default=8080)
+    p.add_argument("--router-host", default="127.0.0.1")
+    p.add_argument("--router-port", type=int, default=8081)
+    p.add_argument("--admin-api-key", default="areal-admin-key")
     p.add_argument(
-        "--launch-timeout", type=float, default=600.0,
-        help="Seconds to wait for the supervisor to become ready (sglang load can be slow).",
+        "--routing-strategy", default="round_robin",
+        choices=["round_robin", "least_busy"],
+    )
+    p.add_argument("--poll-interval", type=float, default=5.0)
+    p.add_argument("--router-timeout", type=float, default=2.0)
+    p.add_argument("--forward-timeout", type=float, default=120.0)
+    p.add_argument(
+        "--log-level", default="info",
+        choices=["debug", "info", "warning", "error"],
+    )
+    p.add_argument("--launch-timeout", type=float, default=30.0)
+    p.add_argument(
+        "--config", type=Path, default=None,
+        help="Optional TOML override file merged over ~/.areal/inf/config.toml.",
     )
     p.add_argument(
         "--force", action="store_true",
-        help="Stop an existing service with the same name first.",
+        help="Stop an existing healthy service with the same name first.",
+    )
+
+    # Inline external model registration (phase 1b only supports external).
+    # Internal model flags (--backend, --model-path, ...) land in phase 3.
+    p.add_argument(
+        "--model", default=None,
+        help="Model name to register at startup. Triggers inline registration.",
     )
     p.add_argument(
-        "overrides", nargs=argparse.REMAINDER,
-        help="Hydra-style overrides forwarded to the supervisor.",
+        "--api-url", default=None,
+        help="External provider URL.  Presence marks the model as external.",
     )
+    p.add_argument("--provider-api-key", default=None)
+    p.add_argument(
+        "--provider-api-key-env", default=None,
+        help="Name of an environment variable holding the provider API key.",
+    )
+    p.add_argument(
+        "--provider-model", default=None,
+        help="Upstream model name to send to the provider (defaults to --model).",
+    )
+
     p.set_defaults(func=_handle)
 
 
-def _resolve_name(config_path: Path, overrides: list[str]) -> str:
-    from areal.experimental.cli.runner import resolve_name
+# ---- helpers --------------------------------------------------------------
 
-    return resolve_name(config_path, overrides=overrides)
+
+def _resolve_provider_api_key(args: argparse.Namespace) -> str:
+    if args.provider_api_key:
+        return args.provider_api_key
+    if args.provider_api_key_env:
+        v = os.environ.get(args.provider_api_key_env)
+        if not v:
+            raise SystemExit(
+                f"--provider-api-key-env={args.provider_api_key_env!r} "
+                f"is not set in the environment."
+            )
+        return v
+    raise SystemExit(
+        "External model registration requires either --provider-api-key or "
+        "--provider-api-key-env."
+    )
 
 
 def _refuse_or_replace(name: str, force: bool) -> None:
-    from areal.experimental.cli.inf_state import (
+    """If a service with this name is healthy, refuse (or replace if --force)."""
+    from areal.experimental.cli.commands.inf.launcher import kill_pids
+    from areal.experimental.cli.commands.inf.state import (
         ServiceState,
+        gateway_alive,
+        router_alive,
         service_state_path,
-        supervisor_alive,
     )
 
     p = service_state_path(name)
@@ -86,206 +125,209 @@ def _refuse_or_replace(name: str, force: bool) -> None:
     try:
         existing = ServiceState.load(name)
     except (FileNotFoundError, ValueError, TypeError):
+        # Stale or corrupt state — overwrite silently.
+        p.unlink()
         return
-    if supervisor_alive(existing):
-        if not force:
-            raise SystemExit(
-                f"Service {name!r} is already running (supervisor pid={existing.supervisor_pid}). "
-                f"Use --force to replace it, or `areal inf stop {name}` first."
-            )
-        os.kill(existing.supervisor_pid, signal.SIGTERM)
-        deadline = time.time() + 30.0
-        while time.time() < deadline and supervisor_alive(existing):
-            time.sleep(0.5)
-        if supervisor_alive(existing):
-            try:
-                os.kill(existing.supervisor_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+
+    alive = gateway_alive(existing) or router_alive(existing)
+    if alive and not force:
+        raise SystemExit(
+            f"Service {name!r} is already running "
+            f"(gateway pid={existing.gateway_pid}, router pid={existing.router_pid}). "
+            f"Use --force to replace it, or `areal inf stop {name}` first."
+        )
+    if alive:
+        kill_pids([existing.gateway_pid, existing.router_pid], grace_s=10.0)
+
     existing.remove()
+    # Models file from previous incarnation is also stale; nuke it.
+    from areal.experimental.cli.commands.inf.state import models_state_path
+    mp = models_state_path(name)
+    if mp.exists():
+        mp.unlink()
 
 
-def _spawn_supervisor(
-    name: str, config_path: Path, overrides: list[str]
-) -> int:
-    """Spawn the supervisor detached.
-
-    Supervisor itself redirects stdout/stderr to the v2-aligned ``main.log``
-    inside the run, so we just discard whatever it emits to fd 1/2 BEFORE
-    that redirect happens.
-    """
-    cmd = [
-        sys.executable, "-m", "areal.experimental.cli.inf_supervisor",
-        "--name", name,
-        "--config", str(config_path),
-        "--",
-        *overrides,
-    ]
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
-    )
-    return proc.pid
-
-
-class _LogTailer:
-    """Stream a (possibly not-yet-existing) log file to stderr line-by-line."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._fp = None
-        self._buf = b""
-
-    def _try_open(self) -> bool:
-        if self._fp is not None:
-            return True
-        if not self.path.exists():
-            return False
-        try:
-            self._fp = open(self.path, "rb")
-        except OSError:
-            return False
-        return True
-
-    def drain(self) -> None:
-        if not self._try_open():
-            return
-        try:
-            chunk = self._fp.read()
-        except OSError:
-            return
-        if not chunk:
-            return
-        self._buf += chunk
-        while b"\n" in self._buf:
-            line, self._buf = self._buf.split(b"\n", 1)
-            try:
-                sys.stderr.write(line.decode("utf-8", errors="replace") + "\n")
-            except Exception:
-                pass
-        sys.stderr.flush()
-
-    def close(self) -> None:
-        if self._fp is not None:
-            self.drain()
-            try:
-                self._fp.close()
-            except Exception:
-                pass
-
-
-def _wait_ready(
-    name: str, supervisor_pid: int, timeout_s: float, log_path: Path
-) -> None:
-    from areal.experimental.cli.inf_state import (
-        service_failed_marker,
-        service_ready_marker,
-    )
+def _wait_health(client, supervisor_pids: list[int], deadline: float) -> None:
+    from areal.experimental.cli.commands.inf.gateway_client import GatewayUnreachable
     from areal.experimental.cli.state import pid_alive
 
-    ready = service_ready_marker(name)
-    failed = service_failed_marker(name)
-    tailer = _LogTailer(log_path)
-
-    deadline = time.time() + timeout_s
-    try:
-        while time.time() < deadline:
-            tailer.drain()
-
-            if failed.exists():
-                reason = failed.read_text().strip() or "(unknown)"
-                raise SystemExit(
-                    f"Service {name!r} failed during init: {reason}\n"
-                    f"See {log_path} for the full traceback."
-                )
-            if ready.exists():
-                return
-            if not pid_alive(supervisor_pid):
-                # Process died WITHOUT writing the failed marker (segfault, OOM,
-                # SIGKILL ...).  Let the user see the tail of the log either way.
-                tailer.drain()
-                raise SystemExit(
-                    f"Supervisor for {name!r} (pid {supervisor_pid}) died "
-                    f"before becoming ready. See {log_path}."
-                )
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        if not all(pid_alive(p) for p in supervisor_pids):
+            raise SystemExit(
+                "Gateway or router subprocess died during startup. "
+                "Check the logs printed above for the reason."
+            )
+        try:
+            client.health()
+            return
+        except GatewayUnreachable as e:
+            last_err = e
             time.sleep(0.5)
-        raise SystemExit(
-            f"Service {name!r} did not become ready within {timeout_s:.0f}s. "
-            f"See {log_path}."
-        )
-    finally:
-        tailer.close()
+    raise SystemExit(
+        f"Service did not become healthy within timeout. "
+        f"Last error: {last_err}"
+    )
 
 
-def _peek_log_dir(config_path: Path, overrides: list[str]) -> Path:
-    """Resolve the supervisor's log dir BEFORE spawning the supervisor.
+def _register_external_inline(
+    *, args: argparse.Namespace, service_name: str, gateway_url: str
+) -> None:
+    """Register an external model right after the service is healthy.
 
-    Done so the parent CLI can tail ``main.log`` from the moment the
-    supervisor starts redirecting to it.
+    Persists a ``ModelState`` and promotes it to default if first.
     """
-    from areal.experimental.cli.inf_config import load_inference_config
-    from areal.experimental.cli.inf_state import service_log_dir_for_config
+    from areal.experimental.cli.commands.inf.gateway_client import (
+        GatewayClient,
+        GatewayHTTPError,
+        GatewayUnreachable,
+    )
+    from areal.experimental.cli.commands.inf.state import (
+        ModelState,
+        ServiceModels,
+    )
 
-    config, _ = load_inference_config(config_path, overrides)
-    return service_log_dir_for_config(config)
+    api_key = _resolve_provider_api_key(args)
+    payload = {
+        "model": args.model,
+        "url": args.api_url,
+        "api_key": api_key,
+        "data_proxy_addrs": [],
+    }
+    if args.provider_model:
+        payload["provider_model"] = args.provider_model
+
+    client = GatewayClient(
+        gateway_url, admin_api_key=args.admin_api_key, timeout=10.0
+    )
+    try:
+        client.register_model(payload)
+    except (GatewayUnreachable, GatewayHTTPError) as e:
+        raise SystemExit(
+            f"Inline register of model {args.model!r} failed: {e}"
+        ) from e
+
+    models = ServiceModels.load(service_name)
+    models.add(
+        ModelState(
+            name=args.model,
+            kind="external",
+            api_url=args.api_url,
+            provider_model=args.provider_model or args.model,
+            registered_at=time.time(),
+        )
+    )
+    models.save()
+
+
+# ---- main entry ----------------------------------------------------------
 
 
 def _handle(args: argparse.Namespace) -> int:
-    from areal.experimental.cli.inf_state import (
+    # Validate inline-model flags up front: phase 1 only supports external.
+    if args.model and not args.api_url:
+        raise SystemExit(
+            "Phase 1 only supports external model registration on `inf run`. "
+            "Internal models (--backend / --model-path) will be supported in "
+            "a later phase. Pass --api-url <url> to register an external model."
+        )
+    if args.api_url and not args.model:
+        raise SystemExit("--api-url requires --model.")
+
+    from areal.experimental.cli.commands.inf.gateway_client import GatewayClient
+    from areal.experimental.cli.commands.inf.launcher import (
+        kill_pids,
+        spawn_gateway,
+        spawn_router,
+    )
+    from areal.experimental.cli.commands.inf.state import (
         ServiceState,
         get_current_service,
+        service_logs_dir,
         set_current_service,
     )
 
-    config_path = args.config.expanduser().resolve()
-    if not config_path.exists():
-        raise SystemExit(f"Config not found: {config_path}")
-    overrides = args.overrides or []
-    if overrides and overrides[0] == "--":
-        overrides = overrides[1:]
+    service = args.service
+    _refuse_or_replace(service, force=args.force)
 
-    name = _resolve_name(config_path, overrides)
-    _refuse_or_replace(name, force=args.force)
+    logs = service_logs_dir(service)
+    print(f"Starting service {service!r} ...", file=sys.stderr)
+    print(f"  logs: {logs}", file=sys.stderr)
 
-    log_dir = _peek_log_dir(config_path, overrides)
-    main_log = log_dir / "main.log"
-
-    print(f"Starting service {name!r} ...", file=sys.stderr)
-    print(f"  log dir: {log_dir}", file=sys.stderr)
-    pid = _spawn_supervisor(name, config_path, overrides)
-    print(f"  supervisor pid: {pid}", file=sys.stderr)
-    print(
-        f"  waiting up to {args.launch_timeout:.0f}s for /ready (streaming main.log) ...",
-        file=sys.stderr,
+    router_pid = spawn_router(
+        host=args.router_host,
+        port=args.router_port,
+        admin_api_key=args.admin_api_key,
+        poll_interval=args.poll_interval,
+        routing_strategy=args.routing_strategy,
+        log_level=args.log_level,
+        log_file=logs / "router.log",
     )
-    print("  --------- supervisor output ---------", file=sys.stderr)
+    print(f"  router pid:  {router_pid}", file=sys.stderr)
 
+    # Give the router a head start so the gateway can dial it.
+    time.sleep(0.3)
+
+    gateway_pid = spawn_gateway(
+        host=args.gateway_host,
+        port=args.gateway_port,
+        admin_api_key=args.admin_api_key,
+        router_host=args.router_host,
+        router_port=args.router_port,
+        router_timeout=args.router_timeout,
+        forward_timeout=args.forward_timeout,
+        log_level=args.log_level,
+        log_file=logs / "gateway.log",
+    )
+    print(f"  gateway pid: {gateway_pid}", file=sys.stderr)
+
+    state = ServiceState(
+        name=service,
+        gateway_host=args.gateway_host,
+        gateway_port=args.gateway_port,
+        router_host=args.router_host,
+        router_port=args.router_port,
+        gateway_pid=gateway_pid,
+        router_pid=router_pid,
+        admin_api_key=args.admin_api_key,
+        routing_strategy=args.routing_strategy,
+        log_level=args.log_level,
+        created_at=time.time(),
+    )
+
+    # Use the state's gateway_url helper so 0.0.0.0 collapses to 127.0.0.1.
+    client = GatewayClient(
+        state.gateway_url, admin_api_key=args.admin_api_key, timeout=2.0
+    )
     try:
-        _wait_ready(name, pid, args.launch_timeout, main_log)
+        _wait_health(client, [router_pid, gateway_pid],
+                     deadline=time.time() + args.launch_timeout)
     except SystemExit:
-        if get_current_service() == name:
-            set_current_service(None)
+        kill_pids([gateway_pid, router_pid], grace_s=5.0)
         raise
 
-    state = ServiceState.load(name)
+    state.save()
+
+    if args.model:
+        try:
+            _register_external_inline(
+                args=args, service_name=service, gateway_url=state.gateway_url
+            )
+        except SystemExit:
+            # If inline registration fails, tear the empty service down so
+            # the user isn't left with a half-started instance.
+            kill_pids([gateway_pid, router_pid], grace_s=5.0)
+            state.remove()
+            raise
+
     if get_current_service() is None:
-        set_current_service(state.name)
-    print("  -------- supervisor ready --------", file=sys.stderr)
-    print(f"\nService {name!r} ready.")
-    print(f"  gateway: {state.gateway_addr or '(n/a)'}")
-    print(f"  router:  {state.router_addr or '(n/a)'}")
-    if state.server_addrs:
-        print(f"  servers: {len(state.server_addrs)}")
-        for addr in state.server_addrs[:4]:
-            print(f"    - {addr}")
-        if len(state.server_addrs) > 4:
-            print(f"    ... (+{len(state.server_addrs) - 4} more)")
-    print(f"  supervisor: pid={state.supervisor_pid}")
-    print(f"  log:        {main_log}")
+        set_current_service(service)
+
+    print(f"\nService {service!r} ready.")
+    print(f"  gateway:  {state.gateway_url}")
+    print(f"  router:   {state.router_url}")
+    print(f"  pids:     gateway={gateway_pid}, router={router_pid}")
+    if args.model:
+        print(f"  default model: {args.model} (external)")
+    print(f"  log dir:  {logs}")
     return 0
