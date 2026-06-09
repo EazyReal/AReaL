@@ -2,19 +2,15 @@
 
 """Top-level entry point for the ``areal`` console-script.
 
-This module wires the top-level training verbs (`run`, `start`, `stop`,
-`ps`, `status`, `logs`) and the three service namespaces (`inf`, `agent`,
-`weight-update`) into a single argparse tree.
+This baseline only wires the ``inf`` namespace.  Other top-level
+surfaces (``train``, ``agent``, ``weight-update``) will land in
+follow-up PRs once we agree on the click-based registration shape;
+keeping the surface to one namespace makes that refactor easy to
+review.
 
-The shape is asymmetric on purpose: training is AReaL's primary use case,
-so its verbs sit at the top level for ergonomic invocation (`areal run`
-vs `areal train run`). Service-side operator commands stay namespaced
-because they are auxiliary surfaces, not the main entry.
-
-The import path is kept deliberately light: only stdlib and the verb /
-namespace modules are touched here. Verb implementations must defer
-heavy imports (torch, ray, megatron, sglang, vllm, fastapi, ...) into
-their ``_handle`` function bodies, never at module top level.
+Heavy imports (torch / sglang / vllm / fastapi / ...) must stay out
+of this module and out of any ``add_parser`` function.  Each verb's
+``_handle`` is the only place that may pull in those packages.
 """
 
 from __future__ import annotations
@@ -22,40 +18,16 @@ from __future__ import annotations
 import argparse
 import sys
 
-from areal.experimental.cli.commands import agent as cmd_agent
 from areal.experimental.cli.commands import inf as cmd_inf
-from areal.experimental.cli.commands import logs as cmd_logs
-from areal.experimental.cli.commands import ps as cmd_ps
-from areal.experimental.cli.commands import run as cmd_run
-from areal.experimental.cli.commands import start as cmd_start
-from areal.experimental.cli.commands import status as cmd_status
-from areal.experimental.cli.commands import stop as cmd_stop
-from areal.experimental.cli.commands import weight_update as cmd_weight_update
 from areal.version import __version__
 
 _DESCRIPTION = """\
 AReaL operator CLI for the v2 microservice architecture.
 
-Training is AReaL's primary use case and its verbs are top-level
-(`areal run`, `areal start`, etc.). Service-side operator surfaces
-(inference, agent, weight-update) live under their own namespaces.
+Available namespaces:
+  inf            Manage inference services and models
 
-Top-level training verbs:
-  run            Launch a training driver in the foreground
-  start          Spawn a detached driver process (background)
-  stop           Signal a running job by name
-  ps             List locally tracked jobs
-  status         Status of one job
-  logs           Tail a job's combined stdout/stderr
-
-Service namespaces:
-  inf            Operate an inference service (gateway + router + models)
-  agent          Operate an agent service (gateway + router + sessions)
-  weight-update  Diagnose weight-sync state between train and inference
-
-Run `areal <command> --help` for the planned surface of each verb.
-Training state lives under ~/.areal/runs/.
-Service state lives under ~/.areal/<namespace>/.
+State lives under ~/.areal/<namespace>/.
 """
 
 
@@ -75,17 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="COMMAND",
     )
-    # Top-level training verbs
-    cmd_run.add_parser(subparsers)
-    cmd_start.add_parser(subparsers)
-    cmd_stop.add_parser(subparsers)
-    cmd_ps.add_parser(subparsers)
-    cmd_status.add_parser(subparsers)
-    cmd_logs.add_parser(subparsers)
-    # Service namespaces
     cmd_inf.add_parser(subparsers)
-    cmd_agent.add_parser(subparsers)
-    cmd_weight_update.add_parser(subparsers)
     return parser
 
 
