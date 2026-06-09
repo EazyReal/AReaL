@@ -109,18 +109,19 @@ def _build_sglang_cmd(
     from areal.api.cli_args import SGLangConfig
 
     cfg = SGLangConfig(model_path=model_path)
-    cmd_str = SGLangConfig.build_cmd(
-        sglang_config=cfg,
-        tp_size=tp,
-        base_gpu_id=0,
-        host=host,
-        port=port,
-        n_nodes=1,
-        node_rank=0,
-        pp_size=1,
+    # build_cmd already returns a fully-tokenized argv list.
+    return list(
+        SGLangConfig.build_cmd(
+            sglang_config=cfg,
+            tp_size=tp,
+            base_gpu_id=0,
+            host=host,
+            port=port,
+            n_nodes=1,
+            node_rank=0,
+            pp_size=1,
+        )
     )
-    # build_cmd returns a single shell-style string; split into argv.
-    return _shlex_split(cmd_str)
 
 
 def _build_vllm_cmd(
@@ -128,16 +129,17 @@ def _build_vllm_cmd(
 ) -> list[str]:
     from areal.api.cli_args import vLLMConfig
 
-    cfg = vLLMConfig(model_path=model_path)
-    cmd_str = vLLMConfig.build_cmd(
-        vllm_config=cfg,
-        tp_size=tp,
-        pp_size=pp,
+    cfg = vLLMConfig(model=model_path)
+    cmd = list(
+        vLLMConfig.build_cmd(
+            vllm_config=cfg,
+            tp_size=tp,
+            pp_size=pp,
+        )
     )
-    parts = _shlex_split(cmd_str)
     # vLLMConfig.build_cmd does not embed --host/--port; append.
-    parts += ["--host", host, "--port", str(port)]
-    return parts
+    cmd += ["--host", host, "--port", str(port)]
+    return cmd
 
 
 def _shlex_split(cmd: str) -> list[str]:
