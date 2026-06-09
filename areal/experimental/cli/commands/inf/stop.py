@@ -77,7 +77,7 @@ def _handle(args: argparse.Namespace) -> int:
     try:
         state = ServiceState.load(name)
     except FileNotFoundError:
-        print(f"No service named {name!r}.", file=sys.stderr)
+        logger.error("No service named %r.", name)
         return 1
 
     pids: list[int] = [state.gateway_pid, state.router_pid]
@@ -121,5 +121,5 @@ def _handle(args: argparse.Namespace) -> int:
         if get_current_service() == name:
             set_current_service(None)
 
-    print(f"Service {name!r} stopped.")
+    logger.info("Service %r stopped.", name)
     return 0

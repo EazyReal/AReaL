@@ -17,6 +17,10 @@ import json
 import sys
 import time
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
+
 
 _DESCRIPTION = __doc__
 
@@ -165,7 +169,7 @@ def _handle(args: argparse.Namespace) -> int:
                 sys.stdout.flush()
             time.sleep(args.interval)
     except FileNotFoundError:
-        print(f"No service named {name!r}.", file=sys.stderr)
+        logger.error("No service named %r.", name)
         return 1
     except KeyboardInterrupt:
         return 0

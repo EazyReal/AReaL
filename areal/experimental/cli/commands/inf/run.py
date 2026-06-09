@@ -449,12 +449,12 @@ def _handle(args: argparse.Namespace) -> int:
     if get_current_service() is None:
         set_current_service(service)
 
-    print(f"\nService {service!r} ready.")
-    print(f"  gateway:  {state.gateway_url}")
-    print(f"  router:   {state.router_url}")
-    print(f"  pids:     gateway={gateway_pid}, router={router_pid}")
+    logger.info("Service %r ready.", service)
+    logger.info("  gateway: %s", state.gateway_url)
+    logger.info("  router:  %s", state.router_url)
+    logger.info("  pids:    gateway=%d, router=%d", gateway_pid, router_pid)
     if args.model:
         kind = "external" if args.api_url else f"internal ({args.backend})"
-        print(f"  default model: {args.model} ({kind})")
-    print(f"  log dir:  {logs}")
+        logger.info("  default model: %s (%s)", args.model, kind)
+    logger.info("  log dir: %s", logs)
     return 0

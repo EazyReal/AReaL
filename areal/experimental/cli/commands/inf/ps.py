@@ -9,6 +9,10 @@ import json
 import sys
 import time
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
+
 
 _DESCRIPTION = __doc__
 
@@ -77,7 +81,7 @@ def _handle(args: argparse.Namespace) -> int:
         msg = "No services."
         if not args.show_all:
             msg += "  (Add --all to include dead ones.)"
-        print(msg, file=sys.stderr)
+        logger.info("%s", msg)
         return 0
 
     cols = ("CURRENT", "NAME", "STATE", "GATEWAY", "ROUTER", "MODELS", "AGE")

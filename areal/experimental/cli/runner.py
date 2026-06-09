@@ -13,6 +13,10 @@ from typing import Any
 
 import yaml
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("TrainCli")
+
 from areal.experimental.cli.state import (
     RunState,
     pid_alive,
@@ -127,7 +131,7 @@ def start_detached(
     )
     state.save()
 
-    print(f"Started run {name!r} (pid {proc.pid}).")
-    print(f"  log:   {log_file}")
-    print(f"  state: {run_state_path(name)}")
+    logger.info("Started run %r (pid %d).", name, proc.pid)
+    logger.info("  log:   %s", log_file)
+    logger.info("  state: %s", run_state_path(name))
     return 0

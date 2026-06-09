@@ -13,6 +13,10 @@ import argparse
 import os
 import sys
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
+
 
 _DESCRIPTION = __doc__
 
@@ -51,10 +55,7 @@ def _handle(args: argparse.Namespace) -> int:
     log_dir = service_logs_dir(name)
     log_file = log_dir / f"{args.component}.log"
     if not log_file.exists():
-        print(
-            f"No {args.component}.log at {log_file}.",
-            file=sys.stderr,
-        )
+        logger.error("No %s.log at %s.", args.component, log_file)
         return 1
 
     cmd = ["tail", f"-n{args.lines}"]

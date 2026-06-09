@@ -10,6 +10,10 @@ import sys
 import time
 from pathlib import Path
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("TrainCli")
+
 
 _DESCRIPTION = """\
 Launch a training driver in the current process (foreground / attached).
@@ -85,9 +89,8 @@ def _handle(args: argparse.Namespace) -> int:
     )
     state.save()
 
-    print(
-        f"Run {name!r} starting (pid {os.getpid()}). "
-        f"State: {run_state_path(name)}",
-        file=sys.stderr,
+    logger.info(
+        "Run %r starting (pid %d). State: %s",
+        name, os.getpid(), run_state_path(name),
     )
     return run_with_wrapper(name, driver, config_path, overrides)
