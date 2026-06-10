@@ -107,7 +107,7 @@ def _free_port() -> int:
 
 
 def _build_sglang_cmd(
-    *, model_path: str, host: str, port: int, tp: int,
+    *, model_path: str, host: str, port: int, tp: int, base_gpu_id: int,
     extra_args: list[str],
 ) -> list[str]:
     from areal.api.cli_args import SGLangConfig
@@ -117,7 +117,7 @@ def _build_sglang_cmd(
         SGLangConfig.build_cmd(
             sglang_config=cfg,
             tp_size=tp,
-            base_gpu_id=0,
+            base_gpu_id=base_gpu_id,
             host=host,
             port=port,
             n_nodes=1,
@@ -274,6 +274,7 @@ def register_internal_model(
                     host="127.0.0.1",
                     port=inf_port,
                     tp=spec.tp,
+                    base_gpu_id=replica * spec.tp,
                     extra_args=args.engine_extra_args,
                 )
             else:

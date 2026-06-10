@@ -264,6 +264,14 @@ def _register_external_inline(
     )
     from areal.experimental.cli.commands.inf.state import ModelState, ServiceModels
 
+    raise SystemExit(
+        "External-only registration via --api-url is not supported by the "
+        "router yet (it would require gateway-side fallback to model "
+        "registry's url; see follow-up). For now: spawn a data-proxy in "
+        "front of your external endpoint and register manually, or use "
+        "internal mode (--backend / --model-path)."
+    )
+
     api_key = _resolve_provider_api_key(opts)
     payload = {
         "model": opts["model"],
@@ -445,7 +453,7 @@ def _do_run(opts: dict) -> int:
                     router_url=state.router_url,
                     log_dir=logs,
                 )
-        except SystemExit:
+        except (SystemExit, KeyboardInterrupt, Exception):
             kill_pids([gateway_pid, router_pid], grace_s=5.0)
             state.remove()
             raise

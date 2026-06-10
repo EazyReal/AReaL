@@ -80,7 +80,7 @@ class GatewayClient:
         return self._request("GET", "/health")
 
     def list_models(self) -> dict:
-        return self._request("GET", "/models")
+        return self._request("GET", "/models", admin=True)
 
     def register_model(self, payload: dict) -> dict:
         return self._request("POST", "/register_model", json_body=payload, admin=True)
