@@ -662,6 +662,84 @@ def sapo_loss_fn(
     return pg_loss, stat
 
 
+def cispo_loss_fn(
+    logprobs: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    loss_mask: torch.Tensor,
+    eps_clip_higher: float | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
+
+    PPO/GRPO-style clipping zeroes the gradient of any token whose
+    importance-sampling ratio leaves the clip band: ``min(r*A, clip(r)*A)`` is
+    constant in theta there. MiniMax-M1 (https://arxiv.org/abs/2506.13585,
+    Eq. 4-5) observes those are disproportionately low-probability "fork" tokens
+    (``However``, ``Wait``, ...) that steer reasoning, and instead clips the IS
+    *weight* under stop-gradient while keeping the gradient on every token's
+    ``log pi_theta`` (the choice ScaleRL, https://arxiv.org/abs/2510.13786 Eq. 4,
+    also adopts). Per token::
+
+        ratio         = exp(logprobs - proximal_logprobs)
+        ratio_clipped = clip(ratio, 1 - eps_clip, 1 + eps_clip_higher)   # stop-grad
+        pg_loss       = -sg(ratio_clipped) * advantages * logprobs
+
+    Advantages are never clipped. The clip bounds reuse the same delta-from-1
+    convention as :func:`ppo_actor_loss_fn`. CISPO is canonically single-sided:
+    pass ``eps_clip=1.0`` (lower bound 0) with ``eps_clip_higher=4.0`` for the
+    wide MiniMax-M1 range. Token level only -- the geometric-mean sequence ratio
+    of GSPO is not part of the MiniMax-M1 surrogate.
+
+    Args:
+        logprobs: Current policy log-probabilities (pi_theta), with autograd.
+        proximal_logprobs: Proximal policy log-probabilities; enters only through
+            the detached ratio path, so it carries no gradient.
+        advantages: Per-token advantage estimates; detached on entry.
+        eps_clip: Lower clipping delta from 1 (ratio lower bound ``1 - eps_clip``).
+        loss_mask: Mask for valid tokens (1 = valid).
+        eps_clip_higher: Upper clipping delta from 1 (ratio upper bound
+            ``1 + eps_clip_higher``); must be positive -- the asymmetric upper
+            clip is the defining knob of CISPO, so ``None`` is rejected.
+
+    Returns:
+        ``(loss, stat)`` matching the PPO loss signature. ``stat['clip_mask']``
+        flags tokens whose raw ratio left the band (CISPO never zeroes their
+        loss, so band-exit -- not loss-affecting clip -- is the meaningful
+        metric); ``stat['importance_weight']`` reports the unclipped ratio.
+    """
+    if eps_clip_higher is None or eps_clip_higher <= 0:
+        raise ValueError(
+            "CISPO requires a positive eps_clip_higher; the asymmetric upper "
+            f"clip is the defining knob (MiniMax-M1 Eq. 4-5). Got {eps_clip_higher!r}."
+        )
+    loss_mask_count = loss_mask.count_nonzero() or 1
+    advantages = advantages.detach()
+
+    # Stop-gradient on the clipped IS weight; the gradient flows through
+    # ``logprobs`` only. The ratio path is detached explicitly so the surrogate
+    # is correct even if a caller forgot to detach ``proximal_logprobs``.
+    log_ratio = (logprobs - proximal_logprobs).detach()
+    ratio = torch.exp(log_ratio)
+    ratio_clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip_higher).detach()
+    pg_loss = -ratio_clipped * advantages * logprobs
+    logging_loss = pg_loss.detach()
+    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+
+    clip_mask = (ratio_clipped != ratio).logical_and(loss_mask)
+    stat = dict(
+        loss=logging_loss,
+        importance_weight=ratio.detach(),
+        # Same sign convention as ppo_actor_loss_fn / sapo_loss_fn so the logged
+        # approx_kl curve is comparable across surrogates.
+        approx_kl=log_ratio,
+        clip_mask=clip_mask,
+        # CISPO has no dual clip; report zeros for a stable stat schema.
+        dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+    )
+    return pg_loss, stat
+
+
 def dpo_pair_logratios(
     logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor,
