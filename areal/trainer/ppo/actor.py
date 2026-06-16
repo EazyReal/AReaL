@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -40,6 +41,40 @@ from areal.utils.functional import (
 from areal.utils.perf_tracer import trace_perf
 
 logger = logging.getLogger("PPOActor")
+
+
+def _ppo_loss_weight(data: dict[str, Any]) -> torch.Tensor:
+    return data["loss_mask"].count_nonzero()
+
+
+def _make_loss_weight_fn(
+    loss_aggregation: str, group_size: int
+) -> Callable[[dict[str, Any]], torch.Tensor]:
+    """Return the per-microbatch loss weight paired with ``aggregate_pg_loss``.
+
+    The weight is the number of averaging *units* in the microbatch, so the
+    engine's ``Σ_mb loss_mb·w_mb / Σ_mb w_mb`` realizes the global mean over
+    that unit. ``token_mean`` -> valid token count; ``seq_mean`` -> sequence
+    count; ``prompt_mean`` -> prompt-group count (``n_seqs // group_size``). The
+    sequence count is inferred from the packed layout (``cu_seqlens``) or the
+    padded layout (``loss_mask.shape[0]``) -- a single source of truth.
+    """
+    if loss_aggregation == "token_mean":
+        return _ppo_loss_weight
+
+    # seq_mean's unit is one sequence (unit=1); prompt_mean groups group_size.
+    unit = group_size if loss_aggregation == "prompt_mean" else 1
+
+    def unit_mean_weight(x: dict[str, Any]) -> torch.Tensor:
+        cu_seqlens = x.get("cu_seqlens")
+        if cu_seqlens is not None:
+            n_seqs = cu_seqlens.numel() - 1
+        else:
+            n_seqs = x["loss_mask"].shape[0]
+        n_units = n_seqs // unit
+        return torch.tensor(n_units, dtype=torch.float32, device=x["loss_mask"].device)
+
+    return unit_mean_weight
 
 
 class PPOActor:
@@ -343,9 +378,22 @@ class PPOActor:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
+        # With prompt_mean, the outer PPO-minibatch split must keep each
+        # prompt-group (group_size consecutive sequences) intact within one
+        # minibatch, so pin granularity to group_size; the inner token-microbatch
+        # granularity is validated in PPOActorConfig.__post_init__. token_mean
+        # uses granularity 1 (no constraint).
+        outer_granularity = (
+            self.config.group_size
+            if self.config.loss_aggregation == "prompt_mean"
+            else 1
+        )
         mb_inputs = split_padded_tensor_dict_into_mb_list(
             data,
-            mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            mb_spec=MicroBatchSpec(
+                n_mbs=self.config.ppo_n_minibatches,
+                granularity=outer_granularity,
+            ),
         )
 
         with stats_tracker.scope("update"):
@@ -369,8 +417,12 @@ class PPOActor:
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        loss_aggregation=self.config.loss_aggregation,
+                        group_size=self.config.group_size,
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=_make_loss_weight_fn(
+                        self.config.loss_aggregation, self.config.group_size
+                    ),
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -431,6 +483,8 @@ def grpo_loss_fn(
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
     use_decoupled_loss: bool = False,
+    loss_aggregation: str = "token_mean",
+    group_size: int = 1,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
 ):
@@ -473,6 +527,8 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            loss_aggregation=loss_aggregation,
+            group_size=group_size,
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -487,6 +543,8 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            loss_aggregation=loss_aggregation,
+            group_size=group_size,
         )
 
     # Joint Distillation KL Loss
