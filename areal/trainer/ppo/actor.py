@@ -28,6 +28,8 @@ from areal.utils.data import (
     KLEstimator,
     Normalization,
     batched_call,
+    concat_batch,
+    split_batch,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
@@ -140,9 +142,17 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        # Concat here (rather than via batched_call) to recover traj_group_sizes:
+        # each trajectory is one prompt group, so it gives the actual per-group
+        # row counts that group-level normalization needs, including partial
+        # groups where some episodes returned None.
+        batched, meta = concat_batch(data)
+        result = self._compute_advantages(batched, group_sizes=meta.traj_group_sizes)
+        return split_batch(result, meta)
 
-    def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _compute_advantages(
+        self, data: dict[str, Any], group_sizes: list[int] | None = None
+    ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -170,7 +180,7 @@ class PPOActor:
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -236,7 +246,7 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            advantages = self.adv_norm(advantages, loss_mask, group_sizes=group_sizes)
 
         # Store data in the dict.
         data["advantages"] = advantages
