@@ -128,6 +128,54 @@ def _ensure_message_dict_list(
     return normalized
 
 
+def _messages_for_hf_chat_template(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a tokenizer-only copy of OpenAI messages.
+
+    OpenAI chat completions represent function-call arguments as a JSON string.
+    Some HuggingFace chat templates, including Qwen3 Coder's, render prior tool
+    calls by iterating over ``tool_call.function.arguments`` as a mapping; given
+    a string they raise ``AttributeError`` (or iterate it character-by-character)
+    and the rendered prompt diverges from the tokens the policy sampled. Keep the
+    public/cache representation OpenAI-compatible (wire strings), but decode the
+    arguments to a mapping for tokenizer rendering only.
+    """
+
+    rendered = deepcopy(messages)
+    for message in rendered:
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, Mapping):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, Mapping):
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                continue
+            try:
+                decoded = json.loads(arguments)
+            except json.JSONDecodeError:
+                # A non-JSON argument string is not valid OpenAI function-call
+                # output; wrapping it under a single key is more useful than a
+                # template crash when replaying a trajectory.
+                decoded = {"arguments": arguments}
+            if not isinstance(decoded, Mapping):
+                # Valid JSON that is not an object (e.g. a list) still has to
+                # satisfy the template's ``.items()`` contract.
+                decoded = {"arguments": decoded}
+            if isinstance(function, dict):
+                function["arguments"] = dict(decoded)
+            else:
+                tool_call["function"] = {**dict(function), "arguments": dict(decoded)}
+    return rendered
+
+
 def _find_kth(lst: list, target, k: int) -> int:
     def target_indices():
         for i, char in enumerate(lst):
@@ -388,7 +436,7 @@ def concat_prompt_token_ids_with_parent(
 
     all_tokens = apply_chat_template(
         tokenizer,
-        all_message_list,
+        _messages_for_hf_chat_template(all_message_list),
         tools=tools,
         add_generation_prompt=True,
         tokenize=True,
@@ -609,7 +657,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         )
         has_images = len(image_data) > 0
 
-        tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _messages_for_hf_chat_template(
+            messages_for_tokenizer if has_images else messages_list
+        )
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
@@ -1017,7 +1067,9 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         )
         has_images = len(image_data) > 0
 
-        tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _messages_for_hf_chat_template(
+            messages_for_tokenizer if has_images else messages_list
+        )
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
