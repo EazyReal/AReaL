@@ -74,12 +74,21 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         workflow: RolloutWorkflow,
         group_size: int,
         logger: Logger,
+        min_valid_group_size: int = 1,
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
+        # A group needs at least this many survivors to be kept; more than
+        # group_size is impossible (it would drop every group).
+        if not 1 <= min_valid_group_size <= group_size:
+            raise ValueError(
+                f"min_valid_group_size must be in [1, group_size={group_size}], "
+                f"got {min_valid_group_size}"
+            )
         self.workflow = workflow
         self.group_size = group_size
         self.logger = logger
+        self.min_valid_group_size = min_valid_group_size
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -94,6 +103,17 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
 
         # All results None -> return None
         if not valid_results:
+            return None
+
+        # Too few survivors to form an acceptable group -> drop the whole group.
+        # min_valid_group_size=1 (default) never triggers here; set it equal to
+        # group_size to require full groups only.
+        if len(valid_results) < self.min_valid_group_size:
+            self.logger.warning(
+                f"GroupedRolloutWorkflow: only {len(valid_results)}/{len(results)} "
+                f"trajectories valid (< min_valid_group_size="
+                f"{self.min_valid_group_size}); dropping group"
+            )
             return None
 
         # Some results None -> warn and continue with valid ones
@@ -621,7 +641,12 @@ class RemoteInfEngine(InferenceEngine):
                 raise ValueError("proxy_addr is required for online mode")
             resolved = self._wrap_openai_agent(None, proxy_addr=proxy_addr)
             if group_size > 1:
-                resolved = GroupedRolloutWorkflow(resolved, group_size, self.logger)
+                resolved = GroupedRolloutWorkflow(
+                    resolved,
+                    group_size,
+                    self.logger,
+                    min_valid_group_size=self.config.min_valid_group_size,
+                )
             return resolved
 
         # 1. Already a RolloutWorkflow instance
@@ -712,7 +737,12 @@ class RemoteInfEngine(InferenceEngine):
 
         # Wrap with GroupedRolloutWorkflow if group_size > 1
         if group_size > 1:
-            resolved = GroupedRolloutWorkflow(resolved, group_size, self.logger)
+            resolved = GroupedRolloutWorkflow(
+                resolved,
+                group_size,
+                self.logger,
+                min_valid_group_size=self.config.min_valid_group_size,
+            )
 
         return resolved
 
