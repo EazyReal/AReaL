@@ -16,7 +16,17 @@ def get_gsm8k_sft_dataset(
             sample["question"] + sample["answer"] + tokenizer.eos_token
         )
         prompt_token = tokenizer.encode(sample["question"])
-        loss_mask = [0] * len(prompt_token) + [1] * (len(seq_token) - len(prompt_token))
+        # `prompt_token` is not always a token-level prefix of `seq_token`:
+        # byte-level/BPE tokenizers may merge a token across the question/answer
+        # join (e.g. when the question has no trailing whitespace). Use the length
+        # of the common token prefix as the boundary so any boundary-spanning
+        # token is attributed to the answer and supervised.
+        prompt_len = 0
+        for p, s in zip(prompt_token, seq_token):
+            if p != s:
+                break
+            prompt_len += 1
+        loss_mask = [0] * prompt_len + [1] * (len(seq_token) - prompt_len)
         return {"input_ids": seq_token, "loss_mask": loss_mask}
 
     dataset = dataset.map(process).remove_columns(["question", "answer"])
