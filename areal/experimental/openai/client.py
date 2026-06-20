@@ -784,7 +784,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
             stop_token_ids=list(
-                set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
+                {self.tokenizer.eos_token_id, self.tokenizer.pad_token_id} - {None}
             ),
         )
 
@@ -1183,7 +1183,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
             stop_token_ids=list(
-                set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
+                {self.tokenizer.eos_token_id, self.tokenizer.pad_token_id} - {None}
             ),
         )
 
