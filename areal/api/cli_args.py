@@ -242,10 +242,16 @@ class GenerationHyperparameters:
     def new_with_stop_and_pad_token_ids(self, tokenizer: "PreTrainedTokenizerFast"):
         """Create a new generation hyperparameters with stop and pad token ids added."""
         new_stop_token_ids = self.stop_token_ids.copy()
-        if tokenizer.pad_token_id not in new_stop_token_ids:
-            new_stop_token_ids.append(tokenizer.pad_token_id)
-        if tokenizer.eos_token_id not in new_stop_token_ids:
-            new_stop_token_ids.append(tokenizer.eos_token_id)
+        # Skip None (some tokenizers, e.g. base Llama, have no pad token) and accept
+        # either a single id or a list of ids (e.g. Llama 3's multiple eos tokens),
+        # so only ints land in the int-typed stop_token_ids.
+        for candidate in (tokenizer.pad_token_id, tokenizer.eos_token_id):
+            if candidate is None:
+                continue
+            ids = candidate if isinstance(candidate, (list, tuple)) else [candidate]
+            for token_id in ids:
+                if token_id not in new_stop_token_ids:
+                    new_stop_token_ids.append(token_id)
         return self.new(stop_token_ids=new_stop_token_ids)
 
     def to_openai_completions_args_dict(
