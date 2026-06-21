@@ -36,7 +36,15 @@ def get_gsm8k_sft_dataset(
             sample["question"] + sample["answer"] + tokenizer.eos_token
         )
         prompt_token = tokenizer.encode(sample["question"])
-        loss_mask = [0] * len(prompt_token) + [1] * (len(seq_token) - len(prompt_token))
+        # `prompt_token` 不一定是 `seq_token` 的 token 级前缀：BPE 分词器可能在
+        # question/answer 衔接处合并出一个跨界 token。用公共前缀长度作为边界，
+        # 使跨界 token 归入 answer 并参与训练。
+        prompt_len = 0
+        for p, s in zip(prompt_token, seq_token):
+            if p != s:
+                break
+            prompt_len += 1
+        loss_mask = [0] * prompt_len + [1] * (len(seq_token) - prompt_len)
         return {"input_ids": seq_token, "loss_mask": loss_mask}
 
     dataset = dataset.map(process).remove_columns(["question", "answer"])
