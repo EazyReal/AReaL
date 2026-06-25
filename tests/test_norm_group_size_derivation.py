@@ -3,8 +3,8 @@
 
 The prompt-group that group-level reward_norm/adv_norm centers over *is* the
 rollout's n_samples responses, so PPOConfig.__post_init__ makes gconfig.n_samples
-the single source of truth instead of a per-config `group_size: ${gconfig.n_samples}`
-literal a user can mis-set out of sync.
+the runtime source of truth even when YAML keeps `group_size: ${gconfig.n_samples}`
+as a visible reference for users.
 """
 
 from areal.api.cli_args import (

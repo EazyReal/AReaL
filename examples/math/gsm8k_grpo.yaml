@@ -80,7 +80,7 @@ actor:
   reward_norm:
     mean_level: group
     std_level: group
-    # group_size is auto-derived from gconfig.n_samples (the prompt-group size).
+    group_size: ${gconfig.n_samples}
   adv_norm:
     mean_level: batch
     std_level: batch
