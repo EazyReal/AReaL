@@ -4,7 +4,6 @@ from areal.utils.stats_tracker import DistributedStatsTracker
 
 
 def test_export_single_key_with_reset():
-    # reset must drop the key from both reduce_types and stats without KeyError.
     t = DistributedStatsTracker()
     t.scalar(foo=1.0)
 
