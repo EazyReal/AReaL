@@ -77,8 +77,8 @@ class NormConfig:
         default=1,
         metadata={
             "help": "Group size for group-level normalization. For the actor's "
-            "reward_norm/adv_norm this is auto-derived from gconfig.n_samples; "
-            "setting it by hand is unnecessary and a mismatched value is overridden."
+            "reward_norm/adv_norm this is derived from gconfig.n_samples; "
+            "mismatched values are overridden."
         },
     )
 
@@ -3076,10 +3076,9 @@ class PPOConfig(BaseExperimentConfig):
 
         # Group-level reward/advantage normalization groups the n_samples
         # responses of one prompt, so its group_size is, by definition,
-        # gconfig.n_samples. Make that the single source of truth instead of
-        # asking every config to repeat `group_size: ${gconfig.n_samples}` (a
-        # literal a user can mis-set out of sync with n_samples). Only touch a
-        # norm that actually uses group level.
+        # gconfig.n_samples. YAML may keep `group_size: ${gconfig.n_samples}` as
+        # a visible reference, but runtime still enforces n_samples as the source
+        # of truth so mismatched literals cannot silently take effect.
         for _name, _norm in (
             ("reward_norm", self.actor.reward_norm),
             ("adv_norm", self.actor.adv_norm),
