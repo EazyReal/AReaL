@@ -103,7 +103,6 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         if not valid_results:
             return None
 
-        # Too few survivors to form an acceptable group -> drop it.
         if len(valid_results) < self.min_valid_group_size:
             self.logger.warning(
                 "GroupedRolloutWorkflow: only %s/%s trajectories valid "
