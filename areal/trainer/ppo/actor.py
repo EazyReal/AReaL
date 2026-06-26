@@ -403,6 +403,7 @@ class PPOActor:
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         loss_aggregation=self.config.loss_aggregation,
                         group_size=self.config.group_size,
+                        loss_aggregation_divisor=self.config.loss_aggregation_divisor,
                     ),
                     loss_weight_fn=_make_loss_weight_fn(
                         self.config.loss_aggregation, self.config.group_size
@@ -470,6 +471,7 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     loss_aggregation: str = "token_mean",
     group_size: int = 1,
+    loss_aggregation_divisor: float | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
 ):
@@ -536,6 +538,7 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
             loss_aggregation=loss_aggregation,
             group_size=group_size,
+            loss_aggregation_divisor=loss_aggregation_divisor,
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -552,6 +555,7 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
             loss_aggregation=loss_aggregation,
             group_size=group_size,
+            loss_aggregation_divisor=loss_aggregation_divisor,
         )
 
     # Joint Distillation KL Loss

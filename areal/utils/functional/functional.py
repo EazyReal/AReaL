@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -452,10 +453,12 @@ def compute_binary_kl_divergence(
 LOSS_AGGREGATION_TOKEN_MEAN = "token_mean"
 LOSS_AGGREGATION_SEQ_MEAN = "seq_mean"
 LOSS_AGGREGATION_PROMPT_MEAN = "prompt_mean"
+LOSS_AGGREGATION_CONSTANT = "constant"
 LOSS_AGGREGATIONS_ALL = (
     LOSS_AGGREGATION_TOKEN_MEAN,
     LOSS_AGGREGATION_SEQ_MEAN,
     LOSS_AGGREGATION_PROMPT_MEAN,
+    LOSS_AGGREGATION_CONSTANT,
 )
 
 
@@ -464,6 +467,7 @@ def aggregate_pg_loss(
     loss_mask: torch.Tensor,
     loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
     group_size: int = 1,
+    loss_aggregation_divisor: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     denom_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -471,14 +475,31 @@ def aggregate_pg_loss(
 
     ``token_mean`` averages valid tokens. ``seq_mean`` averages per-sequence
     token means. ``prompt_mean`` averages means over ``group_size`` consecutive
-    sequences. The returned microbatch mean must be paired with
-    ``_make_loss_weight_fn`` so distributed reduction computes the matching
-    global mean. ``denom_mask`` overrides only the denominator.
+    sequences. ``constant`` averages each sequence's masked token sum divided
+    by ``loss_aggregation_divisor``. The returned microbatch mean must be paired
+    with ``_make_loss_weight_fn`` so distributed reduction computes the matching
+    global mean. ``denom_mask`` overrides only the denominator for data-dependent
+    reductions.
     """
     if loss_aggregation not in LOSS_AGGREGATIONS_ALL:
         raise ValueError(
             f"loss_aggregation must be one of {LOSS_AGGREGATIONS_ALL}, "
             f"got {loss_aggregation!r}."
+        )
+
+    if loss_aggregation == LOSS_AGGREGATION_CONSTANT:
+        if (
+            loss_aggregation_divisor is None
+            or not math.isfinite(loss_aggregation_divisor)
+            or loss_aggregation_divisor <= 0
+        ):
+            raise ValueError(
+                "loss_aggregation_divisor must be a positive finite value "
+                "when loss_aggregation='constant'."
+            )
+    elif loss_aggregation_divisor is not None:
+        raise ValueError(
+            "loss_aggregation_divisor is only used when loss_aggregation='constant'."
         )
 
     num_mask = loss_mask.bool()
@@ -488,8 +509,27 @@ def aggregate_pg_loss(
         denom = den_mask.count_nonzero().clamp_min(1)
         return torch.where(num_mask, pg_loss, 0).sum() / denom
 
-    unit = group_size if loss_aggregation == LOSS_AGGREGATION_PROMPT_MEAN else 1
     masked_pg = torch.where(num_mask, pg_loss, 0).to(torch.float32)
+    if loss_aggregation == LOSS_AGGREGATION_CONSTANT:
+        if cu_seqlens is None:
+            if pg_loss.ndim != 2:
+                raise ValueError(
+                    "constant expects 2D pg_loss when cu_seqlens is None, "
+                    f"got shape {tuple(pg_loss.shape)}."
+                )
+            n_seqs = pg_loss.shape[0]
+        else:
+            if pg_loss.ndim != 1:
+                raise ValueError(
+                    "constant expects 1D pg_loss when cu_seqlens is provided, "
+                    f"got shape {tuple(pg_loss.shape)}."
+                )
+            n_seqs = cu_seqlens.numel() - 1
+        if n_seqs == 0:
+            return pg_loss.sum() * 0.0
+        return masked_pg.sum() / (n_seqs * loss_aggregation_divisor)
+
+    unit = group_size if loss_aggregation == LOSS_AGGREGATION_PROMPT_MEAN else 1
     den_f = den_mask.to(torch.float32)
 
     if cu_seqlens is None:
@@ -554,6 +594,7 @@ def ppo_actor_loss_fn(
     cu_seqlens: torch.Tensor | None = None,
     loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
     group_size: int = 1,
+    loss_aggregation_divisor: float | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -657,6 +698,7 @@ def ppo_actor_loss_fn(
         loss_mask,
         loss_aggregation=loss_aggregation,
         group_size=group_size,
+        loss_aggregation_divisor=loss_aggregation_divisor,
         cu_seqlens=cu_seqlens,
         denom_mask=orig_loss_mask,
     )
@@ -691,6 +733,7 @@ def sapo_loss_fn(
     cu_seqlens: torch.Tensor | None = None,
     loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
     group_size: int = 1,
+    loss_aggregation_divisor: float | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
@@ -747,6 +790,7 @@ def sapo_loss_fn(
         loss_mask,
         loss_aggregation=loss_aggregation,
         group_size=group_size,
+        loss_aggregation_divisor=loss_aggregation_divisor,
         cu_seqlens=cu_seqlens,
     )
 

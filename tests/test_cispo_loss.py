@@ -175,5 +175,12 @@ def test_cispo_config_validation():
             eps_clip_higher=4.0,
             loss_aggregation="seq_mean",
         )
+    with pytest.raises(ValueError, match="loss_aggregation"):
+        PPOActorConfig(
+            use_cispo_loss=True,
+            eps_clip_higher=4.0,
+            loss_aggregation="constant",
+            loss_aggregation_divisor=10,
+        )
     # Valid configuration does not raise.
     PPOActorConfig(use_cispo_loss=True, eps_clip=1.0, eps_clip_higher=4.0)

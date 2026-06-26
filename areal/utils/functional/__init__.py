@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.utils.functional.functional import (
+    LOSS_AGGREGATION_CONSTANT,
     LOSS_AGGREGATION_PROMPT_MEAN,
     LOSS_AGGREGATION_SEQ_MEAN,
     LOSS_AGGREGATION_TOKEN_MEAN,
@@ -24,6 +25,7 @@ from areal.utils.functional.vocab_parallel import (
 
 __all__ = [
     # functional.py
+    "LOSS_AGGREGATION_CONSTANT",
     "LOSS_AGGREGATION_PROMPT_MEAN",
     "LOSS_AGGREGATION_SEQ_MEAN",
     "LOSS_AGGREGATION_TOKEN_MEAN",

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import warnings
 from dataclasses import MISSING as dataclass_missing
@@ -1582,8 +1583,17 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Policy-gradient loss reduction. 'token_mean' averages valid "
             "tokens, 'seq_mean' averages sequence means, and 'prompt_mean' averages "
-            "prompt-group means over gconfig.n_samples responses.",
-            "choices": ["token_mean", "seq_mean", "prompt_mean"],
+            "prompt-group means over gconfig.n_samples responses. 'constant' "
+            "averages each response's masked token sum divided by "
+            "loss_aggregation_divisor.",
+            "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
+        },
+    )
+    loss_aggregation_divisor: float | None = field(
+        default=None,
+        metadata={
+            "help": "Positive fixed denominator L for loss_aggregation='constant'. "
+            "Unused by other loss aggregation modes."
         },
     )
     group_size: int = field(
@@ -1701,10 +1711,30 @@ class PPOActorConfig(TrainEngineConfig):
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
 
-        if self.loss_aggregation not in ("token_mean", "seq_mean", "prompt_mean"):
+        if self.loss_aggregation not in (
+            "token_mean",
+            "seq_mean",
+            "prompt_mean",
+            "constant",
+        ):
             raise ValueError(
-                "loss_aggregation must be 'token_mean', 'seq_mean', or "
-                f"'prompt_mean', got {self.loss_aggregation!r}."
+                "loss_aggregation must be 'token_mean', 'seq_mean', "
+                f"'prompt_mean', or 'constant', got {self.loss_aggregation!r}."
+            )
+        if self.loss_aggregation == "constant":
+            if (
+                self.loss_aggregation_divisor is None
+                or not math.isfinite(self.loss_aggregation_divisor)
+                or self.loss_aggregation_divisor <= 0
+            ):
+                raise ValueError(
+                    "loss_aggregation_divisor must be a positive finite value "
+                    "when loss_aggregation='constant'."
+                )
+        elif self.loss_aggregation_divisor is not None:
+            raise ValueError(
+                "loss_aggregation_divisor is only used when "
+                "loss_aggregation='constant'."
             )
 
         # Validate CISPO configuration
@@ -1728,7 +1758,7 @@ class PPOActorConfig(TrainEngineConfig):
             if self.loss_aggregation != "token_mean":
                 raise ValueError(
                     "CISPO only supports loss_aggregation='token_mean'. "
-                    "Sequence/prompt-level CISPO has no published surrogate."
+                    "Non-token-mean CISPO has no published surrogate."
                 )
 
         super().__post_init__()

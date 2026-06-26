@@ -18,6 +18,8 @@ MASK = torch.tensor(
 )
 PROMPT_MEAN = 2.0
 TOKEN_MEAN = 2.2
+CONSTANT_DIVISOR = 10.0
+CONSTANT_MEAN = 0.55
 
 SEQ_PG = torch.tensor([[2.0, 2.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
 SEQ_MASK = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
@@ -62,13 +64,44 @@ def test_prompt_mean_packed_matches_padded():
     torch.testing.assert_close(loss, torch.tensor(PROMPT_MEAN))
 
 
-@pytest.mark.parametrize("aggregation", ["token_mean", "seq_mean", "prompt_mean"])
+def test_constant_normalizes_token_sum_by_fixed_sequence_divisor():
+    loss = aggregate_pg_loss(
+        PG,
+        MASK,
+        loss_aggregation="constant",
+        loss_aggregation_divisor=CONSTANT_DIVISOR,
+    )
+    torch.testing.assert_close(loss, torch.tensor(CONSTANT_MEAN))
+
+
+def test_constant_packed_matches_padded():
+    pg = PG.reshape(-1)
+    mask = MASK.reshape(-1)
+    cu_seqlens = torch.tensor([0, 3, 6, 9, 12], dtype=torch.int32)
+    loss = aggregate_pg_loss(
+        pg,
+        mask,
+        loss_aggregation="constant",
+        loss_aggregation_divisor=CONSTANT_DIVISOR,
+        cu_seqlens=cu_seqlens,
+    )
+    torch.testing.assert_close(loss, torch.tensor(CONSTANT_MEAN))
+
+
+@pytest.mark.parametrize(
+    "aggregation", ["token_mean", "seq_mean", "prompt_mean", "constant"]
+)
 def test_loss_weight_pairing_realizes_global_mean(aggregation):
     group_size = 2 if aggregation == "prompt_mean" else 1
+    divisor = CONSTANT_DIVISOR if aggregation == "constant" else None
     weight_fn = _make_loss_weight_fn(aggregation, group_size)
 
     full = aggregate_pg_loss(
-        PG, MASK, loss_aggregation=aggregation, group_size=group_size
+        PG,
+        MASK,
+        loss_aggregation=aggregation,
+        group_size=group_size,
+        loss_aggregation_divisor=divisor,
     )
 
     num = torch.tensor(0.0)
@@ -76,7 +109,11 @@ def test_loss_weight_pairing_realizes_global_mean(aggregation):
     for s in (slice(0, 2), slice(2, 4)):
         mb_pg, mb_mask = PG[s], MASK[s]
         loss_mb = aggregate_pg_loss(
-            mb_pg, mb_mask, loss_aggregation=aggregation, group_size=group_size
+            mb_pg,
+            mb_mask,
+            loss_aggregation=aggregation,
+            group_size=group_size,
+            loss_aggregation_divisor=divisor,
         )
         w = weight_fn({"loss_mask": mb_mask})
         num = num + loss_mb * w
@@ -172,6 +209,17 @@ def test_config_validation():
         )
     with pytest.raises(ValueError, match="loss_aggregation must be"):
         PPOActorConfig(loss_aggregation="bogus")
+    with pytest.raises(ValueError, match="loss_aggregation_divisor"):
+        PPOActorConfig(loss_aggregation="constant")
+    with pytest.raises(ValueError, match="loss_aggregation_divisor"):
+        PPOActorConfig(loss_aggregation="constant", loss_aggregation_divisor=0)
+    with pytest.raises(ValueError, match="loss_aggregation_divisor"):
+        PPOActorConfig(
+            loss_aggregation="constant", loss_aggregation_divisor=float("inf")
+        )
+    with pytest.raises(ValueError, match="only used"):
+        PPOActorConfig(loss_aggregation="seq_mean", loss_aggregation_divisor=10)
+    PPOActorConfig(loss_aggregation="constant", loss_aggregation_divisor=10)
     GRPOConfig(gconfig=GenerationHyperparameters(n_samples=1))
     GRPOConfig(
         gconfig=GenerationHyperparameters(n_samples=1),
