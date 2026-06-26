@@ -1586,6 +1586,11 @@ class PPOActorConfig(TrainEngineConfig):
             "prompt-group means over gconfig.n_samples responses. 'constant' "
             "averages each response's masked token sum divided by "
             "loss_aggregation_divisor.",
+            "help_zh": "Policy-gradient loss 的归约方式。'token_mean' 对有效 token "
+            "求平均，'seq_mean' 对每条序列的均值求平均，'prompt_mean' 对 "
+            "gconfig.n_samples 个 response 组成的 prompt group 均值求平均。"
+            "'constant' 将每条 response 的 masked token loss 之和除以 "
+            "loss_aggregation_divisor 后再求平均。",
             "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
         },
     )
@@ -1593,14 +1598,18 @@ class PPOActorConfig(TrainEngineConfig):
         default=None,
         metadata={
             "help": "Positive fixed denominator L for loss_aggregation='constant'. "
-            "Unused by other loss aggregation modes."
+            "Unused by other loss aggregation modes.",
+            "help_zh": "loss_aggregation='constant' 使用的正数固定分母 L。其他 "
+            "loss aggregation 模式不使用。",
         },
     )
     group_size: int = field(
         default=1,
         metadata={
             "help": "Internal prompt-group size for prompt_mean; derived from "
-            "gconfig.n_samples by PPOConfig.__post_init__."
+            "gconfig.n_samples by PPOConfig.__post_init__.",
+            "help_zh": "prompt_mean 使用的内部 prompt group 大小；由 "
+            "PPOConfig.__post_init__ 根据 gconfig.n_samples 推导。",
         },
     )
 
@@ -2230,7 +2239,10 @@ class InferenceEngineConfig:
         metadata={
             "help": "Minimum non-None trajectories required to keep a rollout "
             "group. Default 1 keeps non-empty partial groups; set to "
-            "gconfig.n_samples to require full groups. Must be in [1, group_size]."
+            "gconfig.n_samples to require full groups. Must be in [1, group_size].",
+            "help_zh": "保留一个 rollout group 所需的最小非 None trajectory 数。"
+            "默认值 1 会保留非空的 partial group；设为 gconfig.n_samples "
+            "则要求完整 group。必须在 [1, group_size] 范围内。",
         },
     )
     max_head_offpolicyness: int = field(
