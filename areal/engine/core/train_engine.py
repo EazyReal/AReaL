@@ -60,8 +60,6 @@ def compute_global_normalizers(
         [_sum_term_normalizer(mb_list, term) for term in loss_reduction.terms]
     )
     dist.all_reduce(normalizers, group=dp_group)
-    if normalizers.lt(0).any():
-        raise ValueError("Global loss normalizers must be non-negative.")
     return {
         term.name: normalizer
         for term, normalizer in zip(
