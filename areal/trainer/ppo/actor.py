@@ -34,6 +34,11 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
+    LOSS_AGGREGATION_CONSTANT,
+    LOSS_AGGREGATION_PROMPT_MEAN,
+    LOSS_AGGREGATION_SEQ_MEAN,
+    LOSS_AGGREGATION_TOKEN_MEAN,
+    LOSS_AGGREGATIONS_ALL,
     cispo_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
@@ -43,30 +48,60 @@ from areal.utils.perf_tracer import trace_perf
 
 logger = logging.getLogger("PPOActor")
 
+_LossWeightFn = Callable[[dict[str, Any]], torch.Tensor]
+_LossWeightFactory = Callable[[int], _LossWeightFn]
+
 
 def _ppo_loss_weight(data: dict[str, Any]) -> torch.Tensor:
     return data["loss_mask"].count_nonzero()
 
 
-def _make_loss_weight_fn(
-    loss_aggregation: str, group_size: int
-) -> Callable[[dict[str, Any]], torch.Tensor]:
+def _unit_count_weight(data: dict[str, Any], unit: int) -> torch.Tensor:
+    cu_seqlens = data.get("cu_seqlens")
+    if cu_seqlens is not None:
+        n_seqs = cu_seqlens.numel() - 1
+    else:
+        n_seqs = data["loss_mask"].shape[0]
+    n_units = n_seqs // unit
+    return torch.tensor(n_units, dtype=torch.float32, device=data["loss_mask"].device)
+
+
+def _make_unit_count_weight_fn(unit: int) -> _LossWeightFn:
+    def unit_count_weight(data: dict[str, Any]) -> torch.Tensor:
+        return _unit_count_weight(data, unit)
+
+    return unit_count_weight
+
+
+def _token_loss_weight_fn(_group_size: int) -> _LossWeightFn:
+    return _ppo_loss_weight
+
+
+def _sequence_loss_weight_fn(_group_size: int) -> _LossWeightFn:
+    return _make_unit_count_weight_fn(unit=1)
+
+
+def _prompt_loss_weight_fn(group_size: int) -> _LossWeightFn:
+    return _make_unit_count_weight_fn(unit=group_size)
+
+
+_LOSS_WEIGHT_FACTORIES: dict[str, _LossWeightFactory] = {
+    LOSS_AGGREGATION_TOKEN_MEAN: _token_loss_weight_fn,
+    LOSS_AGGREGATION_SEQ_MEAN: _sequence_loss_weight_fn,
+    LOSS_AGGREGATION_PROMPT_MEAN: _prompt_loss_weight_fn,
+    LOSS_AGGREGATION_CONSTANT: _sequence_loss_weight_fn,
+}
+
+
+def _make_loss_weight_fn(loss_aggregation: str, group_size: int) -> _LossWeightFn:
     """Return the microbatch weight paired with ``aggregate_pg_loss``."""
-    if loss_aggregation == "token_mean":
-        return _ppo_loss_weight
-
-    unit = group_size if loss_aggregation == "prompt_mean" else 1
-
-    def unit_mean_weight(x: dict[str, Any]) -> torch.Tensor:
-        cu_seqlens = x.get("cu_seqlens")
-        if cu_seqlens is not None:
-            n_seqs = cu_seqlens.numel() - 1
-        else:
-            n_seqs = x["loss_mask"].shape[0]
-        n_units = n_seqs // unit
-        return torch.tensor(n_units, dtype=torch.float32, device=x["loss_mask"].device)
-
-    return unit_mean_weight
+    try:
+        return _LOSS_WEIGHT_FACTORIES[loss_aggregation](group_size)
+    except KeyError as e:
+        raise ValueError(
+            f"loss_aggregation must be one of {LOSS_AGGREGATIONS_ALL}, "
+            f"got {loss_aggregation!r}."
+        ) from e
 
 
 class PPOActor:
