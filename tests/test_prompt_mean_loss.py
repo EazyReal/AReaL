@@ -121,6 +121,45 @@ def test_loss_weight_pairing_realizes_global_mean(aggregation):
     torch.testing.assert_close(num / den, full)
 
 
+@pytest.mark.parametrize(
+    "aggregation", ["token_mean", "seq_mean", "prompt_mean", "constant"]
+)
+def test_loss_weight_pairing_realizes_global_mean_for_packed_inputs(aggregation):
+    group_size = 2 if aggregation == "prompt_mean" else 1
+    divisor = CONSTANT_DIVISOR if aggregation == "constant" else None
+    weight_fn = _make_loss_weight_fn(aggregation, group_size)
+
+    pg = PG.reshape(-1)
+    mask = MASK.reshape(-1)
+    cu_seqlens = torch.tensor([0, 3, 6, 9, 12], dtype=torch.int32)
+    full = aggregate_pg_loss(
+        pg,
+        mask,
+        loss_aggregation=aggregation,
+        group_size=group_size,
+        loss_aggregation_divisor=divisor,
+        cu_seqlens=cu_seqlens,
+    )
+
+    num = torch.tensor(0.0)
+    den = torch.tensor(0.0)
+    for s in (slice(0, 6), slice(6, 12)):
+        mb_pg, mb_mask = pg[s], mask[s]
+        mb_cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+        loss_mb = aggregate_pg_loss(
+            mb_pg,
+            mb_mask,
+            loss_aggregation=aggregation,
+            group_size=group_size,
+            loss_aggregation_divisor=divisor,
+            cu_seqlens=mb_cu_seqlens,
+        )
+        w = weight_fn({"loss_mask": mb_mask, "cu_seqlens": mb_cu_seqlens})
+        num = num + loss_mb * w
+        den = den + w
+    torch.testing.assert_close(num / den, full)
+
+
 def test_denom_mask_uses_pre_rejection_count():
     pg = torch.tensor([[2.0, 2.0, 2.0, 2.0]])
     loss_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
@@ -131,6 +170,29 @@ def test_denom_mask_uses_pre_rejection_count():
     torch.testing.assert_close(loss, torch.tensor(1.0))
     without = aggregate_pg_loss(pg, loss_mask, loss_aggregation="token_mean")
     torch.testing.assert_close(without, torch.tensor(2.0))
+
+
+@pytest.mark.parametrize(
+    ("aggregation", "group_size"), [("seq_mean", 1), ("prompt_mean", 2)]
+)
+def test_denom_mask_applies_to_unit_mean_denominator(aggregation, group_size):
+    pg = torch.tensor([[2.0, 2.0, 2.0, 2.0], [4.0, 4.0, 4.0, 4.0]])
+    loss_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+    denom_mask = torch.ones_like(loss_mask)
+
+    loss = aggregate_pg_loss(
+        pg,
+        loss_mask,
+        loss_aggregation=aggregation,
+        group_size=group_size,
+        denom_mask=denom_mask,
+    )
+    torch.testing.assert_close(loss, torch.tensor(1.5))
+
+    without = aggregate_pg_loss(
+        pg, loss_mask, loss_aggregation=aggregation, group_size=group_size
+    )
+    torch.testing.assert_close(without, torch.tensor(3.0))
 
 
 def test_prompt_mean_group_size_one_equals_seq_mean():
