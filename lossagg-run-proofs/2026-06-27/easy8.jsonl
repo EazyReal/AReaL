@@ -1,0 +1,8 @@
+{"prompt": "Compute 18 * 4 + 5. Give only the final integer answer.", "solutions": ["77"]}
+{"prompt": "Compute 19 * 5 + 5. Give only the final integer answer.", "solutions": ["100"]}
+{"prompt": "Compute 20 * 6 + 5. Give only the final integer answer.", "solutions": ["125"]}
+{"prompt": "Compute 21 * 7 + 5. Give only the final integer answer.", "solutions": ["152"]}
+{"prompt": "Compute 22 * 8 + 5. Give only the final integer answer.", "solutions": ["181"]}
+{"prompt": "Compute 23 * 9 + 5. Give only the final integer answer.", "solutions": ["212"]}
+{"prompt": "Compute 24 * 3 + 5. Give only the final integer answer.", "solutions": ["77"]}
+{"prompt": "Compute 25 * 4 + 5. Give only the final integer answer.", "solutions": ["105"]}
