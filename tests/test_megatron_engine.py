@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 from tests.utils import get_model_path
 
-from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, LossReduction, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MegatronEngineConfig,
@@ -70,6 +70,16 @@ def mock_loss_fn(
     return torch.mean(logprobs)
 
 
+def mock_loss_sum_fn(
+    logprobs: torch.Tensor,
+    entropy: torch.Tensor,
+    input_data: dict,
+    **kwargs,
+) -> torch.Tensor:
+    """Mock local numerator loss for testing sum reduction."""
+    return torch.sum(logprobs)
+
+
 # Cannot use a "module" scope since process groups can only be initialized once.
 @pytest.fixture
 def engine():
@@ -115,11 +125,22 @@ def test_simple_train(engine, mock_input):
     engine.train()
     train_result = engine.train_batch(
         mock_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: torch.tensor(1.0, device=engine.device),
+        ),
+    )
+    sum_train_result = engine.train_batch(
+        mock_input,
+        loss_reduction=LossReduction.sum(
+            loss_fn=mock_loss_sum_fn,
+            normalizer_fn=lambda x: x["loss_mask"].count_nonzero()
+            if "loss_mask" in x
+            else x["cu_seqlens"][-1],
+        ),
     )
     engine.step_lr_scheduler()
-    logger.info(f"Train done, result={train_result}")
+    logger.info(f"Train done, result={train_result}, sum_result={sum_train_result}")
 
 
 @torch.no_grad()

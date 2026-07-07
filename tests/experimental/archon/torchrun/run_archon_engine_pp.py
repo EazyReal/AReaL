@@ -31,7 +31,7 @@ from tests.experimental.archon.torchrun.dist_utils import (
 )
 from tests.utils import get_model_path
 
-from areal.api import FinetuneSpec, ParallelStrategy
+from areal.api import FinetuneSpec, LossReduction, ParallelStrategy
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
 from areal.experimental.engine.archon_engine import ArchonEngine
 
@@ -95,8 +95,17 @@ def mock_loss_fn(
     return torch.mean(logprobs)
 
 
-def mock_loss_weight_fn(input_data: dict) -> torch.Tensor:
-    """Mock loss weight function for testing."""
+def mock_loss_sum_fn(
+    logprobs: torch.Tensor,
+    entropy: torch.Tensor,
+    input_data: dict,
+    **kwargs,
+) -> torch.Tensor:
+    """Mock local numerator loss for testing sum reduction."""
+    return torch.sum(logprobs)
+
+
+def mock_normalizer_fn(input_data: dict) -> torch.Tensor:
     return input_data["cu_seqlens"][-1].float()
 
 
@@ -181,8 +190,10 @@ def test_eval_batch(engine: ArchonEngine, mock_input: dict) -> bool:
     try:
         loss = engine.eval_batch(
             mock_input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=mock_loss_weight_fn,
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=mock_normalizer_fn,
+            ),
         )
 
         # In PP mode, eval_batch may return None (TODO in ArchonEngine)
@@ -211,19 +222,35 @@ def test_train_batch(engine: ArchonEngine, mock_input: dict) -> bool:
     try:
         result = engine.train_batch(
             mock_input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=mock_loss_weight_fn,
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=mock_normalizer_fn,
+            ),
+        )
+        sum_result = engine.train_batch(
+            mock_input,
+            loss_reduction=LossReduction.sum(
+                loss_fn=mock_loss_sum_fn,
+                normalizer_fn=mock_normalizer_fn,
+            ),
         )
 
         print_rank0("  train_batch result:")
         print_rank0(f"    update_successful = {result.get('update_successful')}")
         print_rank0(f"    grad_norm = {result.get('grad_norm'):.6f}")
         print_rank0(f"    lr = {result.get('lr'):.2e}")
+        print_rank0("  train_batch sum-reduction result:")
+        print_rank0(f"    update_successful = {sum_result.get('update_successful')}")
+        print_rank0(f"    grad_norm = {sum_result.get('grad_norm'):.6f}")
+        print_rank0(f"    lr = {sum_result.get('lr'):.2e}")
 
         # Verify grad_norm is valid
         grad_norm = result.get("grad_norm")
         if grad_norm is None or not torch.isfinite(torch.tensor(grad_norm)):
             print_rank0("  WARNING: grad_norm is invalid")
+        sum_grad_norm = sum_result.get("grad_norm")
+        if sum_grad_norm is None or not torch.isfinite(torch.tensor(sum_grad_norm)):
+            print_rank0("  WARNING: sum-reduction grad_norm is invalid")
 
         print_rank0("  train_batch PASSED")
         return True

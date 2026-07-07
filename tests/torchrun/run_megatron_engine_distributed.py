@@ -9,7 +9,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from transformers import AutoTokenizer
 
-from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, LossReduction, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MegatronEngineConfig,
@@ -239,6 +239,13 @@ def mock_loss_fn(
     return torch.mean(logprobs)
 
 
+def mock_loss_sum_fn(
+    logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict, **kwargs
+) -> torch.Tensor:
+    """Mock local numerator loss for testing sum reduction."""
+    return torch.sum(logprobs)
+
+
 def test_train(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
@@ -261,11 +268,23 @@ def test_train(
 
     train_result = engine.train_batch(
         input_=bcasted_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
     )
 
     print(f"final rank {rank} train_result: {train_result}")
+
+    sum_train_result = engine.train_batch(
+        input_=bcasted_input,
+        loss_reduction=LossReduction.sum(
+            loss_fn=mock_loss_sum_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
+    )
+
+    print(f"final rank {rank} sum_train_result: {sum_train_result}")
     current_platform.synchronize()
     dist.barrier()
     engine.destroy()
@@ -325,8 +344,10 @@ def test_grad_norm_mb_invariance(
 
         result = engine.train_batch(
             input_=bcasted_input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=lambda x: x["cu_seqlens"][-1],
+            ),
         )
         print(
             f"rank {rank} max_tokens_per_mb={max_tokens_per_mb} train_result={result}"
@@ -400,8 +421,10 @@ def test_train_dcp_save_load(
     # train step 1
     train_result = engine.train_batch(
         input_=bcasted_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
     )
 
     print(f"final rank {rank} train_result: {train_result}")
@@ -415,8 +438,10 @@ def test_train_dcp_save_load(
     # train step 2
     engine.train_batch(
         input_=bcasted_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
     )
 
     with torch.no_grad():
@@ -433,8 +458,10 @@ def test_train_dcp_save_load(
     # train step 2 after recover
     engine.train_batch(
         input_=bcasted_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
     )
 
     current_platform.synchronize()
@@ -576,8 +603,10 @@ def test_train_hf_save_load(
         )
         train_result = engine.train_batch(
             input_=bcasted_input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=lambda x: x["cu_seqlens"][-1],
+            ),
         )
         print(f"rank {rank} train_result: {train_result}")
         current_platform.synchronize()
