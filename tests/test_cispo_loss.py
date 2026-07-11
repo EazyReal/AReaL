@@ -3,7 +3,11 @@ import pytest
 import torch
 
 from areal.api.cli_args import PPOActorConfig, RejectionSamplingConfig
-from areal.utils.functional import apply_rejection_sampling, cispo_loss_fn
+from areal.utils.functional import (
+    PolicyGradientReduction,
+    apply_rejection_sampling,
+    cispo_loss_fn,
+)
 
 BANDS = [(0.2, 0.28), (1.0, 4.0)]
 
@@ -141,7 +145,7 @@ def test_cispo_respects_sequence_loss_aggregation():
         eps_clip=1.0,
         eps_clip_higher=4.0,
         loss_mask=loss_mask,
-        loss_aggregation="seq_mean",
+        pg_reduction=PolicyGradientReduction(mode="seq_mean"),
     )
 
     torch.testing.assert_close(loss, torch.tensor(3.0))
@@ -162,8 +166,7 @@ def test_cispo_prompt_mean_accepts_partial_group_sizes():
         eps_clip=1.0,
         eps_clip_higher=4.0,
         loss_mask=loss_mask,
-        loss_aggregation="prompt_mean",
-        group_size=2,
+        pg_reduction=PolicyGradientReduction(mode="prompt_mean", group_size=2),
         group_sizes=[2, 1],
     )
 

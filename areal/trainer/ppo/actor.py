@@ -32,8 +32,9 @@ from areal.utils.data import (
 from areal.utils.functional import (
     LOSS_AGGREGATION_PROMPT_MEAN,
     LOSS_AGGREGATION_TOKEN_MEAN,
+    PolicyGradientReduction,
+    apply_rejection_sampling,
     cispo_loss_fn,
-    make_pg_loss_normalizer_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
@@ -57,7 +58,10 @@ def _make_actor_loss_normalizer_fn(
     prox_logp_method: str,
     current_version: int | None,
 ):
-    normalizer_fn = make_pg_loss_normalizer_fn(loss_aggregation, group_size)
+    normalizer_fn = PolicyGradientReduction(
+        mode=loss_aggregation,
+        group_size=group_size,
+    ).normalizer_fn
     if m2_threshold is None:
         return normalizer_fn
 
@@ -408,6 +412,11 @@ class PPOActor:
 
         with stats_tracker.scope("update"):
             current_version = self.engine.get_version()
+            pg_reduction = PolicyGradientReduction(
+                mode=self.config.loss_aggregation,
+                group_size=self.config.group_size,
+                divisor=self.config.loss_aggregation_divisor,
+            )
 
             for mb in mb_inputs.mbs:
                 use_sum_reduction = _use_sum_pg_loss(mb, self.m2_threshold)
@@ -426,10 +435,8 @@ class PPOActor:
                     sapo_tau_neg=self.config.sapo_tau_neg,
                     use_cispo_loss=self.config.use_cispo_loss,
                     use_decoupled_loss=self.config.use_decoupled_loss,
-                    loss_aggregation=self.config.loss_aggregation,
-                    group_size=self.config.group_size,
-                    loss_aggregation_divisor=self.config.loss_aggregation_divisor,
-                    return_sum=use_sum_reduction,
+                    pg_reduction=pg_reduction,
+                    local_mean=not use_sum_reduction,
                 )
                 normalizer_fn = _make_actor_loss_normalizer_fn(
                     self.config.loss_aggregation,
@@ -509,10 +516,8 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
-    loss_aggregation: str = "token_mean",
-    group_size: int = 1,
-    loss_aggregation_divisor: float | None = None,
-    return_sum: bool = False,
+    pg_reduction: PolicyGradientReduction | None = None,
+    local_mean: bool = True,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
@@ -543,6 +548,17 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
+    pg_reduction = pg_reduction or PolicyGradientReduction()
+    rejection_sampling_result = None
+    if rejection_sampling is not None and not use_sapo_loss:
+        rejection_sampling_result = apply_rejection_sampling(
+            proximal_logprobs=prox_logp,
+            old_logprobs=old_logp,
+            loss_mask=loss_mask,
+            cu_seqlens=input_data.get("cu_seqlens"),
+            config=rejection_sampling,
+        )
+
     if use_cispo_loss:
         if use_sapo_loss:
             raise ValueError(
@@ -562,13 +578,11 @@ def grpo_loss_fn(
             eps_clip_higher=eps_clip_higher,
             loss_mask=loss_mask,
             old_logprobs=old_logp,
-            rejection_sampling=rejection_sampling,
+            rejection_sampling_result=rejection_sampling_result,
             cu_seqlens=input_data.get("cu_seqlens"),
-            loss_aggregation=loss_aggregation,
-            group_size=group_size,
-            loss_aggregation_divisor=loss_aggregation_divisor,
             group_sizes=input_data.get("group_sizes"),
-            return_sum=return_sum,
+            pg_reduction=pg_reduction,
+            local_mean=local_mean,
         )
     elif use_sapo_loss:
         if use_decoupled_loss:
@@ -585,11 +599,9 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
-            loss_aggregation=loss_aggregation,
-            group_size=group_size,
-            loss_aggregation_divisor=loss_aggregation_divisor,
             group_sizes=input_data.get("group_sizes"),
-            return_sum=return_sum,
+            pg_reduction=pg_reduction,
+            local_mean=local_mean,
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -601,25 +613,28 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             c_clip=c_clip,
             proximal_logprobs=prox_logp,
-            rejection_sampling=rejection_sampling,
+            rejection_sampling_result=rejection_sampling_result,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
-            loss_aggregation=loss_aggregation,
-            group_size=group_size,
-            loss_aggregation_divisor=loss_aggregation_divisor,
             group_sizes=input_data.get("group_sizes"),
-            return_sum=return_sum,
+            pg_reduction=pg_reduction,
+            local_mean=local_mean,
         )
 
     teacher_logp = input_data.get("teacher_logp")
+    effective_loss_mask = (
+        rejection_sampling_result.loss_mask
+        if rejection_sampling_result is not None
+        else loss_mask
+    )
     rkl_stat = None
     if teacher_logp is not None:
-        if loss_aggregation != LOSS_AGGREGATION_TOKEN_MEAN:
+        if pg_reduction.mode != LOSS_AGGREGATION_TOKEN_MEAN:
             raise ValueError(
                 "teacher_logp distillation is only supported with "
                 "loss_aggregation='token_mean'."
             )
-        if return_sum:
+        if not local_mean:
             raise ValueError(
                 "return_sum=True is not supported with teacher_logp. Use the "
                 "mean reduction so distillation keeps its own local normalization."
@@ -633,23 +648,29 @@ def grpo_loss_fn(
             rkl_reward = teacher_logp - logprobs.detach()
             importance_weight = torch.exp(logprobs - old_logp)
 
-            rkl_weighted_term = importance_weight * rkl_reward * loss_mask
+            rkl_weighted_term = importance_weight * rkl_reward * effective_loss_mask
 
             kd_coef = -1 * distill_loss_weight
-            loss = kd_coef * rkl_weighted_term.sum() / loss_mask.sum().clamp(min=1)
+            loss = (
+                kd_coef
+                * rkl_weighted_term.sum()
+                / effective_loss_mask.sum().clamp(min=1)
+            )
 
             rkl_stat = -1 * rkl_weighted_term
         else:
-            rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
-            rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
+            rkl_penalty_per_token = (logprobs - teacher_logp) * effective_loss_mask
+            rkl_penalty = rkl_penalty_per_token.sum() / effective_loss_mask.sum().clamp(
+                min=1
+            )
 
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 
             rkl_stat = rkl_penalty_per_token
 
     stats_tracker.denominator(
-        n_tokens=infer_token_denominator(input_data, loss_mask),
-        n_valid_tokens=loss_mask.bool(),
+        n_tokens=infer_token_denominator(input_data, effective_loss_mask),
+        n_valid_tokens=effective_loss_mask.bool(),
         clipped_tokens=stat["clip_mask"],
         dual_clipped_tokens=stat["dual_clip_mask"],
     )
@@ -708,7 +729,7 @@ def grpo_loss_fn(
         )
 
     # Log proximal approximation metrics
-    compute_logp_mask = stat.get("behave_mask", loss_mask)
+    compute_logp_mask = stat.get("behave_mask", effective_loss_mask)
     _log_proximal_approximation_stats(
         prox_logp_method=prox_logp_method,
         prox_logp_gt=prox_logp_gt,
@@ -721,7 +742,7 @@ def grpo_loss_fn(
 
     # Log version staleness metrics
     if "versions" in input_data and current_version is not None:
-        version_metrics_mask = stat.get("behave_mask", loss_mask)
+        version_metrics_mask = stat.get("behave_mask", effective_loss_mask)
         _log_version_staleness_stats(
             versions=input_data["versions"],
             current_version=current_version,

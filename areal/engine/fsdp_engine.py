@@ -59,6 +59,7 @@ from areal.api import (
 )
 from areal.api.cli_args import OptimizerConfig, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
+from areal.api.loss_api import LossReductionInput, LossWeightFn, coerce_loss_reduction
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_global_normalizers,
@@ -763,9 +764,15 @@ class FSDPEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReduction,
+        loss_reduction: LossReductionInput | None = None,
+        loss_weight_fn: LossWeightFn | None = None,
+        *,
+        loss_fn: Callable[..., torch.Tensor] | None = None,
     ) -> dict[str, float]:
         self._ensure_ready()
+        loss_reduction = coerce_loss_reduction(
+            loss_reduction, loss_weight_fn, loss_fn=loss_fn
+        )
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -798,9 +805,15 @@ class FSDPEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReduction,
+        loss_reduction: LossReductionInput | None = None,
+        loss_weight_fn: LossWeightFn | None = None,
+        *,
+        loss_fn: Callable[..., torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         self._ensure_ready()
+        loss_reduction = coerce_loss_reduction(
+            loss_reduction, loss_weight_fn, loss_fn=loss_fn
+        )
 
         input_batched, _ = self._normalize_batch_input(input_)
 
@@ -2048,6 +2061,8 @@ class FSDPEngine(TrainEngine):
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
         local_normalizers = compute_local_normalizers(ctx.mb_input, loss_reduction)
+        if all(normalizer == 0 for normalizer in local_normalizers.values()):
+            return logits.mean() * 0.0
 
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(

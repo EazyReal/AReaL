@@ -6,12 +6,14 @@ from areal.engine.core.train_engine import (
     aggregate_eval_losses,
     compute_global_normalizers,
     compute_local_normalizers,
+    compute_total_loss_weight,
     reorder_and_pad_outputs,
     scale_loss_for_reduction,
 )
 
 __all__ = [
     "aggregate_eval_losses",
+    "compute_total_loss_weight",
     "compute_global_normalizers",
     "compute_local_normalizers",
     "reorder_and_pad_outputs",

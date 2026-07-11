@@ -32,10 +32,10 @@ __all__ = [
 
 _LAZY_IMPORTS = {
     "TrainEngine": "areal.api.engine_api",
-    "LossReduction": "areal.api.engine_api",
-    "LossTerm": "areal.api.engine_api",
-    "LOSS_TERM_REDUCTION_MEAN": "areal.api.engine_api",
-    "LOSS_TERM_REDUCTION_SUM": "areal.api.engine_api",
+    "LossReduction": "areal.api.loss_api",
+    "LossTerm": "areal.api.loss_api",
+    "LOSS_TERM_REDUCTION_MEAN": "areal.api.loss_api",
+    "LOSS_TERM_REDUCTION_SUM": "areal.api.loss_api",
     "InferenceEngine": "areal.api.engine_api",
     "Scheduler": "areal.api.scheduler_api",
     "Worker": "areal.api.scheduler_api",

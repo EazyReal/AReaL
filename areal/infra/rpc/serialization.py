@@ -649,9 +649,6 @@ def serialize_value(value: Any) -> Any:
             "value": value.value,
         }
 
-    if callable(value) and not isinstance(value, type):
-        raise ValueError("RPC serialization does not support callable values.")
-
     # Primitives (int, float, str, bool) pass through unchanged
     return value
 
@@ -751,9 +748,6 @@ def deserialize_value(value: Any) -> Any:
                 logger.warning(
                     f"Failed to deserialize ray.ObjectRef, treating as regular dict: {e}"
                 )
-
-        if value.get("type") == "callable":
-            raise ValueError("RPC deserialization does not support callable values.")
 
         # Check for SerializedTensor marker
         if value.get("type") == "tensor":

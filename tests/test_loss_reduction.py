@@ -9,6 +9,7 @@ from areal.api import (
     LossReduction,
     LossTerm,
 )
+from areal.api.loss_api import coerce_loss_reduction
 from areal.engine.core.train_engine import (
     compute_global_normalizers,
     scale_loss_for_reduction,
@@ -18,6 +19,32 @@ from areal.utils.data import MicroBatchList
 
 def _normalizer(_data):
     return torch.tensor(1.0)
+
+
+def test_coerce_loss_reduction_preserves_original_callback_api():
+    def loss_fn(*_args):
+        return torch.tensor(2.0)
+
+    def loss_weight_fn(_data):
+        return torch.tensor(3.0)
+
+    positional = coerce_loss_reduction(loss_fn, loss_weight_fn)
+    keyword = coerce_loss_reduction(
+        loss_fn=loss_fn,
+        loss_weight_fn=loss_weight_fn,
+    )
+
+    for reduction in (positional, keyword):
+        assert reduction.loss_fn is loss_fn
+        assert reduction.terms[0].normalizer_fn is loss_weight_fn
+        assert reduction.terms[0].reduction == "mean"
+
+
+def test_coerce_loss_reduction_rejects_mixed_contracts():
+    reduction = LossReduction.mean(lambda: torch.tensor(1.0), _normalizer)
+
+    with pytest.raises(TypeError, match="only valid with the original loss_fn API"):
+        coerce_loss_reduction(reduction, _normalizer)
 
 
 def test_mean_scaling_preserves_local_mean_order():

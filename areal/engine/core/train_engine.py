@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from areal.api.engine_api import (
+from areal.api.loss_api import (
     LOSS_TERM_REDUCTION_MEAN,
     LossFnOutput,
     LossReduction,
@@ -27,12 +27,37 @@ from areal.utils.data import (
 )
 
 __all__ = [
+    "compute_total_loss_weight",
     "compute_global_normalizers",
     "compute_local_normalizers",
     "scale_loss_for_reduction",
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
 ]
+
+
+def compute_total_loss_weight(
+    mb_list: MicroBatchList,
+    loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+    dp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Compute total loss weight and all_reduce across data parallel group.
+
+    This is the original pre-PR helper retained for callers that still use the
+    callback-based engine API.
+    """
+    total_weight = (
+        torch.stack([loss_weight_fn(mb) for mb in mb_list.mbs])
+        .sum()
+        .detach()
+        .clone()
+        .to(dtype=torch.float32)
+    )
+    dist.all_reduce(total_weight, group=dp_group)
+    assert total_weight > 0, (
+        "Global total loss weight must be positive after all_reduce"
+    )
+    return total_weight
 
 
 def compute_local_normalizers(

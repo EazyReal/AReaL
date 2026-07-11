@@ -36,6 +36,7 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec
 from areal.api.io_struct import DeviceRuntimeInfo
+from areal.api.loss_api import LossReductionInput, LossWeightFn, coerce_loss_reduction
 from areal.engine.core.distributed import (
     patch_dist_group_timeout,
     warmup_process_groups,
@@ -528,10 +529,16 @@ class ArchonEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReduction,
+        loss_reduction: LossReductionInput | None = None,
+        loss_weight_fn: LossWeightFn | None = None,
+        *,
+        loss_fn: Callable[..., torch.Tensor] | None = None,
     ) -> dict[str, float]:
         """Train on a batch of data."""
         assert self._initialized
+        loss_reduction = coerce_loss_reduction(
+            loss_reduction, loss_weight_fn, loss_fn=loss_fn
+        )
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -564,10 +571,16 @@ class ArchonEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReduction,
+        loss_reduction: LossReductionInput | None = None,
+        loss_weight_fn: LossWeightFn | None = None,
+        *,
+        loss_fn: Callable[..., torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """Evaluate on a batch of data."""
         assert self._initialized
+        loss_reduction = coerce_loss_reduction(
+            loss_reduction, loss_weight_fn, loss_fn=loss_fn
+        )
 
         input_batched, _ = self._normalize_batch_input(input_)
 
@@ -1266,6 +1279,8 @@ class ArchonEngine(TrainEngine):
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
         local_normalizers = compute_local_normalizers(ctx.mb_input, loss_reduction)
+        if all(normalizer == 0 for normalizer in local_normalizers.values()):
+            return logits.mean() * 0.0
 
         if not self.config.is_critic:
             result = self._gather_actor_train_outputs(logits, ctx)

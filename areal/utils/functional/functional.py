@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import math
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +10,9 @@ import torch.distributed as dist
 
 from areal.api.cli_args import RejectionSamplingConfig
 from areal.utils.data import KLEstimator
+from areal.utils.functional.loss_aggregation import (
+    PolicyGradientReduction,
+)
 
 
 @torch.no_grad()
@@ -442,6 +443,41 @@ def apply_rejection_sampling(
     )
 
 
+def _resolve_rejection_sampling_result(
+    *,
+    proximal_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    config: RejectionSamplingConfig | None,
+    result: RejectionSamplingResult | None,
+) -> RejectionSamplingResult | None:
+    """Resolve rejection sampling once when multiple loss terms share a mask."""
+    if result is not None:
+        if config is not None:
+            raise ValueError(
+                "pass either rejection_sampling or rejection_sampling_result, not both"
+            )
+        if old_logprobs is None:
+            raise ValueError(
+                "old_logprobs are required when rejection_sampling_result is enabled."
+            )
+        return result
+    if config is None:
+        return None
+    if old_logprobs is None:
+        raise ValueError(
+            "old_logprobs are required when rejection_sampling is enabled."
+        )
+    return apply_rejection_sampling(
+        proximal_logprobs=proximal_logprobs,
+        old_logprobs=old_logprobs,
+        loss_mask=loss_mask,
+        cu_seqlens=cu_seqlens,
+        config=config,
+    )
+
+
 def compute_binary_kl_divergence(
     log_p: torch.Tensor, log_q: torch.Tensor, eps: float = 1e-8
 ) -> torch.Tensor:
@@ -454,655 +490,6 @@ def compute_binary_kl_divergence(
     return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
 
 
-LOSS_AGGREGATION_TOKEN_MEAN = "token_mean"
-LOSS_AGGREGATION_SEQ_MEAN = "seq_mean"
-LOSS_AGGREGATION_PROMPT_MEAN = "prompt_mean"
-LOSS_AGGREGATION_CONSTANT = "constant"
-
-
-_PgLossReducer = Callable[
-    [
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        int,
-        float | None,
-        torch.Tensor | None,
-        list[int] | None,
-        str,
-    ],
-    torch.Tensor,
-]
-_PgLossSumReducer = _PgLossReducer
-_PgLossNormalizerFn = Callable[[dict[str, Any]], torch.Tensor]
-_PgLossNormalizerFactory = Callable[[int], _PgLossNormalizerFn]
-
-
-def _masked_pg_loss(pg_loss: torch.Tensor, num_mask: torch.Tensor) -> torch.Tensor:
-    return torch.where(num_mask, pg_loss, 0).to(torch.float32)
-
-
-def _resolve_pg_masks(
-    pg_loss: torch.Tensor,
-    loss_mask: torch.Tensor,
-    denom_mask: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if loss_mask.shape != pg_loss.shape:
-        raise ValueError(
-            f"loss_mask shape {tuple(loss_mask.shape)} must match "
-            f"pg_loss shape {tuple(pg_loss.shape)}."
-        )
-    if denom_mask is not None and denom_mask.shape != pg_loss.shape:
-        raise ValueError(
-            f"denom_mask shape {tuple(denom_mask.shape)} must match "
-            f"pg_loss shape {tuple(pg_loss.shape)}."
-        )
-    num_mask = loss_mask.bool()
-    den_mask = num_mask if denom_mask is None else denom_mask.bool()
-    return num_mask, den_mask
-
-
-def _sum_active_unit_means(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
-    active = den > 0
-    return torch.where(active, num / den.clamp_min(1), torch.zeros_like(num)).sum()
-
-
-def _mean_active_unit_means(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
-    active = den > 0
-    active_count = active.count_nonzero().clamp_min(1)
-    return _sum_active_unit_means(num, den) / active_count
-
-
-def _count_active_packed_sequences(
-    den_mask: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    n_seqs: int,
-) -> torch.Tensor:
-    seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=den_mask.device, dtype=torch.long
-    )
-    seq_ids = torch.arange(n_seqs, device=den_mask.device).repeat_interleave(seq_lens)
-    den = torch.zeros(n_seqs, dtype=torch.float32, device=den_mask.device)
-    den.scatter_add_(0, seq_ids, den_mask.to(dtype=torch.float32))
-    return den.count_nonzero()
-
-
-def _validate_pg_group_sizes(n_seqs: int, group_sizes: list[int] | None) -> list[int]:
-    if group_sizes is None:
-        raise ValueError("group_sizes must be provided for explicit prompt groups.")
-    sizes = [int(size) for size in group_sizes]
-    if any(size <= 0 for size in sizes):
-        raise ValueError(f"group_sizes must be positive, got {sizes}.")
-    total = sum(sizes)
-    if total != n_seqs:
-        raise ValueError(f"group_sizes sum to {total} but sequence count is {n_seqs}.")
-    return sizes
-
-
-def _group_ids_from_sizes(group_sizes: list[int], device: torch.device) -> torch.Tensor:
-    sizes = torch.tensor(group_sizes, dtype=torch.long, device=device)
-    return torch.arange(len(group_sizes), device=device).repeat_interleave(sizes)
-
-
-def _pg_token_normalizer(data: dict[str, Any]) -> torch.Tensor:
-    return data["loss_mask"].count_nonzero()
-
-
-def _active_sequence_mask(data: dict[str, Any]) -> torch.Tensor:
-    loss_mask = data["loss_mask"].bool()
-    cu_seqlens = data.get("cu_seqlens")
-    if cu_seqlens is None:
-        return loss_mask.any(dim=-1)
-
-    n_seqs = cu_seqlens.numel() - 1
-    seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=loss_mask.device, dtype=torch.long
-    )
-    seq_ids = torch.arange(n_seqs, device=loss_mask.device).repeat_interleave(seq_lens)
-    active_tokens = torch.zeros(n_seqs, dtype=torch.float32, device=loss_mask.device)
-    active_tokens.scatter_add_(0, seq_ids, loss_mask.to(dtype=torch.float32))
-    return active_tokens > 0
-
-
-def _pg_unit_normalizer(data: dict[str, Any], unit: int) -> torch.Tensor:
-    active_seqs = _active_sequence_mask(data)
-    n_seqs = active_seqs.numel()
-    group_sizes = data.get("group_sizes")
-    if group_sizes is not None:
-        sizes = _validate_pg_group_sizes(n_seqs, group_sizes)
-        group_ids = _group_ids_from_sizes(sizes, active_seqs.device)
-        active_groups = torch.zeros(
-            len(sizes), dtype=torch.float32, device=active_seqs.device
-        )
-        active_groups.scatter_add_(0, group_ids, active_seqs.to(dtype=torch.float32))
-        return active_groups.count_nonzero().to(torch.float32)
-    if n_seqs % unit != 0:
-        raise ValueError(
-            f"microbatch sequence count {n_seqs} is not divisible by group_size {unit}."
-        )
-    return active_seqs.view(-1, unit).any(dim=-1).count_nonzero().to(torch.float32)
-
-
-def _make_pg_unit_normalizer_fn(unit: int) -> _PgLossNormalizerFn:
-    def pg_unit_normalizer(data: dict[str, Any]) -> torch.Tensor:
-        return _pg_unit_normalizer(data, unit)
-
-    return pg_unit_normalizer
-
-
-def _make_pg_token_normalizer_fn(_group_size: int) -> _PgLossNormalizerFn:
-    return _pg_token_normalizer
-
-
-def _make_pg_sequence_normalizer_fn(_group_size: int) -> _PgLossNormalizerFn:
-    return _make_pg_unit_normalizer_fn(unit=1)
-
-
-def _make_pg_prompt_normalizer_fn(group_size: int) -> _PgLossNormalizerFn:
-    return _make_pg_unit_normalizer_fn(unit=group_size)
-
-
-def _aggregate_token_mean(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    _group_size: int,
-    _loss_aggregation_divisor: float | None,
-    _cu_seqlens: torch.Tensor | None,
-    _group_sizes: list[int] | None,
-    _mode: str,
-) -> torch.Tensor:
-    denom = den_mask.count_nonzero().clamp_min(1)
-    return torch.where(num_mask, pg_loss, 0).sum() / denom
-
-
-def _aggregate_token_sum(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    _den_mask: torch.Tensor,
-    _group_size: int,
-    _loss_aggregation_divisor: float | None,
-    _cu_seqlens: torch.Tensor | None,
-    _group_sizes: list[int] | None,
-    _mode: str,
-) -> torch.Tensor:
-    return _masked_pg_loss(pg_loss, num_mask).sum()
-
-
-def _aggregate_constant(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    _group_size: int,
-    loss_aggregation_divisor: float | None,
-    cu_seqlens: torch.Tensor | None,
-    _group_sizes: list[int] | None,
-    _mode: str,
-) -> torch.Tensor:
-    divisor = loss_aggregation_divisor
-    assert divisor is not None
-
-    if cu_seqlens is None:
-        if pg_loss.ndim != 2:
-            raise ValueError(
-                "constant expects 2D pg_loss when cu_seqlens is None, "
-                f"got shape {tuple(pg_loss.shape)}."
-            )
-        active_seqs = den_mask.any(dim=-1).count_nonzero()
-    else:
-        if pg_loss.ndim != 1:
-            raise ValueError(
-                "constant expects 1D pg_loss when cu_seqlens is provided, "
-                f"got shape {tuple(pg_loss.shape)}."
-            )
-        n_seqs = cu_seqlens.numel() - 1
-        active_seqs = _count_active_packed_sequences(den_mask, cu_seqlens, n_seqs)
-    return _masked_pg_loss(pg_loss, num_mask).sum() / (
-        active_seqs.clamp_min(1) * divisor
-    )
-
-
-def _aggregate_constant_sum(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    _den_mask: torch.Tensor,
-    _group_size: int,
-    loss_aggregation_divisor: float | None,
-    cu_seqlens: torch.Tensor | None,
-    _group_sizes: list[int] | None,
-    _mode: str,
-) -> torch.Tensor:
-    divisor = loss_aggregation_divisor
-    assert divisor is not None
-
-    if cu_seqlens is None:
-        if pg_loss.ndim != 2:
-            raise ValueError(
-                "constant expects 2D pg_loss when cu_seqlens is None, "
-                f"got shape {tuple(pg_loss.shape)}."
-            )
-        n_seqs = pg_loss.shape[0]
-    else:
-        if pg_loss.ndim != 1:
-            raise ValueError(
-                "constant expects 1D pg_loss when cu_seqlens is provided, "
-                f"got shape {tuple(pg_loss.shape)}."
-            )
-        n_seqs = cu_seqlens.numel() - 1
-    if n_seqs == 0:
-        return pg_loss.sum() * 0.0
-    return _masked_pg_loss(pg_loss, num_mask).sum() / divisor
-
-
-def _aggregate_seq_mean(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    _group_size: int,
-    _loss_aggregation_divisor: float | None,
-    cu_seqlens: torch.Tensor | None,
-    _group_sizes: list[int] | None,
-    mode: str,
-) -> torch.Tensor:
-    return _aggregate_unit_mean(
-        pg_loss,
-        num_mask,
-        den_mask,
-        unit=1,
-        cu_seqlens=cu_seqlens,
-        group_sizes=None,
-        mode=mode,
-    )
-
-
-def _aggregate_seq_sum(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    _group_size: int,
-    _loss_aggregation_divisor: float | None,
-    cu_seqlens: torch.Tensor | None,
-    _group_sizes: list[int] | None,
-    mode: str,
-) -> torch.Tensor:
-    return _aggregate_unit_sum(
-        pg_loss,
-        num_mask,
-        den_mask,
-        unit=1,
-        cu_seqlens=cu_seqlens,
-        group_sizes=None,
-        mode=mode,
-    )
-
-
-def _aggregate_prompt_mean(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    group_size: int,
-    _loss_aggregation_divisor: float | None,
-    cu_seqlens: torch.Tensor | None,
-    group_sizes: list[int] | None,
-    mode: str,
-) -> torch.Tensor:
-    return _aggregate_unit_mean(
-        pg_loss,
-        num_mask,
-        den_mask,
-        unit=group_size,
-        cu_seqlens=cu_seqlens,
-        group_sizes=group_sizes,
-        mode=mode,
-    )
-
-
-def _aggregate_prompt_sum(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    group_size: int,
-    _loss_aggregation_divisor: float | None,
-    cu_seqlens: torch.Tensor | None,
-    group_sizes: list[int] | None,
-    mode: str,
-) -> torch.Tensor:
-    return _aggregate_unit_sum(
-        pg_loss,
-        num_mask,
-        den_mask,
-        unit=group_size,
-        cu_seqlens=cu_seqlens,
-        group_sizes=group_sizes,
-        mode=mode,
-    )
-
-
-def _aggregate_unit_mean(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    unit: int,
-    cu_seqlens: torch.Tensor | None,
-    group_sizes: list[int] | None,
-    mode: str,
-) -> torch.Tensor:
-    masked_pg = _masked_pg_loss(pg_loss, num_mask)
-    den_f = den_mask.to(torch.float32)
-
-    if cu_seqlens is None:
-        return _aggregate_padded_unit_mean(
-            pg_loss, unit, group_sizes, mode, masked_pg, den_f
-        )
-    return _aggregate_packed_unit_mean(
-        pg_loss, unit, cu_seqlens, group_sizes, mode, masked_pg, den_f
-    )
-
-
-def _aggregate_unit_sum(
-    pg_loss: torch.Tensor,
-    num_mask: torch.Tensor,
-    den_mask: torch.Tensor,
-    unit: int,
-    cu_seqlens: torch.Tensor | None,
-    group_sizes: list[int] | None,
-    mode: str,
-) -> torch.Tensor:
-    masked_pg = _masked_pg_loss(pg_loss, num_mask)
-    den_f = den_mask.to(torch.float32)
-
-    if cu_seqlens is None:
-        return _aggregate_padded_unit_sum(
-            pg_loss, unit, group_sizes, mode, masked_pg, den_f
-        )
-    return _aggregate_packed_unit_sum(
-        pg_loss, unit, cu_seqlens, group_sizes, mode, masked_pg, den_f
-    )
-
-
-def _aggregate_padded_unit_mean(
-    pg_loss: torch.Tensor,
-    unit: int,
-    group_sizes: list[int] | None,
-    mode: str,
-    masked_pg: torch.Tensor,
-    den_f: torch.Tensor,
-) -> torch.Tensor:
-    if pg_loss.ndim != 2:
-        raise ValueError(
-            f"{mode} expects 2D pg_loss when cu_seqlens is None, "
-            f"got shape {tuple(pg_loss.shape)}."
-        )
-    n, t = pg_loss.shape
-    if group_sizes is not None:
-        sizes = _validate_pg_group_sizes(n, group_sizes)
-        group_ids = _group_ids_from_sizes(sizes, pg_loss.device)
-        num = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        den = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        num.scatter_add_(0, group_ids, masked_pg.sum(dim=1))
-        den.scatter_add_(0, group_ids, den_f.sum(dim=1))
-        return _mean_active_unit_means(num, den)
-    if n % unit != 0:
-        raise ValueError(
-            f"{mode}: microbatch sequence count {n} is not divisible by "
-            f"group_size {unit}. Configure mb_spec.granularity >= group_size "
-            f"so prompt-groups stay contiguous within each microbatch."
-        )
-    g = n // unit
-    if g == 0:
-        return pg_loss.sum() * 0.0
-    num = masked_pg.view(g, unit, t).sum(dim=(1, 2))
-    den = den_f.view(g, unit, t).sum(dim=(1, 2))
-    return _mean_active_unit_means(num, den)
-
-
-def _aggregate_padded_unit_sum(
-    pg_loss: torch.Tensor,
-    unit: int,
-    group_sizes: list[int] | None,
-    mode: str,
-    masked_pg: torch.Tensor,
-    den_f: torch.Tensor,
-) -> torch.Tensor:
-    if pg_loss.ndim != 2:
-        raise ValueError(
-            f"{mode} expects 2D pg_loss when cu_seqlens is None, "
-            f"got shape {tuple(pg_loss.shape)}."
-        )
-    n, t = pg_loss.shape
-    if group_sizes is not None:
-        sizes = _validate_pg_group_sizes(n, group_sizes)
-        group_ids = _group_ids_from_sizes(sizes, pg_loss.device)
-        num = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        den = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        num.scatter_add_(0, group_ids, masked_pg.sum(dim=1))
-        den.scatter_add_(0, group_ids, den_f.sum(dim=1))
-        return _sum_active_unit_means(num, den)
-    if n % unit != 0:
-        raise ValueError(
-            f"{mode}: microbatch sequence count {n} is not divisible by "
-            f"group_size {unit}. Configure mb_spec.granularity >= group_size "
-            f"so prompt-groups stay contiguous within each microbatch."
-        )
-    g = n // unit
-    if g == 0:
-        return pg_loss.sum() * 0.0
-    num = masked_pg.view(g, unit, t).sum(dim=(1, 2))
-    den = den_f.view(g, unit, t).sum(dim=(1, 2))
-    return _sum_active_unit_means(num, den)
-
-
-def _aggregate_packed_unit_mean(
-    pg_loss: torch.Tensor,
-    unit: int,
-    cu_seqlens: torch.Tensor,
-    group_sizes: list[int] | None,
-    mode: str,
-    masked_pg: torch.Tensor,
-    den_f: torch.Tensor,
-) -> torch.Tensor:
-    if pg_loss.ndim != 1:
-        raise ValueError(
-            f"{mode} expects 1D pg_loss when cu_seqlens is provided, "
-            f"got shape {tuple(pg_loss.shape)}."
-        )
-    n_seqs = cu_seqlens.numel() - 1
-    seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=pg_loss.device, dtype=torch.long
-    )
-    if group_sizes is not None:
-        sizes = _validate_pg_group_sizes(n_seqs, group_sizes)
-        seq_group_ids = _group_ids_from_sizes(sizes, pg_loss.device)
-        group_ids = seq_group_ids.repeat_interleave(seq_lens)
-        num = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        den = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        num.scatter_add_(0, group_ids, masked_pg)
-        den.scatter_add_(0, group_ids, den_f)
-        return _mean_active_unit_means(num, den)
-    if n_seqs % unit != 0:
-        raise ValueError(
-            f"{mode}: packed microbatch has {n_seqs} sequences, not "
-            f"divisible by group_size {unit}. Configure "
-            f"mb_spec.granularity >= group_size."
-        )
-    g = n_seqs // unit
-    if g == 0:
-        return pg_loss.sum() * 0.0
-    seq_ids = torch.arange(n_seqs, device=pg_loss.device)
-    group_ids = (seq_ids // unit).repeat_interleave(seq_lens)
-    num = torch.zeros(g, dtype=torch.float32, device=pg_loss.device)
-    den = torch.zeros(g, dtype=torch.float32, device=pg_loss.device)
-    num.scatter_add_(0, group_ids, masked_pg)
-    den.scatter_add_(0, group_ids, den_f)
-    return _mean_active_unit_means(num, den)
-
-
-def _aggregate_packed_unit_sum(
-    pg_loss: torch.Tensor,
-    unit: int,
-    cu_seqlens: torch.Tensor,
-    group_sizes: list[int] | None,
-    mode: str,
-    masked_pg: torch.Tensor,
-    den_f: torch.Tensor,
-) -> torch.Tensor:
-    if pg_loss.ndim != 1:
-        raise ValueError(
-            f"{mode} expects 1D pg_loss when cu_seqlens is provided, "
-            f"got shape {tuple(pg_loss.shape)}."
-        )
-    n_seqs = cu_seqlens.numel() - 1
-    seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-        device=pg_loss.device, dtype=torch.long
-    )
-    if group_sizes is not None:
-        sizes = _validate_pg_group_sizes(n_seqs, group_sizes)
-        seq_group_ids = _group_ids_from_sizes(sizes, pg_loss.device)
-        group_ids = seq_group_ids.repeat_interleave(seq_lens)
-        num = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        den = torch.zeros(len(sizes), dtype=torch.float32, device=pg_loss.device)
-        num.scatter_add_(0, group_ids, masked_pg)
-        den.scatter_add_(0, group_ids, den_f)
-        return _sum_active_unit_means(num, den)
-    if n_seqs % unit != 0:
-        raise ValueError(
-            f"{mode}: packed microbatch has {n_seqs} sequences, not "
-            f"divisible by group_size {unit}. Configure "
-            f"mb_spec.granularity >= group_size."
-        )
-    g = n_seqs // unit
-    if g == 0:
-        return pg_loss.sum() * 0.0
-    seq_ids = torch.arange(n_seqs, device=pg_loss.device)
-    group_ids = (seq_ids // unit).repeat_interleave(seq_lens)
-    num = torch.zeros(g, dtype=torch.float32, device=pg_loss.device)
-    den = torch.zeros(g, dtype=torch.float32, device=pg_loss.device)
-    num.scatter_add_(0, group_ids, masked_pg)
-    den.scatter_add_(0, group_ids, den_f)
-    return _sum_active_unit_means(num, den)
-
-
-_PG_LOSS_REDUCERS: dict[str, _PgLossReducer] = {
-    LOSS_AGGREGATION_TOKEN_MEAN: _aggregate_token_mean,
-    LOSS_AGGREGATION_SEQ_MEAN: _aggregate_seq_mean,
-    LOSS_AGGREGATION_PROMPT_MEAN: _aggregate_prompt_mean,
-    LOSS_AGGREGATION_CONSTANT: _aggregate_constant,
-}
-_PG_LOSS_SUM_REDUCERS: dict[str, _PgLossSumReducer] = {
-    LOSS_AGGREGATION_TOKEN_MEAN: _aggregate_token_sum,
-    LOSS_AGGREGATION_SEQ_MEAN: _aggregate_seq_sum,
-    LOSS_AGGREGATION_PROMPT_MEAN: _aggregate_prompt_sum,
-    LOSS_AGGREGATION_CONSTANT: _aggregate_constant_sum,
-}
-_PG_LOSS_NORMALIZER_FACTORIES: dict[str, _PgLossNormalizerFactory] = {
-    LOSS_AGGREGATION_TOKEN_MEAN: _make_pg_token_normalizer_fn,
-    LOSS_AGGREGATION_SEQ_MEAN: _make_pg_sequence_normalizer_fn,
-    LOSS_AGGREGATION_PROMPT_MEAN: _make_pg_prompt_normalizer_fn,
-    LOSS_AGGREGATION_CONSTANT: _make_pg_sequence_normalizer_fn,
-}
-LOSS_AGGREGATIONS_ALL = tuple(_PG_LOSS_REDUCERS)
-
-
-def _validate_pg_loss_aggregation_config(
-    loss_aggregation: str, loss_aggregation_divisor: float | None
-) -> None:
-    if loss_aggregation not in _PG_LOSS_REDUCERS:
-        raise ValueError(
-            f"loss_aggregation must be one of {LOSS_AGGREGATIONS_ALL}, "
-            f"got {loss_aggregation!r}."
-        )
-
-    if loss_aggregation == LOSS_AGGREGATION_CONSTANT:
-        if (
-            loss_aggregation_divisor is None
-            or not math.isfinite(loss_aggregation_divisor)
-            or loss_aggregation_divisor <= 0
-        ):
-            raise ValueError(
-                "loss_aggregation_divisor must be a positive finite value "
-                "when loss_aggregation='constant'."
-            )
-    elif loss_aggregation_divisor is not None:
-        raise ValueError(
-            "loss_aggregation_divisor is only used when loss_aggregation='constant'."
-        )
-
-
-def make_pg_loss_normalizer_fn(
-    loss_aggregation: str, group_size: int
-) -> _PgLossNormalizerFn:
-    """Return the denominator normalizer paired with policy-gradient aggregation."""
-    try:
-        return _PG_LOSS_NORMALIZER_FACTORIES[loss_aggregation](group_size)
-    except KeyError as e:
-        raise ValueError(
-            f"loss_aggregation must be one of {LOSS_AGGREGATIONS_ALL}, "
-            f"got {loss_aggregation!r}."
-        ) from e
-
-
-def aggregate_pg_loss(
-    pg_loss: torch.Tensor,
-    loss_mask: torch.Tensor,
-    loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
-    group_size: int = 1,
-    loss_aggregation_divisor: float | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    denom_mask: torch.Tensor | None = None,
-    group_sizes: list[int] | None = None,
-) -> torch.Tensor:
-    """Reduce per-token policy-gradient loss to a microbatch scalar.
-
-    ``token_mean`` averages valid tokens. ``seq_mean`` averages per-sequence
-    token means. ``prompt_mean`` averages prompt-group means, using
-    ``group_sizes`` for partial groups and ``group_size`` otherwise.
-    ``constant`` averages each sequence's masked token sum divided by
-    ``loss_aggregation_divisor``. Pair the returned scalar with
-    ``make_pg_loss_normalizer_fn`` for distributed reduction.
-    """
-    _validate_pg_loss_aggregation_config(loss_aggregation, loss_aggregation_divisor)
-
-    num_mask, den_mask = _resolve_pg_masks(pg_loss, loss_mask, denom_mask)
-
-    return _PG_LOSS_REDUCERS[loss_aggregation](
-        pg_loss,
-        num_mask,
-        den_mask,
-        group_size,
-        loss_aggregation_divisor,
-        cu_seqlens,
-        group_sizes,
-        loss_aggregation,
-    )
-
-
-def aggregate_pg_loss_sum(
-    pg_loss: torch.Tensor,
-    loss_mask: torch.Tensor,
-    loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
-    group_size: int = 1,
-    loss_aggregation_divisor: float | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    denom_mask: torch.Tensor | None = None,
-    group_sizes: list[int] | None = None,
-) -> torch.Tensor:
-    """Reduce per-token policy-gradient loss to a local sum term."""
-    _validate_pg_loss_aggregation_config(loss_aggregation, loss_aggregation_divisor)
-
-    num_mask, den_mask = _resolve_pg_masks(pg_loss, loss_mask, denom_mask)
-
-    return _PG_LOSS_SUM_REDUCERS[loss_aggregation](
-        pg_loss,
-        num_mask,
-        den_mask,
-        group_size,
-        loss_aggregation_divisor,
-        cu_seqlens,
-        group_sizes,
-        loss_aggregation,
-    )
-
-
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
     proximal_logprobs: torch.Tensor,
@@ -1113,13 +500,12 @@ def ppo_actor_loss_fn(
     eps_clip_higher: float | None = None,
     c_clip: float | None = None,
     rejection_sampling: RejectionSamplingConfig | None = None,
+    rejection_sampling_result: RejectionSamplingResult | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
-    group_size: int = 1,
-    loss_aggregation_divisor: float | None = None,
     group_sizes: list[int] | None = None,
-    return_sum: bool = False,
+    pg_reduction: PolicyGradientReduction | None = None,
+    local_mean: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -1162,14 +548,15 @@ def ppo_actor_loss_fn(
     orig_loss_mask = loss_mask
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
-    if rejection_sampling is not None:
-        rs_result = apply_rejection_sampling(
-            proximal_logprobs=proximal_logprobs,
-            old_logprobs=old_logprobs,
-            loss_mask=loss_mask,
-            cu_seqlens=cu_seqlens,
-            config=rejection_sampling,
-        )
+    rs_result = _resolve_rejection_sampling_result(
+        proximal_logprobs=proximal_logprobs,
+        old_logprobs=old_logprobs,
+        loss_mask=loss_mask,
+        cu_seqlens=cu_seqlens,
+        config=rejection_sampling,
+        result=rejection_sampling_result,
+    )
+    if rs_result is not None:
         # mask mode updates loss_mask; clamp mode keeps it unchanged
         loss_mask = rs_result.loss_mask
         behave_imp_weight = rs_result.behave_imp_weight
@@ -1211,23 +598,21 @@ def ppo_actor_loss_fn(
         dual_clip_mask = torch.zeros_like(clip_mask)
 
     # Apply behavioural importance weight from rejection sampling
-    if rejection_sampling is not None:
+    if rs_result is not None:
         behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
         behave_mask = (behave_imp_weight > 0).logical_and(loss_mask.bool())
         behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    aggregate_fn = aggregate_pg_loss_sum if return_sum else aggregate_pg_loss
-    pg_loss = aggregate_fn(
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
         pg_loss,
         loss_mask,
-        loss_aggregation=loss_aggregation,
-        group_size=group_size,
-        loss_aggregation_divisor=loss_aggregation_divisor,
+        denominator_mask=orig_loss_mask,
         cu_seqlens=cu_seqlens,
-        denom_mask=orig_loss_mask,
         group_sizes=group_sizes,
+        local_mean=local_mean,
     )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
@@ -1239,7 +624,7 @@ def ppo_actor_loss_fn(
         dual_clip_mask=dual_clip_mask,
     )
 
-    if rejection_sampling is not None:
+    if rs_result is not None:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),
             behave_imp_weight=behave_imp_weight.detach(),
@@ -1258,11 +643,9 @@ def sapo_loss_fn(
     loss_mask: torch.Tensor,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
-    group_size: int = 1,
-    loss_aggregation_divisor: float | None = None,
     group_sizes: list[int] | None = None,
-    return_sum: bool = False,
+    pg_reduction: PolicyGradientReduction | None = None,
+    local_mean: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
@@ -1314,15 +697,13 @@ def sapo_loss_fn(
     # Compute loss
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
-    aggregate_fn = aggregate_pg_loss_sum if return_sum else aggregate_pg_loss
-    pg_loss = aggregate_fn(
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
         pg_loss,
         loss_mask,
-        loss_aggregation=loss_aggregation,
-        group_size=group_size,
-        loss_aggregation_divisor=loss_aggregation_divisor,
         cu_seqlens=cu_seqlens,
         group_sizes=group_sizes,
+        local_mean=local_mean,
     )
 
     stat = dict(
@@ -1348,12 +729,11 @@ def cispo_loss_fn(
     eps_clip_higher: float | None = None,
     old_logprobs: torch.Tensor | None = None,
     rejection_sampling: RejectionSamplingConfig | None = None,
+    rejection_sampling_result: RejectionSamplingResult | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    loss_aggregation: str = LOSS_AGGREGATION_TOKEN_MEAN,
-    group_size: int = 1,
-    loss_aggregation_divisor: float | None = None,
     group_sizes: list[int] | None = None,
-    return_sum: bool = False,
+    pg_reduction: PolicyGradientReduction | None = None,
+    local_mean: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
 
@@ -1411,14 +791,15 @@ def cispo_loss_fn(
         )
     orig_loss_mask = loss_mask
 
-    if rejection_sampling is not None:
-        rs_result = apply_rejection_sampling(
-            proximal_logprobs=proximal_logprobs,
-            old_logprobs=old_logprobs,
-            loss_mask=loss_mask,
-            cu_seqlens=cu_seqlens,
-            config=rejection_sampling,
-        )
+    rs_result = _resolve_rejection_sampling_result(
+        proximal_logprobs=proximal_logprobs,
+        old_logprobs=old_logprobs,
+        loss_mask=loss_mask,
+        cu_seqlens=cu_seqlens,
+        config=rejection_sampling,
+        result=rejection_sampling_result,
+    )
+    if rs_result is not None:
         loss_mask = rs_result.loss_mask
         behave_imp_weight = rs_result.behave_imp_weight
         filtered_fraction = rs_result.filtered_fraction
@@ -1430,23 +811,21 @@ def cispo_loss_fn(
     ratio_clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip_higher).detach()
     pg_loss = -ratio_clipped * advantages * logprobs
 
-    if rejection_sampling is not None:
+    if rs_result is not None:
         behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
         behave_mask = (behave_imp_weight > 0).logical_and(loss_mask.bool())
         behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    aggregate_fn = aggregate_pg_loss_sum if return_sum else aggregate_pg_loss
-    pg_loss = aggregate_fn(
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
         pg_loss,
         loss_mask,
-        loss_aggregation=loss_aggregation,
-        group_size=group_size,
-        loss_aggregation_divisor=loss_aggregation_divisor,
+        denominator_mask=orig_loss_mask,
         cu_seqlens=cu_seqlens,
-        denom_mask=orig_loss_mask,
         group_sizes=group_sizes,
+        local_mean=local_mean,
     )
 
     clip_mask = (ratio_clipped != ratio).logical_and(loss_mask)
@@ -1457,7 +836,7 @@ def cispo_loss_fn(
         clip_mask=clip_mask,
         dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
     )
-    if rejection_sampling is not None:
+    if rs_result is not None:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),
             behave_imp_weight=behave_imp_weight.detach(),

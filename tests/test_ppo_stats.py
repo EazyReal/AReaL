@@ -3,9 +3,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from areal.api.cli_args import RejectionSamplingConfig
 from areal.trainer.ppo.actor import grpo_loss_fn
 from areal.trainer.ppo.critic import ppo_loss_fn
 from areal.trainer.ppo.stats import infer_token_denominator
+from areal.utils.functional import PolicyGradientReduction
 from areal.utils.stats_tracker import DistributedStatsTracker
 
 
@@ -114,8 +116,48 @@ def test_teacher_logp_requires_token_mean_loss_aggregation():
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                loss_aggregation="seq_mean",
+                pg_reduction=PolicyGradientReduction(mode="seq_mean"),
             )
+
+
+def test_teacher_distillation_excludes_rejected_tokens_from_gradient():
+    logprobs = torch.zeros(1, 2, requires_grad=True)
+    input_data = {
+        "input_ids": torch.tensor([[11, 12]]),
+        "logprobs": torch.zeros(1, 2),
+        "advantages": torch.zeros(1, 2),
+        "loss_mask": torch.ones(1, 2, dtype=torch.bool),
+        "prox_logp": torch.tensor([[0.0, torch.log(torch.tensor(2.0))]]),
+        "versions": torch.zeros(1, 2, dtype=torch.int32),
+        "teacher_logp": torch.ones(1, 2),
+        "rl_loss_weight": 0.0,
+        "distill_loss_weight": 1.0,
+    }
+    rejection_sampling = RejectionSamplingConfig(
+        level="token", action="mask", metric="ratio", upper=1.5
+    )
+
+    with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
+        mock_tracker.denominator = MagicMock()
+        mock_tracker.stat = MagicMock()
+        mock_tracker.scope = MagicMock()
+        mock_tracker.scope.return_value.__enter__ = MagicMock()
+        mock_tracker.scope.return_value.__exit__ = MagicMock()
+
+        loss = grpo_loss_fn(
+            logprobs=logprobs,
+            entropy=torch.zeros(1, 2),
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            rejection_sampling=rejection_sampling,
+        )
+
+    loss.backward()
+    assert logprobs.grad is not None
+    assert logprobs.grad[0, 0] != 0
+    assert logprobs.grad[0, 1] == 0
 
 
 def test_critic_loss_fn_uses_full_cu_seqlens_for_n_tokens():
