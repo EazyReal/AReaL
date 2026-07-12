@@ -43,8 +43,22 @@ def compute_total_loss_weight(
 ) -> torch.Tensor:
     """Compute total loss weight and all_reduce across data parallel group.
 
-    This is the original pre-PR helper retained for callers that still use the
-    callback-based engine API.
+    This aggregates the loss weights from all micro-batches and reduces
+    them across the data parallel group to get a global normalization factor.
+
+    Parameters
+    ----------
+    mb_list : MicroBatchList
+        The list of micro-batches.
+    loss_weight_fn : Callable[[dict[str, Any]], torch.Tensor]
+        Function to compute loss weight for each micro-batch.
+    dp_group : dist.ProcessGroup
+        The data parallel process group for all_reduce.
+
+    Returns
+    -------
+    torch.Tensor
+        The total loss weight (scalar tensor) after all_reduce.
     """
     total_weight = (
         torch.stack([loss_weight_fn(mb) for mb in mb_list.mbs])
