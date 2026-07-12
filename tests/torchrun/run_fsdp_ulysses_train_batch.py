@@ -147,7 +147,7 @@ def test_ulysses(model_type: str):
             model_type, mb_spec, ulysses_sp_size=2, init_optimizer=True
         )
         engine.train()
-        engine.train_batch(
+        engine.train_batch_with_reduction(
             input_=input,
             loss_reduction=LossReduction.mean(
                 loss_fn=mock_loss_fn,
@@ -159,7 +159,7 @@ def test_ulysses(model_type: str):
         engine_golden = make_engine(model_type, mb_spec, init_optimizer=True)
         engine_golden.train()
         for input in input_chunks:
-            engine_golden.train_batch(
+            engine_golden.train_batch_with_reduction(
                 input_=input,
                 loss_reduction=LossReduction.mean(
                     loss_fn=mock_loss_fn,

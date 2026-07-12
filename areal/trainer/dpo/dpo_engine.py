@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from areal.api import LossReduction, TrainEngine
+from areal.api import TrainEngine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -56,12 +56,10 @@ class DPOEngine:
         self.engine.train()
         stats = self.engine.train_batch(
             input_=data,
-            loss_reduction=LossReduction.mean(
-                loss_fn=functools.partial(
-                    compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
-                ),
-                normalizer_fn=_dpo_loss_normalizer,
+            loss_fn=functools.partial(
+                compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
             ),
+            loss_weight_fn=_dpo_loss_normalizer,
         )
         stats_tracker.scalar(**stats)
 
@@ -74,12 +72,10 @@ class DPOEngine:
         self.engine.eval()
         self.engine.eval_batch(
             input_=data,
-            loss_reduction=LossReduction.mean(
-                loss_fn=functools.partial(
-                    compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
-                ),
-                normalizer_fn=_dpo_loss_normalizer,
+            loss_fn=functools.partial(
+                compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
             ),
+            loss_weight_fn=_dpo_loss_normalizer,
         )
 
     @trace_perf("dpo_engine.compute_logp", category="compute")

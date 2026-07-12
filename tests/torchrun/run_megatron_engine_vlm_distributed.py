@@ -278,7 +278,7 @@ def test_vlm_train(backend: str, output: str | None = None):
         bcasted_input = _make_input(engine)
 
         engine.train()
-        train_result = engine.train_batch(
+        train_result = engine.train_batch_with_reduction(
             input_=bcasted_input,
             loss_reduction=LossReduction.mean(
                 loss_fn=lambda logprobs, entropy, input_data, **kwargs: (

@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from areal.api import LossReduction, TrainEngine
+from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
@@ -47,13 +47,10 @@ from areal.v2.training_service.controller.controller import (
 logger = logging.getLogger("PPOActor")
 
 
-def _use_sum_pg_loss(data: dict[str, Any], m2_threshold: float | None) -> bool:
-    return "teacher_logp" not in data and m2_threshold is None
-
-
 def _make_actor_loss_normalizer_fn(
     loss_aggregation: str,
     group_size: int,
+    loss_aggregation_divisor: float | None,
     m2_threshold: float | None,
     prox_logp_method: str,
     current_version: int | None,
@@ -61,6 +58,7 @@ def _make_actor_loss_normalizer_fn(
     normalizer_fn = PolicyGradientReduction(
         mode=loss_aggregation,
         group_size=group_size,
+        divisor=loss_aggregation_divisor,
     ).normalizer_fn
     if m2_threshold is None:
         return normalizer_fn
@@ -419,7 +417,6 @@ class PPOActor:
             )
 
             for mb in mb_inputs.mbs:
-                use_sum_reduction = _use_sum_pg_loss(mb, self.m2_threshold)
                 loss_fn = functools.partial(
                     grpo_loss_fn,
                     eps_clip=self.config.eps_clip,
@@ -436,26 +433,21 @@ class PPOActor:
                     use_cispo_loss=self.config.use_cispo_loss,
                     use_decoupled_loss=self.config.use_decoupled_loss,
                     pg_reduction=pg_reduction,
-                    local_mean=not use_sum_reduction,
+                    local_mean=True,
                 )
                 normalizer_fn = _make_actor_loss_normalizer_fn(
                     self.config.loss_aggregation,
                     self.config.group_size,
+                    self.config.loss_aggregation_divisor,
                     self.m2_threshold,
                     self.config.prox_logp_method,
                     current_version,
                 )
-                if use_sum_reduction:
-                    loss_reduction = LossReduction.sum(
-                        loss_fn=loss_fn,
-                        normalizer_fn=normalizer_fn,
-                    )
-                else:
-                    loss_reduction = LossReduction.mean(
-                        loss_fn=loss_fn,
-                        normalizer_fn=normalizer_fn,
-                    )
-                train_stat = self.engine.train_batch(mb, loss_reduction=loss_reduction)
+                train_stat = self.engine.train_batch(
+                    mb,
+                    loss_fn=loss_fn,
+                    loss_weight_fn=normalizer_fn,
+                )
                 stats_tracker.scalar(**train_stat)
 
 
@@ -641,6 +633,7 @@ def grpo_loss_fn(
             )
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
+        loss_normalizer = loss_mask.count_nonzero().clamp_min(1)
 
         teacher_logp = teacher_logp.detach()
 
@@ -651,18 +644,12 @@ def grpo_loss_fn(
             rkl_weighted_term = importance_weight * rkl_reward * effective_loss_mask
 
             kd_coef = -1 * distill_loss_weight
-            loss = (
-                kd_coef
-                * rkl_weighted_term.sum()
-                / effective_loss_mask.sum().clamp(min=1)
-            )
+            loss = kd_coef * rkl_weighted_term.sum() / loss_normalizer
 
             rkl_stat = -1 * rkl_weighted_term
         else:
             rkl_penalty_per_token = (logprobs - teacher_logp) * effective_loss_mask
-            rkl_penalty = rkl_penalty_per_token.sum() / effective_loss_mask.sum().clamp(
-                min=1
-            )
+            rkl_penalty = rkl_penalty_per_token.sum() / loss_normalizer
 
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 

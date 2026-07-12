@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from areal.api import LossReduction, TrainEngine
+from areal.api import TrainEngine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -54,10 +54,8 @@ class RWEngine:
         self.engine.train()
         stats = self.engine.train_batch(
             input_=data,
-            loss_reduction=LossReduction.mean(
-                loss_fn=compute_rw_loss,
-                normalizer_fn=_rw_loss_normalizer,
-            ),
+            loss_fn=compute_rw_loss,
+            loss_weight_fn=_rw_loss_normalizer,
         )
         stats_tracker.scalar(**stats)
 
@@ -72,10 +70,8 @@ class RWEngine:
         self.engine.eval()
         self.engine.eval_batch(
             input_=data,
-            loss_reduction=LossReduction.mean(
-                loss_fn=compute_rw_loss,
-                normalizer_fn=_rw_loss_normalizer,
-            ),
+            loss_fn=compute_rw_loss,
+            loss_weight_fn=_rw_loss_normalizer,
         )
 
 

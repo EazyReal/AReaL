@@ -79,10 +79,11 @@ def reduce_pg_loss_sum(
     )
 
 
-def make_normalizer(loss_aggregation, group_size):
+def make_normalizer(loss_aggregation, group_size, loss_aggregation_divisor=None):
     return PolicyGradientReduction(
         mode=loss_aggregation,
         group_size=group_size,
+        divisor=loss_aggregation_divisor,
     ).normalizer_fn
 
 
@@ -105,7 +106,7 @@ def test_inactive_units_do_not_deflate_local_mean(aggregation):
     mask = torch.tensor([[1, 1], [0, 0], [0, 0]], dtype=torch.bool)
     kwargs = {
         "loss_aggregation": aggregation,
-        "group_size": 2,
+        "group_size": 2 if aggregation == "prompt_mean" else 1,
         "group_sizes": [2, 1],
     }
 
@@ -233,7 +234,7 @@ def test_constant_packed_matches_padded():
 def test_loss_normalizer_pairing_realizes_global_mean(aggregation):
     group_size = 2 if aggregation == "prompt_mean" else 1
     divisor = CONSTANT_DIVISOR if aggregation == "constant" else None
-    normalizer_fn = make_normalizer(aggregation, group_size)
+    normalizer_fn = make_normalizer(aggregation, group_size, divisor)
 
     full = reduce_pg_loss(
         PG,
@@ -266,7 +267,7 @@ def test_loss_normalizer_pairing_realizes_global_mean(aggregation):
 def test_loss_sum_pairing_realizes_global_mean(aggregation):
     group_size = 2 if aggregation == "prompt_mean" else 1
     divisor = CONSTANT_DIVISOR if aggregation == "constant" else None
-    normalizer_fn = make_normalizer(aggregation, group_size)
+    normalizer_fn = make_normalizer(aggregation, group_size, divisor)
 
     full = reduce_pg_loss(
         PG,
@@ -297,7 +298,7 @@ def test_loss_sum_pairing_realizes_global_mean(aggregation):
 def test_loss_normalizer_pairing_realizes_global_mean_for_packed_inputs(aggregation):
     group_size = 2 if aggregation == "prompt_mean" else 1
     divisor = CONSTANT_DIVISOR if aggregation == "constant" else None
-    normalizer_fn = make_normalizer(aggregation, group_size)
+    normalizer_fn = make_normalizer(aggregation, group_size, divisor)
 
     pg = PG.reshape(-1)
     mask = MASK.reshape(-1)
@@ -336,7 +337,7 @@ def test_loss_normalizer_pairing_realizes_global_mean_for_packed_inputs(aggregat
 def test_loss_sum_pairing_realizes_global_mean_for_packed_inputs(aggregation):
     group_size = 2 if aggregation == "prompt_mean" else 1
     divisor = CONSTANT_DIVISOR if aggregation == "constant" else None
-    normalizer_fn = make_normalizer(aggregation, group_size)
+    normalizer_fn = make_normalizer(aggregation, group_size, divisor)
 
     pg = PG.reshape(-1)
     mask = MASK.reshape(-1)
@@ -542,6 +543,7 @@ def test_m2po_normalizer_uses_post_filter_mask():
     normalizer = _make_actor_loss_normalizer_fn(
         "token_mean",
         group_size=1,
+        loss_aggregation_divisor=None,
         m2_threshold=0.1,
         prox_logp_method=PROX_LOGP_METHOD_RECOMPUTE,
         current_version=3,
@@ -555,10 +557,25 @@ def test_m2po_normalizer_uses_post_filter_mask():
     torch.testing.assert_close(normalizer(data), torch.tensor(2))
 
 
+def test_constant_actor_normalizer_carries_valid_reduction_config():
+    normalizer = _make_actor_loss_normalizer_fn(
+        "constant",
+        group_size=1,
+        loss_aggregation_divisor=10.0,
+        m2_threshold=None,
+        prox_logp_method=PROX_LOGP_METHOD_RECOMPUTE,
+        current_version=3,
+    )
+    data = {"loss_mask": torch.tensor([[1, 0], [1, 1]], dtype=torch.bool)}
+
+    torch.testing.assert_close(normalizer(data), torch.tensor(2.0))
+
+
 def test_m2po_normalizer_rejects_missing_prox_logp_for_loglinear():
     normalizer = _make_actor_loss_normalizer_fn(
         "token_mean",
         group_size=1,
+        loss_aggregation_divisor=None,
         m2_threshold=0.1,
         prox_logp_method=PROX_LOGP_METHOD_LOGLINEAR,
         current_version=3,
@@ -577,6 +594,7 @@ def test_m2po_normalizer_rejects_missing_prox_logp_for_reused_train_logp():
     normalizer = _make_actor_loss_normalizer_fn(
         "token_mean",
         group_size=1,
+        loss_aggregation_divisor=None,
         m2_threshold=0.1,
         prox_logp_method=PROX_LOGP_METHOD_REUSE_TRAIN_LOGP,
         current_version=3,
@@ -610,6 +628,21 @@ def test_non_token_packed_reduction_requires_sequence_boundaries():
         reduction.aggregate(loss, mask)
     with pytest.raises(ValueError, match="requires cu_seqlens"):
         reduction.normalizer_fn({"loss_mask": mask})
+
+
+@pytest.mark.parametrize("mode", ["token_mean", "seq_mean", "constant"])
+def test_group_size_is_only_valid_for_prompt_mean(mode):
+    with pytest.raises(ValueError, match="group_size is only valid"):
+        PolicyGradientReduction(
+            mode=mode,
+            group_size=2,
+            divisor=10.0 if mode == "constant" else None,
+        )
+
+
+def test_constant_reduction_requires_divisor_at_construction():
+    with pytest.raises(ValueError, match="positive finite"):
+        PolicyGradientReduction(mode="constant")
 
 
 def test_prompt_mean_group_size_one_equals_seq_mean():
@@ -721,6 +754,17 @@ def test_config_validation():
         )
     with pytest.raises(ValueError, match="only used"):
         PPOActorConfig(loss_aggregation="seq_mean", loss_aggregation_divisor=10)
+    with pytest.raises(ValueError, match="group_size is only valid"):
+        PPOActorConfig(loss_aggregation="seq_mean", group_size=2)
+    with pytest.raises(ValueError, match="positive finite"):
+        PPOActorConfig(m2_threshold=0)
+    with pytest.raises(ValueError, match="incompatible"):
+        PPOActorConfig(m2_threshold=0.1, prox_logp_method=PROX_LOGP_METHOD_LOGLINEAR)
+    with pytest.raises(ValueError, match="incompatible"):
+        PPOActorConfig(
+            m2_threshold=0.1,
+            prox_logp_method=PROX_LOGP_METHOD_REUSE_TRAIN_LOGP,
+        )
     PPOActorConfig(loss_aggregation="constant", loss_aggregation_divisor=10)
     GRPOConfig(gconfig=GenerationHyperparameters(n_samples=1))
     GRPOConfig(

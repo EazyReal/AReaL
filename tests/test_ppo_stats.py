@@ -160,6 +160,46 @@ def test_teacher_distillation_excludes_rejected_tokens_from_gradient():
     assert logprobs.grad[0, 1] == 0
 
 
+def test_teacher_distillation_rejection_uses_partition_invariant_normalizer():
+    rejection_sampling = RejectionSamplingConfig(
+        level="token", action="mask", metric="ratio", upper=1.5
+    )
+
+    def compute_loss(prox_logp):
+        n_tokens = prox_logp.numel()
+        input_data = {
+            "input_ids": torch.arange(n_tokens).unsqueeze(0),
+            "logprobs": torch.zeros_like(prox_logp),
+            "advantages": torch.zeros_like(prox_logp),
+            "loss_mask": torch.ones_like(prox_logp, dtype=torch.bool),
+            "prox_logp": prox_logp,
+            "versions": torch.zeros_like(prox_logp, dtype=torch.int32),
+            "teacher_logp": torch.ones_like(prox_logp),
+            "rl_loss_weight": 0.0,
+            "distill_loss_weight": 1.0,
+        }
+        return grpo_loss_fn(
+            logprobs=torch.zeros_like(prox_logp),
+            entropy=torch.zeros_like(prox_logp),
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            rejection_sampling=rejection_sampling,
+        )
+
+    rejected = torch.log(torch.tensor(2.0))
+    prox_logp = torch.tensor([[0.0, rejected, rejected, rejected]])
+    with patch("areal.trainer.ppo.actor.stats_tracker"):
+        full_loss = compute_loss(prox_logp)
+        partitioned_loss = (
+            compute_loss(prox_logp[:, :2]) + compute_loss(prox_logp[:, 2:])
+        ) / 2
+
+    torch.testing.assert_close(full_loss, torch.tensor(-0.25))
+    torch.testing.assert_close(partitioned_loss, full_loss)
+
+
 def test_critic_loss_fn_uses_full_cu_seqlens_for_n_tokens():
     input_data = {
         "input_ids": torch.tensor([11, 12]),

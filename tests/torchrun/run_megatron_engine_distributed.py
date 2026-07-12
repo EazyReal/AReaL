@@ -266,7 +266,7 @@ def test_train(
         group=engine.context_and_model_parallel_group,
     )
 
-    train_result = engine.train_batch(
+    train_result = engine.train_batch_with_reduction(
         input_=bcasted_input,
         loss_reduction=LossReduction.mean(
             loss_fn=mock_loss_fn,
@@ -276,7 +276,7 @@ def test_train(
 
     print(f"final rank {rank} train_result: {train_result}")
 
-    sum_train_result = engine.train_batch(
+    sum_train_result = engine.train_batch_with_reduction(
         input_=bcasted_input,
         loss_reduction=LossReduction.sum(
             loss_fn=mock_loss_sum_fn,
@@ -342,7 +342,7 @@ def test_grad_norm_mb_invariance(
             group=engine.context_and_model_parallel_group,
         )
 
-        result = engine.train_batch(
+        result = engine.train_batch_with_reduction(
             input_=bcasted_input,
             loss_reduction=LossReduction.mean(
                 loss_fn=mock_loss_fn,
@@ -419,7 +419,7 @@ def test_train_dcp_save_load(
     )
 
     # train step 1
-    train_result = engine.train_batch(
+    train_result = engine.train_batch_with_reduction(
         input_=bcasted_input,
         loss_reduction=LossReduction.mean(
             loss_fn=mock_loss_fn,
@@ -436,7 +436,7 @@ def test_train_dcp_save_load(
     engine.save(save_load_meta)
 
     # train step 2
-    engine.train_batch(
+    engine.train_batch_with_reduction(
         input_=bcasted_input,
         loss_reduction=LossReduction.mean(
             loss_fn=mock_loss_fn,
@@ -456,7 +456,7 @@ def test_train_dcp_save_load(
 
     engine.train()
     # train step 2 after recover
-    engine.train_batch(
+    engine.train_batch_with_reduction(
         input_=bcasted_input,
         loss_reduction=LossReduction.mean(
             loss_fn=mock_loss_fn,
@@ -601,7 +601,7 @@ def test_train_hf_save_load(
             src_rank=engine.current_data_parallel_head(),
             group=engine.context_and_model_parallel_group,
         )
-        train_result = engine.train_batch(
+        train_result = engine.train_batch_with_reduction(
             input_=bcasted_input,
             loss_reduction=LossReduction.mean(
                 loss_fn=mock_loss_fn,

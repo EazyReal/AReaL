@@ -36,7 +36,7 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec
 from areal.api.io_struct import DeviceRuntimeInfo
-from areal.api.loss_api import LossReductionInput, LossWeightFn, coerce_loss_reduction
+from areal.api.loss_api import LossWeightFn
 from areal.engine.core.distributed import (
     patch_dist_group_timeout,
     warmup_process_groups,
@@ -529,16 +529,21 @@ class ArchonEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReductionInput | None = None,
-        loss_weight_fn: LossWeightFn | None = None,
-        *,
-        loss_fn: Callable[..., torch.Tensor] | None = None,
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: LossWeightFn,
     ) -> dict[str, float]:
         """Train on a batch of data."""
-        assert self._initialized
-        loss_reduction = coerce_loss_reduction(
-            loss_reduction, loss_weight_fn, loss_fn=loss_fn
+        return self.train_batch_with_reduction(
+            input_, LossReduction.mean(loss_fn, loss_weight_fn)
         )
+
+    def train_batch_with_reduction(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_reduction: LossReduction,
+    ) -> dict[str, float]:
+        """Train on a batch with an explicit reduction contract."""
+        assert self._initialized
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -571,16 +576,22 @@ class ArchonEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReductionInput | None = None,
-        loss_weight_fn: LossWeightFn | None = None,
-        *,
-        loss_fn: Callable[..., torch.Tensor] | None = None,
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: LossWeightFn,
     ) -> torch.Tensor | None:
         """Evaluate on a batch of data."""
-        assert self._initialized
-        loss_reduction = coerce_loss_reduction(
-            loss_reduction, loss_weight_fn, loss_fn=loss_fn
+        return self.eval_batch_with_reduction(
+            input_, LossReduction.mean(loss_fn, loss_weight_fn)
         )
+
+    @torch.no_grad()
+    def eval_batch_with_reduction(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_reduction: LossReduction,
+    ) -> torch.Tensor | None:
+        """Evaluate on a batch with an explicit reduction contract."""
+        assert self._initialized
 
         input_batched, _ = self._normalize_batch_input(input_)
 

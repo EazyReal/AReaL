@@ -194,7 +194,7 @@ class PolicyGradientReduction:
     the matching number of active tokens, sequences, or prompt groups.
     """
 
-    mode: str = LOSS_AGGREGATION_TOKEN_MEAN
+    mode: LossAggregationMode = LOSS_AGGREGATION_TOKEN_MEAN
     group_size: int = 1
     divisor: float | None = None
 
@@ -206,16 +206,22 @@ class PolicyGradientReduction:
             )
         if self.group_size <= 0:
             raise ValueError(f"group_size must be positive, got {self.group_size}.")
-        if self.divisor is not None:
+        if self.mode != LOSS_AGGREGATION_PROMPT_MEAN and self.group_size != 1:
+            raise ValueError(
+                "group_size is only valid for loss_aggregation='prompt_mean'."
+            )
+        if self.mode == LOSS_AGGREGATION_CONSTANT:
             if (
-                self.mode != LOSS_AGGREGATION_CONSTANT
+                self.divisor is None
                 or not math.isfinite(self.divisor)
                 or self.divisor <= 0
             ):
                 raise ValueError(
-                    "divisor must be a positive finite value and is only valid "
-                    "for loss_aggregation='constant'."
+                    "divisor must be a positive finite value for "
+                    "loss_aggregation='constant'."
                 )
+        elif self.divisor is not None:
+            raise ValueError("divisor is only valid for loss_aggregation='constant'.")
 
     def _require_divisor(self) -> float:
         if self.divisor is None:
@@ -250,7 +256,7 @@ class PolicyGradientReduction:
         )
         ids, n_units = _group_ids(
             sequence_denominators.numel(),
-            self.group_size,
+            self.group_size if self.mode == LOSS_AGGREGATION_PROMPT_MEAN else 1,
             group_sizes,
             loss_mask.device,
         )

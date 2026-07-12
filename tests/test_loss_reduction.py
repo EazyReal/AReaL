@@ -8,8 +8,8 @@ from areal.api import (
     LOSS_TERM_REDUCTION_SUM,
     LossReduction,
     LossTerm,
+    TrainEngine,
 )
-from areal.api.loss_api import coerce_loss_reduction
 from areal.engine.core.train_engine import (
     compute_global_normalizers,
     scale_loss_for_reduction,
@@ -21,30 +21,51 @@ def _normalizer(_data):
     return torch.tensor(1.0)
 
 
-def test_coerce_loss_reduction_preserves_original_callback_api():
-    def loss_fn(*_args):
+def _make_original_callback_engine():
+    calls = []
+
+    def stub(*_args, **_kwargs):
+        return None
+
+    def train_batch(self, input_, loss_fn, loss_weight_fn):
+        calls.append(("train", input_, loss_fn, loss_weight_fn))
+        return {"lr": 1.0}
+
+    def eval_batch(self, input_, loss_fn, loss_weight_fn):
+        calls.append(("eval", input_, loss_fn, loss_weight_fn))
         return torch.tensor(2.0)
 
-    def loss_weight_fn(_data):
-        return torch.tensor(3.0)
-
-    positional = coerce_loss_reduction(loss_fn, loss_weight_fn)
-    keyword = coerce_loss_reduction(
-        loss_fn=loss_fn,
-        loss_weight_fn=loss_weight_fn,
-    )
-
-    for reduction in (positional, keyword):
-        assert reduction.loss_fn is loss_fn
-        assert reduction.terms[0].normalizer_fn is loss_weight_fn
-        assert reduction.terms[0].reduction == "mean"
+    implementations = {name: stub for name in TrainEngine.__abstractmethods__}
+    implementations.update(train_batch=train_batch, eval_batch=eval_batch)
+    engine_type = type("OriginalCallbackEngine", (TrainEngine,), implementations)
+    return engine_type(), calls
 
 
-def test_coerce_loss_reduction_rejects_mixed_contracts():
-    reduction = LossReduction.mean(lambda: torch.tensor(1.0), _normalizer)
+def test_original_train_engine_subclass_supports_mean_reduction_adapter():
+    engine, calls = _make_original_callback_engine()
 
-    with pytest.raises(TypeError, match="only valid with the original loss_fn API"):
-        coerce_loss_reduction(reduction, _normalizer)
+    def loss_fn():
+        return torch.tensor(2.0)
+
+    reduction = LossReduction.mean(loss_fn, _normalizer)
+
+    train_result = engine.train_batch_with_reduction({"x": 1}, reduction)
+    eval_result = engine.eval_batch_with_reduction({"x": 2}, reduction)
+
+    assert train_result == {"lr": 1.0}
+    torch.testing.assert_close(eval_result, torch.tensor(2.0))
+    assert calls == [
+        ("train", {"x": 1}, loss_fn, _normalizer),
+        ("eval", {"x": 2}, loss_fn, _normalizer),
+    ]
+
+
+def test_original_train_engine_subclass_rejects_advanced_reduction():
+    engine, _ = _make_original_callback_engine()
+    reduction = LossReduction.sum(lambda: torch.tensor(1.0), _normalizer)
+
+    with pytest.raises(NotImplementedError, match="original callback API"):
+        engine.train_batch_with_reduction({}, reduction)
 
 
 def test_mean_scaling_preserves_local_mean_order():
@@ -128,10 +149,11 @@ def test_multi_term_scaling_uses_each_terms_normalizer():
     torch.testing.assert_close(scaled, torch.tensor(1.0), rtol=0, atol=0)
 
 
-def test_global_normalizer_must_be_positive(monkeypatch):
+@pytest.mark.parametrize("normalizer", [0.0, -1.0, float("nan"), float("inf")])
+def test_global_normalizer_must_be_finite_and_positive(monkeypatch, normalizer):
     reduction = LossReduction.sum(
         loss_fn=lambda: torch.tensor(0.0),
-        normalizer_fn=lambda data: data["loss_mask"].count_nonzero(),
+        normalizer_fn=lambda _data: torch.tensor(normalizer),
     )
     mb_list = MicroBatchList(
         data={},
@@ -141,5 +163,5 @@ def test_global_normalizer_must_be_positive(monkeypatch):
     )
     monkeypatch.setattr(dist, "all_reduce", lambda tensor, group=None: tensor)
 
-    with pytest.raises(RuntimeError, match="Global loss normalizers"):
+    with pytest.raises(RuntimeError, match="finite and positive"):
         compute_global_normalizers(mb_list, reduction, dp_group=None)

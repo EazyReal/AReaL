@@ -190,7 +190,7 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
         loss_fn=mock_loss_fn,
         normalizer_fn=lambda x: x["cu_seqlens"][-1],
     )
-    train_result = engine.train_batch(
+    train_result = engine.train_batch_with_reduction(
         input_data,
         loss_reduction=loss_reduction,
     )
@@ -201,7 +201,7 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
     print(f"Rank {rank} checkpoint saved")
 
     # Train step 2
-    train_result = engine.train_batch(
+    train_result = engine.train_batch_with_reduction(
         input_data,
         loss_reduction=loss_reduction,
     )
@@ -220,7 +220,7 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
 
     # Train step 2 again after load
     engine.train()
-    train_result = engine.train_batch(
+    train_result = engine.train_batch_with_reduction(
         input_data,
         loss_reduction=loss_reduction,
     )

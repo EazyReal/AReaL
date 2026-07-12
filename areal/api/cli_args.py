@@ -1744,8 +1744,22 @@ class PPOActorConfig(TrainEngineConfig):
 
         from areal.utils.constants import ProxLogpMethod
 
+        prox_logp_method = ProxLogpMethod(self.prox_logp_method)
+        if self.m2_threshold is not None:
+            if not math.isfinite(self.m2_threshold) or self.m2_threshold <= 0:
+                raise ValueError(
+                    "m2_threshold must be a positive finite value, "
+                    f"got {self.m2_threshold!r}."
+                )
+            if prox_logp_method.skips_forward_pass():
+                raise ValueError(
+                    "m2_threshold requires proximal log probabilities before the "
+                    "training forward pass and is incompatible with "
+                    f"prox_logp_method={self.prox_logp_method!r}."
+                )
+
         if (
-            ProxLogpMethod(self.prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP
+            prox_logp_method == ProxLogpMethod.REUSE_TRAIN_LOGP
             and self.ppo_n_minibatches > 1
         ):
             logger.warning(
@@ -1817,6 +1831,10 @@ class PPOActorConfig(TrainEngineConfig):
             raise ValueError(
                 "loss_aggregation_divisor is only used when "
                 "loss_aggregation='constant'."
+            )
+        if self.loss_aggregation != "prompt_mean" and self.group_size != 1:
+            raise ValueError(
+                "group_size is only valid for loss_aggregation='prompt_mean'."
             )
 
         # Validate CISPO configuration

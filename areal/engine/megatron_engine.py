@@ -50,7 +50,7 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
-from areal.api.loss_api import LossReductionInput, LossWeightFn, coerce_loss_reduction
+from areal.api.loss_api import LossWeightFn
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_global_normalizers,
@@ -994,15 +994,19 @@ class MegatronEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReductionInput | None = None,
-        loss_weight_fn: LossWeightFn | None = None,
-        *,
-        loss_fn: Callable[..., torch.Tensor] | None = None,
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: LossWeightFn,
+    ) -> dict[str, float]:
+        return self.train_batch_with_reduction(
+            input_, LossReduction.mean(loss_fn, loss_weight_fn)
+        )
+
+    def train_batch_with_reduction(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_reduction: LossReduction,
     ) -> dict[str, float]:
         self._ensure_ready()
-        loss_reduction = coerce_loss_reduction(
-            loss_reduction, loss_weight_fn, loss_fn=loss_fn
-        )
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -1056,15 +1060,20 @@ class MegatronEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReductionInput | None = None,
-        loss_weight_fn: LossWeightFn | None = None,
-        *,
-        loss_fn: Callable[..., torch.Tensor] | None = None,
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: LossWeightFn,
+    ) -> torch.Tensor | None:
+        return self.eval_batch_with_reduction(
+            input_, LossReduction.mean(loss_fn, loss_weight_fn)
+        )
+
+    @torch.no_grad()
+    def eval_batch_with_reduction(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_reduction: LossReduction,
     ) -> torch.Tensor | None:
         self._ensure_ready()
-        loss_reduction = coerce_loss_reduction(
-            loss_reduction, loss_weight_fn, loss_fn=loss_fn
-        )
 
         input_batched, _ = self._normalize_batch_input(input_)
 

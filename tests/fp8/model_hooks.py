@@ -561,7 +561,7 @@ def forward_backward_model_with_hooks(
         model_chunk.zero_grad_buffer()
 
     # Forward and backward
-    engine.train_batch(input_, loss_reduction=loss_reduction)
+    engine.train_batch_with_reduction(input_, loss_reduction=loss_reduction)
 
     # Collect gradients from all components (focusing on the selected layers)
     model = get_model_from_engine(engine)

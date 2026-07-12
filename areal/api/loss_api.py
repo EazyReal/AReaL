@@ -103,35 +103,4 @@ class LossReduction:
         )
 
 
-LossReductionInput = LossReduction | Callable[..., torch.Tensor]
 LossWeightFn = Callable[[dict[str, Any]], torch.Tensor]
-
-
-def coerce_loss_reduction(
-    loss_reduction: LossReductionInput | None = None,
-    loss_weight_fn: LossWeightFn | None = None,
-    *,
-    loss_fn: Callable[..., torch.Tensor] | None = None,
-) -> LossReduction:
-    """Normalize the original loss callback API at the engine boundary.
-
-    AReaL originally accepted ``loss_fn`` and ``loss_weight_fn`` separately.
-    The engine internals now consume ``LossReduction``; this adapter keeps the
-    original positional and keyword calls working without carrying two code
-    paths through every backend.
-    """
-    if loss_fn is not None:
-        if loss_reduction is not None:
-            raise TypeError("pass either loss_fn or loss_reduction, not both")
-        loss_reduction = loss_fn
-    if isinstance(loss_reduction, LossReduction):
-        if loss_weight_fn is not None:
-            raise TypeError(
-                "loss_weight_fn is only valid with the original loss_fn API"
-            )
-        return loss_reduction
-    if not callable(loss_reduction) or loss_weight_fn is None:
-        raise TypeError(
-            "train/eval batch requires LossReduction or both loss_fn and loss_weight_fn"
-        )
-    return LossReduction.mean(loss_reduction, loss_weight_fn)

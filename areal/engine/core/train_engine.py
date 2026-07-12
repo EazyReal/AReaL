@@ -85,16 +85,17 @@ def compute_global_normalizers(
         [_sum_term_normalizer(mb_list, term) for term in loss_reduction.terms]
     )
     dist.all_reduce(normalizers, group=dp_group)
-    if torch.any(normalizers <= 0).item():
-        invalid_mask = (normalizers <= 0).detach().cpu().tolist()
+    invalid_normalizers = ~torch.isfinite(normalizers) | (normalizers <= 0)
+    if torch.any(invalid_normalizers).item():
+        invalid_mask = invalid_normalizers.detach().cpu().tolist()
         invalid = [
             term.name
             for term, is_invalid in zip(loss_reduction.terms, invalid_mask, strict=True)
             if is_invalid
         ]
         raise RuntimeError(
-            "Global loss normalizers must be positive after all_reduce; "
-            f"got non-positive normalizer for terms {invalid}."
+            "Global loss normalizers must be finite and positive after all_reduce; "
+            f"got invalid normalizer for terms {invalid}."
         )
     return {
         term.name: normalizer

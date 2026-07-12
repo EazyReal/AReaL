@@ -333,7 +333,7 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     # Create baseline engine
     baseline_engine = _create_engine(engine_type, port="7777")
     baseline_engine.train()
-    _ = baseline_engine.train_batch(
+    _ = baseline_engine.train_batch_with_reduction(
         inputs,
         loss_reduction=loss_reduction,
     )
@@ -358,7 +358,7 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
         experiment_name="test_tree",
     )
     tree_engine.train()
-    _ = tree_engine.train_batch(
+    _ = tree_engine.train_batch_with_reduction(
         inputs,
         loss_reduction=loss_reduction,
     )

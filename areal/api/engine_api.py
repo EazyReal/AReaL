@@ -23,7 +23,9 @@ from areal.api.io_struct import (
     WeightUpdateMeta,
 )
 from areal.api.loss_api import (
-    LossReductionInput,
+    LOSS_TERM_REDUCTION_MEAN,
+    LossReduction,
+    LossTerm,
     LossWeightFn,
 )
 
@@ -367,10 +369,8 @@ class TrainEngine(abc.ABC):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReductionInput | None = None,
-        loss_weight_fn: LossWeightFn | None = None,
-        *,
-        loss_fn: Callable[..., torch.Tensor] | None = None,
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: LossWeightFn,
     ) -> dict[str, float]:
         """Update the model with a batch of data and a loss function.
 
@@ -385,12 +385,14 @@ class TrainEngine(abc.ABC):
             Preferred format is ``list[dict[str, Any]]`` (trajectory list).
             Backward compatibility: a pre-batched ``dict[str, Any]`` is
             also accepted.
-        loss_reduction : LossReductionInput, optional
-            New reduction contract, or the original positional ``loss_fn``.
-        loss_weight_fn : Callable, optional
-            Original AReaL denominator callback, paired with ``loss_fn``.
-        loss_fn : Callable, optional
-            Original AReaL keyword loss callback.
+        loss_fn : Callable[..., torch.Tensor]
+            The loss function. For actor (is_critic=False), it receives
+            (logprobs, entropy, input_data). For critic (is_critic=True),
+            it receives (values, input_data). Returns a scalar normalized loss.
+        loss_weight_fn : Callable[[dict[str, Any]], torch.Tensor]
+            A function used to calculate the weight of each micro-batch. Since
+            loss_fn normalizes the loss for a micro-batch, we need a corresponding
+            weight for each micro-batch to normalize the loss globally.
 
         Returns
         -------
@@ -400,15 +402,27 @@ class TrainEngine(abc.ABC):
         """
         raise NotImplementedError()
 
+    def train_batch_with_reduction(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_reduction: LossReduction,
+    ) -> dict[str, float]:
+        """Update the model using an explicit distributed reduction contract.
+
+        Engines written against the original callback API automatically support
+        a single mean term. Engines that support sum or multi-term reductions
+        should override this method.
+        """
+        term = self._original_loss_term(loss_reduction)
+        return self.train_batch(input_, loss_reduction.loss_fn, term.normalizer_fn)
+
     @torch.no_grad()
     @abc.abstractmethod
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_reduction: LossReductionInput | None = None,
-        loss_weight_fn: LossWeightFn | None = None,
-        *,
-        loss_fn: Callable[..., torch.Tensor] | None = None,
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: LossWeightFn,
     ) -> torch.Tensor | None:
         """Evaluate the model using the forward pass and loss function.
 
@@ -423,12 +437,14 @@ class TrainEngine(abc.ABC):
             Preferred format is ``list[dict[str, Any]]`` (trajectory list).
             Backward compatibility: a pre-batched ``dict[str, Any]`` is
             also accepted.
-        loss_reduction : LossReductionInput, optional
-            New reduction contract, or the original positional ``loss_fn``.
-        loss_weight_fn : Callable, optional
-            Original AReaL denominator callback, paired with ``loss_fn``.
-        loss_fn : Callable, optional
-            Original AReaL keyword loss callback.
+        loss_fn : Callable[..., torch.Tensor]
+            The loss function. For actor (is_critic=False), it receives
+            (logprobs, entropy, input_data). For critic (is_critic=True),
+            it receives (values, input_data). Returns a scalar normalized loss.
+        loss_weight_fn : Callable[[dict[str, Any]], torch.Tensor]
+            A function used to calculate the weight of each micro-batch. Since
+            loss_fn normalizes the loss for a micro-batch, we need a corresponding
+            weight for each micro-batch to normalize the loss globally.
 
         Returns
         -------
@@ -437,6 +453,30 @@ class TrainEngine(abc.ABC):
             with `stats_tracker`.
         """
         raise NotImplementedError()
+
+    @torch.no_grad()
+    def eval_batch_with_reduction(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_reduction: LossReduction,
+    ) -> torch.Tensor | None:
+        """Evaluate the model using an explicit distributed reduction contract."""
+        term = self._original_loss_term(loss_reduction)
+        return self.eval_batch(input_, loss_reduction.loss_fn, term.normalizer_fn)
+
+    @staticmethod
+    def _original_loss_term(loss_reduction: LossReduction) -> LossTerm:
+        if (
+            len(loss_reduction.terms) != 1
+            or loss_reduction.terms[0].reduction != LOSS_TERM_REDUCTION_MEAN
+        ):
+            raise NotImplementedError(
+                "This TrainEngine implements the original callback API and only "
+                "supports a single mean loss term. Override "
+                "train_batch_with_reduction/eval_batch_with_reduction to support "
+                "sum or multi-term reductions."
+            )
+        return loss_reduction.terms[0]
 
     @torch.no_grad()
     @abc.abstractmethod

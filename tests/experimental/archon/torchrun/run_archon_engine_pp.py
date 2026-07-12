@@ -190,10 +190,8 @@ def test_eval_batch(engine: ArchonEngine, mock_input: dict) -> bool:
     try:
         loss = engine.eval_batch(
             mock_input,
-            loss_reduction=LossReduction.mean(
-                loss_fn=mock_loss_fn,
-                normalizer_fn=mock_normalizer_fn,
-            ),
+            loss_fn=mock_loss_fn,
+            loss_weight_fn=mock_normalizer_fn,
         )
 
         # In PP mode, eval_batch may return None (TODO in ArchonEngine)
@@ -222,12 +220,10 @@ def test_train_batch(engine: ArchonEngine, mock_input: dict) -> bool:
     try:
         result = engine.train_batch(
             mock_input,
-            loss_reduction=LossReduction.mean(
-                loss_fn=mock_loss_fn,
-                normalizer_fn=mock_normalizer_fn,
-            ),
+            loss_fn=mock_loss_fn,
+            loss_weight_fn=mock_normalizer_fn,
         )
-        sum_result = engine.train_batch(
+        sum_result = engine.train_batch_with_reduction(
             mock_input,
             loss_reduction=LossReduction.sum(
                 loss_fn=mock_loss_sum_fn,

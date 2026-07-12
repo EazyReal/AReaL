@@ -125,12 +125,10 @@ def test_simple_train(engine, mock_input):
     engine.train()
     train_result = engine.train_batch(
         mock_input,
-        loss_reduction=LossReduction.mean(
-            loss_fn=mock_loss_fn,
-            normalizer_fn=lambda x: torch.tensor(1.0, device=engine.device),
-        ),
+        loss_fn=mock_loss_fn,
+        loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
     )
-    sum_train_result = engine.train_batch(
+    sum_train_result = engine.train_batch_with_reduction(
         mock_input,
         loss_reduction=LossReduction.sum(
             loss_fn=mock_loss_sum_fn,
