@@ -1620,17 +1620,20 @@ class PPOActorConfig(TrainEngineConfig):
     loss_aggregation: str = field(
         default="token_mean",
         metadata={
-            "help": "Policy-gradient loss reduction. 'token_mean' averages valid "
-            "tokens, 'seq_mean' averages sequence means, and 'prompt_mean' averages "
-            "means over responses from the same prompt. 'constant' "
-            "averages each response's masked token sum divided by "
+            "help": "Policy-gradient loss reduction. "
+            "'token_mean': average over valid tokens. "
+            "'seq_mean': average per-response token means. "
+            "'prompt_mean': average per-prompt-group token means. "
+            "'constant': average each response's masked token sum divided by "
             "loss_aggregation_divisor. Non-token modes require sequence "
             "boundaries; tree-packed actor training currently supports only "
             "'token_mean'.",
-            "help_zh": "Policy-gradient loss 的归约方式。'token_mean' 对有效 token "
-            "求平均，'seq_mean' 对每条序列的均值求平均，'prompt_mean' 对同一 "
-            "prompt 生成的 response 组均值求平均。"
-            "'constant' 将每条 response 的 masked token loss 之和除以 "
+            "help_zh": "Policy-gradient loss 的归约方式。"
+            "'token_mean': 对有效 token 求平均。"
+            "'seq_mean': 先对每条 response 的有效 token 求平均，再对 response "
+            "求平均。'prompt_mean': 先对同一 prompt 的 response group 内有效 "
+            "token 求平均，再对 prompt group 求平均。"
+            "'constant': 将每条 response 的 masked token loss 之和除以 "
             "loss_aggregation_divisor 后再求平均。非 token 模式需要 sequence "
             "边界；tree-packed actor 训练目前仅支持 'token_mean'。",
             "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
