@@ -70,10 +70,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.group_size = group_size
         self.min_usable_group_size = min_usable_group_size
 
-    def _record_group_stats(self, usable_slot_count: int) -> None:
-        trainable_slot_count = (
-            usable_slot_count if usable_slot_count >= self.min_usable_group_size else 0
-        )
+    def _record_group_stats(self, usable_slot_count: int, *, trainable: bool) -> None:
+        trainable_slot_count = usable_slot_count if trainable else 0
         stats_tracker.get(workflow_context.stat_scope()).scalar(
             target_slot_count=self.group_size,
             usable_slot_count=usable_slot_count,
@@ -232,7 +230,6 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             if result is None
         ]
         usable_slot_count = len(results) - len(unusable_session_ids)
-        self._record_group_stats(usable_slot_count)
         group_is_trainable = usable_slot_count >= self.min_usable_group_size
         excluded_session_ids = (
             unusable_session_ids if group_is_trainable else session_ids
@@ -247,6 +244,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             group_id=group_id,
             exclude_session_ids=excluded_session_ids,
         )
+        trainable = group_is_trainable and bool(traj)
+        self._record_group_stats(usable_slot_count, trainable=trainable)
 
         if unusable_session_ids:
             logger.warning(
@@ -262,7 +261,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                 ),
             )
 
-        if not group_is_trainable or not traj:
+        if not trainable:
             return None
 
         tracker = stats_tracker.get(workflow_context.stat_scope())

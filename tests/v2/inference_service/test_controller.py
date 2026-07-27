@@ -719,6 +719,50 @@ class TestInferenceServiceWorkflow:
         )
 
     @pytest.mark.asyncio
+    async def test_offline_mode_marks_empty_export_untrainable(self):
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("grp-test-1", [("sess-1", "sess-api-key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(return_value={})
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is None
+        mock_st.get.return_value.scalar.assert_called_once_with(
+            target_slot_count=1,
+            usable_slot_count=1,
+            trainable_slot_count=0,
+            fully_masked_group=False,
+            singleton_slot_group=True,
+            pre_filter_usable_slot_yield=1.0,
+            pre_filter_trainable_slot_yield=0.0,
+        )
+
+    @pytest.mark.asyncio
     async def test_offline_mode_masks_group_below_estimator_minimum(self):
         controller = MagicMock()
 

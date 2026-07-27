@@ -66,7 +66,8 @@ class ExportTrajectoriesRequest(BaseModel):
 
     Sessions not listed in ``exclude_session_ids`` are exported and merged into a
     single interactions dict. Excluded sessions are still removed when
-    ``remove_session`` is true.
+    ``remove_session`` is true. A duplicate-ID conflict is terminal and removes
+    all requested sessions regardless of ``remove_session``.
     ``group_id`` is optional metadata used by the gateway for router cleanup;
     the data proxy itself does not use it.
     """

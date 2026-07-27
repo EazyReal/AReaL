@@ -870,7 +870,10 @@ async def test_export_excludes_unusable_session_but_cleans_entire_group(client):
 
 
 @pytest.mark.asyncio
-async def test_export_rejects_duplicate_interaction_ids_and_cleans_group(client):
+@pytest.mark.parametrize("remove_session", [True, False])
+async def test_export_rejects_duplicate_interaction_ids_and_cleans_group(
+    client, remove_session
+):
     start = await client.post(
         "/rl/start_session",
         json={"task_id": "duplicate-group", "group_size": 2},
@@ -887,7 +890,7 @@ async def test_export_rejects_duplicate_interaction_ids_and_cleans_group(client)
 
     export_resp = await client.post(
         "/export_trajectories",
-        json={"session_ids": session_ids},
+        json={"session_ids": session_ids, "remove_session": remove_session},
         headers=admin_headers(),
     )
 

@@ -734,9 +734,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         excluded_session_ids = set(body.exclude_session_ids)
 
         def _remove_sessions() -> None:
-            if body.remove_session:
-                for sid in body.session_ids:
-                    store.remove_session(sid)
+            for sid in body.session_ids:
+                store.remove_session(sid)
 
         for sid in body.session_ids:
             if sid in excluded_session_ids:
@@ -774,7 +773,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         else:
             traj = concat_string_interactions(merged)
 
-        _remove_sessions()
+        if body.remove_session:
+            _remove_sessions()
         serialized = serialize_value(traj)
         return ExportTrajectoriesResponse(traj=serialized)
 
