@@ -69,7 +69,7 @@ async def gateway_client(gateway_config: GatewayConfig):
 class TestGatewayUnifiedExportTrajectories:
     @pytest.mark.asyncio
     @patch(f"{ROUTER_MODULE}.revoke_session_in_router", new_callable=AsyncMock)
-    @patch(f"{ROUTER_MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{ROUTER_MODULE}.forward_request_once", new_callable=AsyncMock)
     @patch(f"{ROUTER_MODULE}.query_router", new_callable=AsyncMock)
     async def test_export_trajectories_with_session_id(
         self,
@@ -98,7 +98,7 @@ class TestGatewayUnifiedExportTrajectories:
 
     @pytest.mark.asyncio
     @patch(f"{ROUTER_MODULE}.revoke_session_in_router", new_callable=AsyncMock)
-    @patch(f"{ROUTER_MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{ROUTER_MODULE}.forward_request_once", new_callable=AsyncMock)
     @patch(f"{ROUTER_MODULE}.query_router", new_callable=AsyncMock)
     async def test_export_trajectories_internal_session(
         self,
@@ -336,6 +336,10 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             ),
             patch(
                 f"{ROUTER_MODULE}.forward_request",
+                new=AsyncMock(side_effect=_forward_request),
+            ),
+            patch(
+                f"{ROUTER_MODULE}.forward_request_once",
                 new=AsyncMock(side_effect=_forward_request),
             ),
             patch(

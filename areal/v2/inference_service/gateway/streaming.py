@@ -435,6 +435,22 @@ async def forward_sse_stream(
         yield f"data: {error_event}\n\n".encode()
 
 
+async def forward_request_once(
+    upstream_url: str,
+    body: bytes,
+    headers: dict[str, str],
+    timeout: float = 120.0,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> httpx.Response:
+    """Forward a non-streaming request exactly once."""
+    fwd_headers = _forwarding_headers(headers)
+    async with _use_client(client, timeout) as c:
+        return await c.post(
+            upstream_url, content=body, headers=fwd_headers, timeout=timeout
+        )
+
+
 @async_httpx_retry
 async def forward_request(
     upstream_url: str,
@@ -444,12 +460,14 @@ async def forward_request(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> httpx.Response:
-    """Forward a non-streaming request to upstream, return full response."""
-    fwd_headers = _forwarding_headers(headers)
-    async with _use_client(client, timeout) as c:
-        return await c.post(
-            upstream_url, content=body, headers=fwd_headers, timeout=timeout
-        )
+    """Forward a retryable non-streaming request to upstream."""
+    return await forward_request_once(
+        upstream_url,
+        body,
+        headers,
+        timeout,
+        client=client,
+    )
 
 
 async def broadcast_to_workers(

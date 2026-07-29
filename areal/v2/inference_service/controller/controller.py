@@ -1066,6 +1066,7 @@ class RolloutControllerV2:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         self._ensure_initialized()
         if reward_normalization or drop_incomplete_group:
@@ -1077,6 +1078,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         return self.workflow_executor.submit(
@@ -1120,6 +1122,7 @@ class RolloutControllerV2:
         batch_size: int | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Submit a batch of data items and wait for all results.
 
@@ -1140,6 +1143,8 @@ class RolloutControllerV2:
             filter results.
         group_size : int
             Number of times to run the workflow per input (default ``1``).
+        min_usable_group_size : int
+            Estimator-owned minimum number of successfully exported sessions.
         batch_size : int | None
             Expected batch size.  **Required** when ``data`` is ``None``;
             when ``data`` is provided, an optional consistency check
@@ -1173,6 +1178,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         for item in data:
@@ -1196,6 +1202,7 @@ class RolloutControllerV2:
         batch_size: int | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Prepare a full training batch by consuming data from a dataloader.
 
@@ -1222,6 +1229,8 @@ class RolloutControllerV2:
             Batch size for the dummy dataloader when ``dataloader`` is
             ``None``.  **Required** when ``dataloader`` is ``None``.
             Ignored when ``dataloader`` is not ``None``.
+        min_usable_group_size : int
+            Estimator-owned minimum number of successfully exported sessions.
 
         Returns
         -------
@@ -1247,6 +1256,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         results = self.workflow_executor.prepare_batch(
@@ -1534,7 +1544,12 @@ class RolloutControllerV2:
 
     # -- Workflow resolution helpers ----------------------------------------
 
-    def _wrap_agent(self, agent: Any, group_size: int = 1):
+    def _wrap_agent(
+        self,
+        agent: Any,
+        group_size: int = 1,
+        min_usable_group_size: int = 1,
+    ):
         """Wrap an agent in an InferenceServiceWorkflow.
 
         Parameters
@@ -1543,6 +1558,8 @@ class RolloutControllerV2:
             The agent to wrap (any object with an async ``run()`` method).
         group_size : int
             Number of parallel trajectories per episode.
+        min_usable_group_size : int
+            Estimator-owned minimum number of successfully exported sessions.
         """
         from areal.v2.inference_service.controller.workflow import (
             InferenceServiceWorkflow,
@@ -1566,6 +1583,7 @@ class RolloutControllerV2:
             discount=turn_discount,
             export_style=export_style,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
         )
 
     def _resolve_workflow(
@@ -1573,6 +1591,7 @@ class RolloutControllerV2:
         workflow,
         workflow_kwargs=None,
         group_size=1,
+        min_usable_group_size=1,
     ):
         """Resolve a workflow-like input to an InferenceServiceWorkflow.
 
@@ -1589,6 +1608,8 @@ class RolloutControllerV2:
             Keyword arguments passed to the agent constructor.
         group_size : int
             Number of times to run the workflow per input.
+        min_usable_group_size : int
+            Estimator-owned minimum number of successfully exported sessions.
         """
         from areal.api.workflow_api import RolloutWorkflow
         from areal.utils.dynamic_import import import_from_string
@@ -1620,11 +1641,15 @@ class RolloutControllerV2:
 
             online_kwargs = dict(workflow_kwargs or {})
             online_kwargs.pop("controller", None)
+            online_kwargs.pop("group_size", None)
+            online_kwargs.pop("min_usable_group_size", None)
             return InferenceServiceWorkflow(
                 controller=self,
                 agent=None,
                 gateway_addr=self._gateway_addr,
                 admin_api_key=self.config.admin_api_key,
+                group_size=group_size,
+                min_usable_group_size=min_usable_group_size,
                 **online_kwargs,
             )
 
@@ -1658,7 +1683,11 @@ class RolloutControllerV2:
             )
 
         # (d) Wrap the agent in InferenceServiceWorkflow (with group_size)
-        resolved = self._wrap_agent(agent, group_size=group_size)
+        resolved = self._wrap_agent(
+            agent,
+            group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
+        )
 
         return resolved
 

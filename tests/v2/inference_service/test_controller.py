@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import httpx
 import pytest
 
 from areal.api.cli_args import AgentConfig, InferenceEngineConfig
+from areal.infra.workflow_executor import WorkflowContractError, WorkflowExecutor
 from areal.utils import stats_tracker
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
@@ -22,6 +24,21 @@ def _make_scheduler(n_gpus_per_node: int = 8) -> MagicMock:
     scheduler = MagicMock()
     scheduler.n_gpus_per_node = n_gpus_per_node
     return scheduler
+
+
+def _mock_aiohttp_post(
+    *, data: dict | None = None, error: Exception | None = None
+) -> MagicMock:
+    response = MagicMock()
+    response.raise_for_status.side_effect = error
+    if data is not None:
+        response.json = AsyncMock(return_value=data)
+    response_cm = MagicMock()
+    response_cm.__aenter__ = AsyncMock(return_value=response)
+    response_cm.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.post.return_value = response_cm
+    return session
 
 
 # =============================================================================
@@ -126,11 +143,15 @@ class TestControllerWorkflowResolution:
         resolved = controller._resolve_workflow(
             MockAgent,
             workflow_kwargs={},
+            group_size=4,
+            min_usable_group_size=2,
         )
 
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert isinstance(resolved.agent, MockAgent)
+        assert resolved.group_size == 4
+        assert resolved.min_usable_group_size == 2
 
     def test_resolve_should_accept_fn_none(self):
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
@@ -533,6 +554,136 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
+    @pytest.mark.asyncio
+    async def test_terminal_export_failure_is_not_retried(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        http_session = _mock_aiohttp_post(error=RuntimeError("terminal export failed"))
+
+        with pytest.raises(RuntimeError, match="terminal export failed"):
+            await workflow._export_interactions(http_session, ["sess-1"])
+
+        http_session.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_translates_permanent_client_error(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        http_session = _mock_aiohttp_post(
+            error=aiohttp.ClientResponseError(
+                request_info=MagicMock(),
+                history=(),
+                status=400,
+            )
+        )
+
+        with pytest.raises(WorkflowContractError, match="HTTP 400"):
+            await workflow._export_interactions(http_session, ["sess-1"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {
+                "traj": {},
+                "exported_session_count": 2,
+                "exported_session_ids": ["sess-1", "sess-1"],
+            },
+            {
+                "traj": [],
+                "exported_session_count": 1,
+                "exported_session_ids": ["sess-1"],
+            },
+        ],
+    )
+    async def test_export_interactions_rejects_invalid_export_authority(self, data):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        http_session = _mock_aiohttp_post(data=data)
+
+        with pytest.raises(WorkflowContractError, match="Invalid export authority"):
+            await workflow._export_interactions(http_session, ["sess-1"])
+
+    @pytest.mark.parametrize("dynamic_bs", [False, True])
+    def test_executor_does_not_retry_export_contract_failure(self, dynamic_bs):
+        class CyclingDataLoader:
+            batch_size = 1
+
+            def __iter__(self):
+                return iter([[{}]])
+
+        class SuccessfulAgent:
+            async def run(self, data, **kwargs):
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=SuccessfulAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("group-1", [("sess-1", "key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            side_effect=WorkflowContractError("invalid export cardinality")
+        )
+
+        inference_engine = MagicMock()
+        inference_engine.get_version.return_value = 0
+        executor = WorkflowExecutor(
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                consumer_batch_size=1,
+                max_concurrent_rollouts=1,
+            ),
+            inference_engine,
+        )
+        executor.initialize()
+
+        try:
+            with pytest.raises(
+                WorkflowContractError, match="invalid export cardinality"
+            ):
+                executor.prepare_batch(
+                    CyclingDataLoader(),
+                    workflow,
+                    dynamic_bs=dynamic_bs,
+                )
+        finally:
+            executor.destroy()
+
+        workflow._export_interactions.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_returns_validated_export_authority(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        http_session = _mock_aiohttp_post(
+            data={
+                "traj": {},
+                "exported_session_count": 1,
+                "exported_session_ids": ["sess-1"],
+            }
+        )
+
+        assert await workflow._export_interactions(
+            http_session, ["sess-1", "sess-2"]
+        ) == ({}, 1, ["sess-1"])
+
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_online_mode_waits_on_controller(self):
@@ -610,7 +761,7 @@ class TestInferenceServiceWorkflow:
         )
         workflow._set_last_reward = AsyncMock(return_value=None)
         workflow._export_interactions = AsyncMock(
-            return_value={"chatcmpl-1": mock_interaction}
+            return_value=({"chatcmpl-1": mock_interaction}, 1, ["sess-1"])
         )
 
         with (
@@ -635,7 +786,127 @@ class TestInferenceServiceWorkflow:
         workflow._start_session.assert_awaited_once()
         workflow._set_last_reward.assert_awaited_once()
         workflow._export_interactions.assert_awaited_once_with(
-            mock_http_session, ["sess-1"], group_id="grp-test-1"
+            mock_http_session,
+            ["sess-1"],
+            group_id="grp-test-1",
+            excluded_session_ids=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_keeps_successfully_exported_sessions(self):
+        class PartialAgent:
+            async def run(self, data, **kwargs):
+                if kwargs["api_key"] == "bad-key":
+                    raise ValueError("unusable")
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=PartialAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=3,
+            min_usable_group_size=2,
+        )
+        sessions = [
+            ("sess-1", "good-key-1"),
+            ("sess-2", "bad-key"),
+            ("sess-3", "good-key-2"),
+        ]
+        workflow._start_session = AsyncMock(return_value=("grp-test-1", sessions))
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value=(
+                {"chatcmpl-1": MagicMock(reward=1.0)},
+                2,
+                ["sess-1", "sess-3"],
+            )
+        )
+
+        stats_tracker.export_all(reset=True)
+        try:
+            with patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx:
+                mock_http_session = AsyncMock()
+                mock_wf_ctx.get_aiohttp_session = AsyncMock(
+                    return_value=mock_http_session
+                )
+                mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+                mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+                mock_wf_ctx.stat_scope.return_value = "rollout"
+
+                result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+            exported_stats = stats_tracker.export_all(reset=True)
+        finally:
+            stats_tracker.export_all(reset=True)
+
+        assert result is not None
+        workflow._export_interactions.assert_awaited_once_with(
+            mock_http_session,
+            ["sess-1", "sess-2", "sess-3"],
+            group_id="grp-test-1",
+            excluded_session_ids=["sess-2"],
+        )
+        assert exported_stats["rollout/reward"] == 1.0
+        assert exported_stats["rollout/reward__count"] == 2
+        assert exported_stats["rollout/usable_slot_count"] == 2.0
+        assert exported_stats["rollout/trainable_slot_count"] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_uses_actual_export_count_for_trainability(self):
+        class SuccessfulAgent:
+            async def run(self, data, **kwargs):
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=SuccessfulAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=2,
+            min_usable_group_size=2,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=(
+                "grp-test-1",
+                [("sess-1", "key-1"), ("sess-2", "key-2")],
+            )
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value=(
+                {"chatcmpl-1": MagicMock(reward=1.0)},
+                1,
+                ["sess-1"],
+            )
+        )
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_stats,
+        ):
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is None
+        mock_stats.get.return_value.scalar.assert_called_once_with(
+            target_slot_count=2,
+            usable_slot_count=1,
+            trainable_slot_count=0,
+            fully_masked_group=False,
+            singleton_slot_group=True,
+            pre_filter_usable_slot_yield=0.5,
+            pre_filter_trainable_slot_yield=0.0,
         )
 
 

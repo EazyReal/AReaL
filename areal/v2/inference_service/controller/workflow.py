@@ -14,6 +14,10 @@ from areal.infra import workflow_context
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import async_http_retry
+from areal.infra.workflow_executor import (
+    WorkflowContractError,
+    validate_rollout_group_sizes,
+)
 from areal.utils import logging, stats_tracker
 
 if TYPE_CHECKING:
@@ -53,7 +57,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         timeout: float | None = None,
         group_size: int = 1,
+        min_usable_group_size: int = 1,
     ):
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         self.controller = controller
         self.agent = agent
         self.gateway_addr = gateway_addr.rstrip("/") if gateway_addr else ""
@@ -62,6 +68,19 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.timeout = timeout
         self.group_size = group_size
+        self.min_usable_group_size = min_usable_group_size
+
+    def _record_group_stats(self, usable_slot_count: int, *, trainable: bool) -> None:
+        trainable_slot_count = usable_slot_count if trainable else 0
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            target_slot_count=self.group_size,
+            usable_slot_count=usable_slot_count,
+            trainable_slot_count=trainable_slot_count,
+            fully_masked_group=usable_slot_count == 0,
+            singleton_slot_group=usable_slot_count == 1,
+            pre_filter_usable_slot_yield=usable_slot_count / self.group_size,
+            pre_filter_trainable_slot_yield=trainable_slot_count / self.group_size,
+        )
 
     @async_http_retry
     async def _start_session(
@@ -99,29 +118,57 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         trajectory_id = data.get("trajectory_id")
         return int(trajectory_id) if trajectory_id is not None else None
 
-    @async_http_retry
     async def _export_interactions(
         self,
         session: aiohttp.ClientSession,
         session_ids: list[str],
         group_id: str | None = None,
         trajectory_id: int | None = None,
-    ) -> dict[str, Any]:
+        excluded_session_ids: list[str] | None = None,
+    ) -> tuple[dict[str, Any], int, list[str]]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
             "session_ids": session_ids,
+            "excluded_session_ids": excluded_session_ids or [],
             "group_id": group_id,
             "trajectory_id": trajectory_id,
+            "min_usable_group_size": self.min_usable_group_size,
             "discount": self.discount,
             "style": self.export_style,
             "remove_session": True,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-
-        return deserialize_value(data["traj"])
+            try:
+                resp.raise_for_status()
+            except aiohttp.ClientResponseError as exc:
+                if 400 <= exc.status < 500 and exc.status != 429:
+                    raise WorkflowContractError(
+                        f"Trajectory export rejected with HTTP {exc.status}"
+                    ) from exc
+                raise
+            try:
+                data = await resp.json()
+                exported_session_count = int(data["exported_session_count"])
+                exported_session_ids = data["exported_session_ids"]
+                traj = deserialize_value(data["traj"])
+            except (aiohttp.ContentTypeError, KeyError, TypeError, ValueError) as exc:
+                raise WorkflowContractError(
+                    "Invalid export authority response"
+                ) from exc
+        if (
+            not isinstance(traj, dict)
+            or not isinstance(exported_session_ids, list)
+            or not all(isinstance(sid, str) for sid in exported_session_ids)
+            or len(exported_session_ids) != len(set(exported_session_ids))
+            or not set(exported_session_ids) <= set(session_ids)
+            or exported_session_count != len(exported_session_ids)
+        ):
+            raise WorkflowContractError(
+                "Invalid export authority: exported_session_count and "
+                "exported_session_ids must identify unique requested sessions"
+            )
+        return traj, exported_session_count, exported_session_ids
 
     async def arun_episode(
         self,
@@ -200,30 +247,60 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         )
 
         session_ids = [sid for sid, _ in sessions]
+        failed_session_ids = [
+            sid
+            for (sid, _), result in zip(sessions, results, strict=True)
+            if result is None
+        ]
+        provisional_usable_count = len(sessions) - len(failed_session_ids)
+        excluded_session_ids = (
+            failed_session_ids
+            if provisional_usable_count >= self.min_usable_group_size
+            else session_ids
+        )
 
-        # Always export to trigger session cleanup on the data proxy,
-        # even when we intend to discard the trajectories.
-        traj = await self._export_interactions(
+        # The data proxy owns exportability. Excluded sessions are not materialized,
+        # but all requested sessions are removed by this terminal export.
+        (
+            traj,
+            exported_session_count,
+            exported_session_ids,
+        ) = await self._export_interactions(
             http_session,
             session_ids,
             group_id=group_id,
+            excluded_session_ids=excluded_session_ids,
         )
-        if not traj:
-            return None
+        trainable = exported_session_count >= self.min_usable_group_size and bool(traj)
+        self._record_group_stats(exported_session_count, trainable=trainable)
 
-        n_failed = sum(r is None for r in results)
-        if n_failed > 0:
+        if failed_session_ids or exported_session_count != provisional_usable_count:
             logger.warning(
-                "Abandoning group %s: %d/%d sessions failed",
+                "Grouped inference-service rollout %s exported %d/%d sessions "
+                "after %d agent failures; %s",
                 group_id,
-                n_failed,
+                exported_session_count,
                 len(sessions),
+                len(failed_session_ids),
+                (
+                    "using exported sessions"
+                    if trainable
+                    else "dropping group below min_usable_group_size"
+                ),
             )
+
+        if not trainable:
             return None
 
+        reward_by_session_id = dict(zip(session_ids, results, strict=True))
         tracker = stats_tracker.get(workflow_context.stat_scope())
-        for r in results:
-            tracker.scalar(reward=r)
+        for session_id in exported_session_ids:
+            reward = reward_by_session_id[session_id]
+            if reward is None:
+                raise WorkflowContractError(
+                    f"Data proxy exported failed agent session {session_id}"
+                )
+            tracker.scalar(reward=reward)
 
         return traj
 
@@ -238,12 +315,12 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         if not export_request:
             return None
 
-        traj = await self._export_interactions(
+        traj, exported_session_count, _ = await self._export_interactions(
             http_session,
             [export_request["session_id"]],
             trajectory_id=export_request["trajectory_id"],
         )
-        if not traj:
+        if exported_session_count != 1 or not traj:
             return None
 
         rewards_tensor = traj.get("rewards")

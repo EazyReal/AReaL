@@ -645,11 +645,8 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
-        is_v1_rollout = config.rollout._version == "v1"
-        min_usable_group_size = (
-            _minimum_usable_group_size(config.actor, config.gconfig.n_samples)
-            if is_v1_rollout
-            else 1
+        min_usable_group_size = _minimum_usable_group_size(
+            config.actor, config.gconfig.n_samples
         )
         train_teacher = (
             self.teacher
@@ -720,9 +717,8 @@ class PPOTrainer:
                     dynamic_bs=config.dynamic_bs,
                     reward_normalization=config.gconfig.reward_normalization,
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                    min_usable_group_size=min_usable_group_size,
                 )
-                if is_v1_rollout:
-                    prepare_kwargs["min_usable_group_size"] = min_usable_group_size
                 rollout_batch = _collect_trainable_rollout_batch(
                     functools.partial(
                         self.actor.prepare_batch,
