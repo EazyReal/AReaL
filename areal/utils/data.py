@@ -733,6 +733,13 @@ def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
     return dummy
 
 
+def make_transport_microbatch(template: dict[str, Any]) -> dict[str, Any]:
+    """Create one transport-only batch that arbitrary objectives must bypass."""
+    dummy = make_transport_dummy(template)
+    dummy[TRANSPORT_DUMMY_KEY] = True
+    return dummy
+
+
 def _pad_batch_to_min_groups(
     data: dict[str, Any],
     *,
@@ -757,6 +764,7 @@ def split_padded_tensor_dict_into_mb_list(
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
     allow_transport_padding: bool = False,
+    synchronize: bool = True,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -766,6 +774,7 @@ def split_padded_tensor_dict_into_mb_list(
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
         allow_transport_padding: Add model-valid rows when synchronized execution
             requires more micro-batches than local semantic data can provide.
+        synchronize: Synchronize the micro-batch count across ``group``.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -812,13 +821,15 @@ def split_padded_tensor_dict_into_mb_list(
             input_lens[-transport_dummy_count // granularity :] = 0
 
         if not allow_transport_padding:
-            group_indices = allocate_balanced_mbs_synced(
-                allocation_spec, input_lens, group=group
+            group_indices = (
+                allocate_balanced_mbs_synced(allocation_spec, input_lens, group=group)
+                if synchronize
+                else allocate_balanced_mbs(allocation_spec, input_lens)
             )
             break
 
         group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
-        if not dist.is_initialized():
+        if not synchronize or not dist.is_initialized():
             break
         all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
         dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
@@ -918,6 +929,76 @@ def split_padded_tensor_dict_into_mb_list(
         group_lens=group_lens,
         transport_dummy_count=transport_dummy_count,
     )
+
+
+def split_training_batch_into_microbatches(
+    data: dict[str, Any],
+    n_mbs: int,
+    group: dist.ProcessGroup | None = None,
+) -> list[dict[str, Any]]:
+    """Build a synchronized PPO schedule without all-dummy global steps."""
+    if n_mbs < 1:
+        raise ValueError(f"n_mbs must be positive, got {n_mbs}")
+    batch_size = get_batch_size(data)
+    if batch_size < 1:
+        raise ValueError("Cannot split an empty training batch")
+
+    local_n_mbs = min(batch_size, n_mbs)
+    local_mbs = split_padded_tensor_dict_into_mb_list(
+        data,
+        MicroBatchSpec(n_mbs=local_n_mbs),
+        synchronize=False,
+    ).mbs
+    if not dist.is_initialized():
+        if local_n_mbs < n_mbs:
+            logger.warning(
+                "Reducing PPO minibatches from %d to %d for a batch of %d rows",
+                n_mbs,
+                local_n_mbs,
+                batch_size,
+            )
+        return local_mbs
+
+    counts: list[int | None] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(counts, len(local_mbs), group=group)
+    concrete_counts = [count for count in counts if count is not None]
+    effective_n_mbs = max(
+        min(n_mbs, sum(concrete_counts)),
+        max(concrete_counts),
+    )
+    if effective_n_mbs < n_mbs:
+        logger.warning(
+            "Reducing synchronized PPO minibatches from %d to %d for %d global "
+            "training microbatches",
+            n_mbs,
+            effective_n_mbs,
+            sum(concrete_counts),
+        )
+    elif effective_n_mbs > n_mbs:
+        logger.warning(
+            "Increasing synchronized PPO minibatches from %d to %d because one "
+            "data-parallel rank produced that many local microbatches",
+            n_mbs,
+            effective_n_mbs,
+        )
+
+    group_rank = dist.get_rank(group=group)
+    offset = sum(concrete_counts[:group_rank])
+    scheduled: list[dict[str, Any] | None] = [None] * effective_n_mbs
+    for index, microbatch in enumerate(local_mbs):
+        slot = (offset + index) % effective_n_mbs
+        if scheduled[slot] is not None:
+            raise RuntimeError(
+                "Microbatch scheduling collision at slot "
+                f"{slot} with {effective_n_mbs} synchronized slots"
+            )
+        scheduled[slot] = microbatch
+
+    dummy = make_transport_microbatch(data)
+    return [
+        microbatch if microbatch is not None else copy.deepcopy(dummy)
+        for microbatch in scheduled
+    ]
 
 
 N_TOKENS_PER_PAGE = 256
@@ -1533,6 +1614,11 @@ class Normalization:
                 slices.append(slice(offset, offset + sz))
                 offset += sz
             return slices
+        if bs % self.group_size != 0:
+            raise ValueError(
+                f"batch size ({bs}) must be divisible by group_size "
+                f"({self.group_size}) when group_sizes is not provided"
+            )
         return [
             slice(i * self.group_size, (i + 1) * self.group_size)
             for i in range(bs // self.group_size)

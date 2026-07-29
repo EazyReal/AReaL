@@ -18,6 +18,7 @@ from areal.utils.data import (
     pad_sequences_to_tensors,
     reorder_list,
     split_padded_tensor_dict_into_mb_list,
+    split_training_batch_into_microbatches,
     unpack_sequence,
 )
 
@@ -208,3 +209,92 @@ def test_transport_padding_converges_to_distributed_microbatch_count(monkeypatch
     assert len(mb_list.mbs) == 3
     assert mb_list.transport_dummy_count == 2
     assert sum(TRANSPORT_DUMMY_KEY in mb for mb in mb_list.mbs) == 2
+
+
+def _training_batch(batch_size: int) -> dict[str, torch.Tensor]:
+    return {
+        "input_ids": torch.arange(batch_size * 3).view(batch_size, 3),
+        "attention_mask": torch.ones(batch_size, 3, dtype=torch.bool),
+        "loss_mask": torch.tensor([[0, 1, 1]], dtype=torch.bool).repeat(batch_size, 1),
+        "advantages": torch.ones(batch_size, 3),
+    }
+
+
+@pytest.mark.parametrize(
+    ("rank", "batch_size", "expected_semantic_steps"),
+    [(0, 1, [True, False, False]), (1, 2, [False, True, True])],
+)
+def test_synchronized_training_schedule_has_semantic_global_member_per_step(
+    monkeypatch, rank, batch_size, expected_semantic_steps
+):
+    monkeypatch.setattr(data_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(data_module.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(data_module.dist, "get_rank", lambda group=None: rank)
+
+    def _all_gather_counts(output, value, group=None):
+        del value, group
+        output[:] = [1, 2]
+
+    monkeypatch.setattr(data_module.dist, "all_gather_object", _all_gather_counts)
+
+    schedule = split_training_batch_into_microbatches(
+        _training_batch(batch_size),
+        n_mbs=4,
+    )
+
+    assert len(schedule) == 3
+    assert [
+        TRANSPORT_DUMMY_KEY not in microbatch for microbatch in schedule
+    ] == expected_semantic_steps
+    assert all(
+        bool(microbatch["loss_mask"].any()) == is_semantic
+        for microbatch, is_semantic in zip(
+            schedule, expected_semantic_steps, strict=True
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("rank", "batch_size", "expected_semantic_steps"),
+    [(0, 3, [True, True, True]), (1, 1, [True, False, False])],
+)
+def test_synchronized_training_schedule_preserves_extra_local_microbatches(
+    monkeypatch, rank, batch_size, expected_semantic_steps
+):
+    monkeypatch.setattr(data_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(data_module.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(data_module.dist, "get_rank", lambda group=None: rank)
+
+    def _all_gather_counts(output, value, group=None):
+        del value, group
+        output[:] = [3, 1]
+
+    def _split_into_local_microbatches(data, mb_spec, synchronize):
+        del synchronize
+        microbatches = [
+            {key: value[index : index + 1] for key, value in data.items()}
+            for index in range(batch_size)
+        ]
+        return MicroBatchList(
+            data=data,
+            mb_spec=mb_spec,
+            mbs=microbatches,
+            group_lens=[1] * batch_size,
+        )
+
+    monkeypatch.setattr(data_module.dist, "all_gather_object", _all_gather_counts)
+    monkeypatch.setattr(
+        data_module,
+        "split_padded_tensor_dict_into_mb_list",
+        _split_into_local_microbatches,
+    )
+
+    schedule = split_training_batch_into_microbatches(
+        _training_batch(batch_size),
+        n_mbs=2,
+    )
+
+    assert len(schedule) == 3
+    assert [
+        TRANSPORT_DUMMY_KEY not in microbatch for microbatch in schedule
+    ] == expected_semantic_steps
