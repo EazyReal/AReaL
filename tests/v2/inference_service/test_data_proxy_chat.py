@@ -819,6 +819,133 @@ async def test_batch_online_set_reward_completes_that_session(client):
     )
     assert export_resp.status_code == 200
     assert "traj" in export_resp.json()
+    assert export_resp.json()["exported_session_count"] == 1
+    assert export_resp.json()["exported_session_ids"] == [session_id]
+
+
+async def _make_session_exportable(client, credential) -> None:
+    headers = session_headers(credential["session_api_key"])
+    chat = await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
+        headers=headers,
+    )
+    assert chat.status_code == 200
+    reward = await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=headers,
+    )
+    assert reward.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_export_counts_only_materialized_sessions_and_cleans_group(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "partial-export", "group_size": 2},
+        headers=admin_headers(),
+    )
+    credentials = start.json()["sessions"]
+    await _make_session_exportable(client, credentials[0])
+    session_ids = [item["session_id"] for item in credentials]
+
+    export = await client.post(
+        "/export_trajectories",
+        json={"session_ids": session_ids},
+        headers=admin_headers(),
+    )
+
+    assert export.status_code == 200
+    assert export.json()["exported_session_count"] == 1
+    assert export.json()["exported_session_ids"] == [session_ids[0]]
+    store: SessionStore = client._transport.app.state.session_store
+    assert all(store.get_session(session_id) is None for session_id in session_ids)
+
+
+@pytest.mark.asyncio
+async def test_export_excludes_failed_session_without_leaking_it(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "excluded-export", "group_size": 2},
+        headers=admin_headers(),
+    )
+    credentials = start.json()["sessions"]
+    for credential in credentials:
+        await _make_session_exportable(client, credential)
+    session_ids = [item["session_id"] for item in credentials]
+
+    export = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": session_ids,
+            "excluded_session_ids": [session_ids[1]],
+        },
+        headers=admin_headers(),
+    )
+
+    assert export.status_code == 200
+    assert export.json()["exported_session_count"] == 1
+    assert export.json()["exported_session_ids"] == [session_ids[0]]
+    store: SessionStore = client._transport.app.state.session_store
+    assert all(store.get_session(session_id) is None for session_id in session_ids)
+
+
+@pytest.mark.asyncio
+async def test_group_relative_export_rejects_multi_member_session_and_cleans(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "multi-member", "group_size": 2},
+        headers=admin_headers(),
+    )
+    session_ids = [item["session_id"] for item in start.json()["sessions"]]
+    store: SessionStore = client._transport.app.state.session_store
+    first = store.get_session(session_ids[0])
+    assert first is not None
+    first.export_trajectory = MagicMock(
+        return_value=(0, {"first": MagicMock(), "second": MagicMock()})
+    )
+
+    export = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": session_ids,
+            "min_usable_group_size": 2,
+        },
+        headers=admin_headers(),
+    )
+
+    assert export.status_code == 400
+    assert "exactly one unique physical training member" in export.json()["detail"]
+    assert all(store.get_session(session_id) is None for session_id in session_ids)
+
+
+@pytest.mark.parametrize("invalid_request", ["unknown_exclusion", "invalid_minimum"])
+@pytest.mark.asyncio
+async def test_terminal_export_validation_error_cleans_requested_sessions(
+    client, invalid_request
+):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": invalid_request, "group_size": 2},
+        headers=admin_headers(),
+    )
+    session_ids = [item["session_id"] for item in start.json()["sessions"]]
+    payload = {"session_ids": session_ids}
+    if invalid_request == "unknown_exclusion":
+        payload["excluded_session_ids"] = ["not-requested"]
+    else:
+        payload["min_usable_group_size"] = 3
+
+    export = await client.post(
+        "/export_trajectories",
+        json=payload,
+        headers=admin_headers(),
+    )
+
+    assert export.status_code == 400
+    store: SessionStore = client._transport.app.state.session_store
+    assert all(store.get_session(session_id) is None for session_id in session_ids)
 
 
 # =============================================================================
@@ -944,6 +1071,8 @@ async def test_export_trajectories_not_found(client):
     )
     assert resp.status_code == 200
     assert resp.json()["traj"] == {}
+    assert resp.json()["exported_session_count"] == 0
+    assert resp.json()["exported_session_ids"] == []
 
 
 @pytest.mark.asyncio

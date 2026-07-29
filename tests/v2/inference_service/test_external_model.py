@@ -335,7 +335,7 @@ class TestGatewayExternalEndpoints:
         assert resp.json()["models"] == ["ext-1", "ext-2"]
 
     @pytest.mark.asyncio
-    @patch(f"{ROUTER_MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{ROUTER_MODULE}.forward_request_once", new_callable=AsyncMock)
     @patch(f"{ROUTER_MODULE}.query_router", new_callable=AsyncMock)
     async def test_export_trajectories_routes_external_by_session_id(
         self,

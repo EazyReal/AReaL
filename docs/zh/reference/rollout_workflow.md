@@ -199,10 +199,13 @@ rollout:
 1. 每个 slot 可用时返回正常结果类型，不可用时返回 `None`。`None` 有意保持不透明；原因分类与重试策略仍由 producer 负责。
 1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
 1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
-1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
-   使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`。低于该 estimator 自有下限的 group 返回 `None`，异步
+1. `min_usable_group_size` 默认为 `1`。仅当 RL trainer 的 reward 或 advantage normalization 使用
+   group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`。低于该 estimator 自有下限的 group 返回 `None`，异步
    collector 随后会接收另一个已就绪的 prompt group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的
    singleton。
+
+v2 inference-service 路径会在 data proxy 导出 session 后再作此判断，而不是只看 agent 是否返回。失败的 session
+不会进入训练结果；响应会报告实际成功导出的 session 标识和数量；所有请求的 session 仍会被清理。
 
 PPO 系列 actor loss 默认仍按全局 token 加权。因此，有更多有效 response tokens 的 partial group 会比更小或更短的
 group 获得更高 loss weight。这是保持向后兼容的现有 estimator，并不表示各 prompt 隐式等权。

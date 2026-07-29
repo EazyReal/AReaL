@@ -724,41 +724,88 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
-        if not body.session_ids:
-            raise HTTPException(
-                status_code=400,
-                detail="session_ids must be a non-empty list",
-            )
-
-        merged: dict[str, InteractionWithTokenLogpReward] = {}
-
-        for sid in body.session_ids:
-            session = store.get_session(sid)
-            if session is None:
-                continue
-
-            try:
-                _, interactions = session.export_trajectory(
-                    discount=body.discount,
-                    style=body.style,
-                    trajectory_id=body.trajectory_id,
+        try:
+            if not body.session_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="session_ids must be a non-empty list",
                 )
-                merged.update(interactions)
-            except KeyError:
-                continue
 
-        if all(v.has_tensor_data for v in merged.values()):
-            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
-            traj = RTensor.remotize(traj, node_addr=config.serving_addr)
-        else:
-            traj = concat_string_interactions(merged)
+            requested_session_ids = set(body.session_ids)
+            excluded_session_ids = set(body.excluded_session_ids)
+            unknown_exclusions = excluded_session_ids - requested_session_ids
+            if unknown_exclusions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "excluded_session_ids must be a subset of session_ids; got "
+                        f"{sorted(unknown_exclusions)}"
+                    ),
+                )
+            if not 1 <= body.min_usable_group_size <= len(body.session_ids):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "min_usable_group_size must be between 1 and the requested "
+                        f"session count ({len(body.session_ids)}), got "
+                        f"{body.min_usable_group_size}"
+                    ),
+                )
 
-        if body.remove_session:
+            merged: dict[str, InteractionWithTokenLogpReward] = {}
+            exported_session_ids: list[str] = []
             for sid in body.session_ids:
-                store.remove_session(sid)
+                if sid in excluded_session_ids:
+                    continue
+                session = store.get_session(sid)
+                if session is None:
+                    continue
 
-        serialized = serialize_value(traj)
-        return ExportTrajectoriesResponse(traj=serialized)
+                try:
+                    _, interactions = session.export_trajectory(
+                        discount=body.discount,
+                        style=body.style,
+                        trajectory_id=body.trajectory_id,
+                    )
+                except KeyError:
+                    continue
+                if not interactions:
+                    continue
+
+                if body.min_usable_group_size > 1 and (
+                    len(interactions) != 1 or merged.keys() & interactions.keys()
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Group-relative normalization requires each logical "
+                            "session to export exactly one unique physical training "
+                            "member."
+                        ),
+                    )
+                merged.update(interactions)
+                exported_session_ids.append(sid)
+
+            if not merged:
+                traj = {}
+            elif all(v.has_tensor_data for v in merged.values()):
+                traj = concat_padded_tensors(
+                    [v.to_tensor_dict() for v in merged.values()]
+                )
+                traj = RTensor.remotize(traj, node_addr=config.serving_addr)
+            else:
+                traj = concat_string_interactions(merged)
+
+            serialized = serialize_value(traj)
+            return ExportTrajectoriesResponse(
+                traj=serialized,
+                exported_session_count=len(exported_session_ids),
+                exported_session_ids=exported_session_ids,
+            )
+        finally:
+            if body.remove_session:
+                for sid in body.session_ids:
+                    store.remove_session(sid)
 
     # =========================================================================
     # Runtime backend reconfiguration (for fork-based deployment)

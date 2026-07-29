@@ -31,6 +31,7 @@ from areal.v2.inference_service.gateway.streaming import (
     _forwarding_headers,
     broadcast_to_workers,
     forward_request,
+    forward_request_once,
     forward_sse_stream,
     list_models_from_router,
     query_router,
@@ -492,6 +493,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
         session_ids: list[str] = body_json.get("session_ids") or []
         group_id: str | None = body_json.get("group_id")
+        remove_session = body_json.get("remove_session", True)
 
         if not session_ids:
             return JSONResponse({"error": "session_ids is required"}, status_code=400)
@@ -508,22 +510,29 @@ def create_app(config: GatewayConfig) -> FastAPI:
             return _router_error_response(exc)
 
         headers = _forwarding_headers(dict(request.headers))
-        resp = await forward_request(
-            f"{worker_addr}/export_trajectories",
-            body,
-            headers,
-            config.forward_timeout,
-            client=_client(),
-        )
-
-        if resp.status_code == 200 and group_id is not None:
-            await revoke_session_in_router(
-                config.router_addr,
-                config.admin_api_key,
-                group_id,
-                timeout=config.router_timeout,
+        try:
+            resp = await forward_request_once(
+                f"{worker_addr}/export_trajectories",
+                body,
+                headers,
+                config.forward_timeout,
                 client=_client(),
             )
+        except httpx.HTTPError as exc:
+            logger.error("Terminal trajectory export failed: %s", exc)
+            return JSONResponse(
+                {"error": f"Terminal trajectory export failed: {exc}"},
+                status_code=502,
+            )
+        finally:
+            if group_id is not None and remove_session:
+                await revoke_session_in_router(
+                    config.router_addr,
+                    config.admin_api_key,
+                    group_id,
+                    timeout=config.router_timeout,
+                    client=_client(),
+                )
 
         return Response(
             content=resp.content,

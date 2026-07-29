@@ -212,11 +212,16 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    nor duplicates a usable result.
 1. Usable slots are retained exactly once and concatenated. Their actual count remains a
    prompt-group boundary during reward and advantage normalization.
-1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
-   or advantage normalization uses group statistics, because that statistic needs at
-   least two observations. Groups below that estimator-owned minimum return `None`; the
+1. `min_usable_group_size` defaults to `1`. The RL trainer sets it to `2` when reward or
+   advantage normalization uses group statistics, because that statistic needs at least
+   two observations. Groups below that estimator-owned minimum return `None`; the
    asynchronous collector then takes another ready prompt group. Batch-relative PPO and
    REINFORCE retain a usable singleton.
+
+The v2 inference-service path applies this decision after the data proxy exports the
+sessions, not merely after their agents return. Failed sessions are excluded from the
+training result, the response reports the exact successfully exported session identities
+and count, and every requested session is still cleaned up.
 
 PPO-family actor loss remains globally token-weighted by default. Consequently, a
 partial group with more valid response tokens contributes more loss weight than a

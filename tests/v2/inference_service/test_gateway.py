@@ -233,7 +233,7 @@ class TestAdminEndpoints:
     @pytest.mark.asyncio
     @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
     @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
-    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request_once", new_callable=AsyncMock)
     async def test_admin_export_trajectories(
         self, mock_forward, mock_query_router, mock_revoke, client
     ):
@@ -258,7 +258,7 @@ class TestAdminEndpoints:
     @pytest.mark.asyncio
     @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
     @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
-    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request_once", new_callable=AsyncMock)
     async def test_online_export_without_group_id_skips_revoke(
         self, mock_forward, mock_query_router, mock_revoke, client
     ):
@@ -277,6 +277,54 @@ class TestAdminEndpoints:
         )
         assert resp.status_code == 200
         mock_revoke.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request_once", new_callable=AsyncMock)
+    async def test_terminal_export_error_still_revokes_group(
+        self, mock_forward, mock_query_router, mock_revoke, client
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+        mock_forward.return_value = httpx.Response(
+            400,
+            json={"detail": "invalid grouped export"},
+        )
+
+        resp = await client.post(
+            "/export_trajectories",
+            json={
+                "session_ids": ["task-1-0", "task-1-1"],
+                "group_id": "grp-test",
+            },
+            headers=admin_headers(),
+        )
+
+        assert resp.status_code == 400
+        mock_revoke.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request_once", new_callable=AsyncMock)
+    async def test_terminal_export_transport_error_is_not_retried_and_revokes_group(
+        self, mock_forward, mock_query_router, mock_revoke, client
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+        mock_forward.side_effect = httpx.ReadError("response lost")
+
+        resp = await client.post(
+            "/export_trajectories",
+            json={
+                "session_ids": ["task-1-0", "task-1-1"],
+                "group_id": "grp-test",
+            },
+            headers=admin_headers(),
+        )
+
+        assert resp.status_code == 502
+        mock_forward.assert_awaited_once()
+        mock_revoke.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_export_trajectories_missing_session_id(self, client):
