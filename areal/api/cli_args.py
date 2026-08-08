@@ -1628,14 +1628,6 @@ class PPOActorConfig(TrainEngineConfig):
             "loss_aggregation_divisor. Non-token modes require sequence "
             "boundaries; tree-packed actor training currently supports only "
             "'token_mean'.",
-            "help_zh": "Policy-gradient loss 的归约方式。"
-            "'token_mean': 对有效 token 求平均。"
-            "'seq_mean': 先对每条 response 的有效 token 求平均，再对 response "
-            "求平均。'prompt_mean': 先对同一 prompt 的 response group 内有效 "
-            "token 求平均，再对 prompt group 求平均。"
-            "'constant': 将每条 response 的 masked token loss 之和除以 "
-            "loss_aggregation_divisor 后再求平均。非 token 模式需要 sequence "
-            "边界；tree-packed actor 训练目前仅支持 'token_mean'。",
             "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
         },
     )
@@ -1644,8 +1636,6 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Positive fixed denominator L for loss_aggregation='constant'. "
             "Unused by other loss aggregation modes.",
-            "help_zh": "loss_aggregation='constant' 使用的正数固定分母 L。其他 "
-            "loss aggregation 模式不使用。",
         },
     )
     # Asynchronous RL
