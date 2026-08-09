@@ -292,6 +292,13 @@ _SHUTDOWN_TIMEOUT_SECONDS = 2.0
 # Timeout for "wait" and "wait_for_task" if timeout parameter is None
 _DEFAULT_WAIT_TIMEOUT_SECONDS = float(7 * 24 * 3600)
 
+# Dynamic collection is declared stalled only when BOTH hold: this many
+# consecutive rounds added zero trainable groups, and the streak lasted at
+# least this long. Requiring both keeps fast legitimate all-reject bursts
+# (e.g. a staleness flush after a weight update) from aborting the run.
+MAX_CONSECUTIVE_EMPTY_ROLLOUT_ROUNDS = 8
+ROLLOUT_COLLECTION_STALL_TIMEOUT_SECONDS = 1800.0
+
 
 class WithTaskID(Protocol):
     task_id: int

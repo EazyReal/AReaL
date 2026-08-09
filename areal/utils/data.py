@@ -1440,6 +1440,164 @@ def all_gather_tensor_container(data, group=None) -> list:
     return results
 
 
+@dataclass(frozen=True)
+class _TensorLeaf:
+    """Picklable stand-in for a tensor leaf inside a gathered container skeleton."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device_type: str
+
+    @property
+    def numel(self) -> int:
+        return int(np.prod(self.shape))
+
+
+def _deconstruct_tensor_container(value, out_tensors: list[torch.Tensor]):
+    """Split a container into a picklable skeleton and its tensor leaves (DFS order)."""
+    if torch.is_tensor(value):
+        out_tensors.append(value)
+        return _TensorLeaf(tuple(value.shape), value.dtype, value.device.type)
+    if isinstance(value, list):
+        return [_deconstruct_tensor_container(item, out_tensors) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _deconstruct_tensor_container(item, out_tensors)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _reconstruct_tensor_container(skeleton, tensors: Iterator[torch.Tensor]):
+    """Rebuild a container from its skeleton, consuming tensor leaves in DFS order."""
+    if isinstance(skeleton, _TensorLeaf):
+        return next(tensors)
+    if isinstance(skeleton, list):
+        return [_reconstruct_tensor_container(item, tensors) for item in skeleton]
+    if isinstance(skeleton, dict):
+        return {
+            key: _reconstruct_tensor_container(item, tensors)
+            for key, item in skeleton.items()
+        }
+    return skeleton
+
+
+def _skeleton_tensor_leaves(skeletons) -> list[_TensorLeaf]:
+    leaves: list[_TensorLeaf] = []
+
+    def _walk(value):
+        if isinstance(value, _TensorLeaf):
+            leaves.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+
+    _walk(skeletons)
+    return leaves
+
+
+def all_gather_ragged_tensor_container(items: list, group=None) -> list[list]:
+    """All-gather per-rank container lists whose lengths differ across ranks.
+
+    Complements :func:`all_gather_tensor_container`, which requires every rank
+    to contribute the same number of items. One object all-gather exchanges
+    per-item skeletons (structure, non-tensor leaves, and tensor metadata);
+    tensor payloads then travel in one padded all-gather per (dtype, device
+    type) bucket. Buckets are derived from the gathered metadata, so every
+    rank — including ranks with no items — joins the same collectives.
+    """
+    world_size = dist.get_world_size(group)
+
+    local_tensors: list[torch.Tensor] = []
+    local_skeletons = [
+        _deconstruct_tensor_container(item, local_tensors) for item in items
+    ]
+
+    all_skeletons: list[list | None] = [None] * world_size
+    dist.all_gather_object(all_skeletons, local_skeletons, group=group)
+
+    leaves_by_rank = [_skeleton_tensor_leaves(skeletons) for skeletons in all_skeletons]
+    buckets = sorted(
+        {
+            (leaf.dtype, leaf.device_type)
+            for rank_leaves in leaves_by_rank
+            for leaf in rank_leaves
+        },
+        key=str,
+    )
+
+    local_rank = dist.get_rank(group=group)
+    payloads: dict[tuple[torch.dtype, str], list[list[torch.Tensor]]] = {}
+    for bucket in buckets:
+        dtype, device_type = bucket
+        device = (
+            torch.device("cpu")
+            if device_type == "cpu"
+            else current_platform.current_device()
+        )
+        max_numel = max(
+            sum(
+                leaf.numel
+                for leaf in rank_leaves
+                if (leaf.dtype, leaf.device_type) == bucket
+            )
+            for rank_leaves in leaves_by_rank
+        )
+        local_bucket_tensors = [
+            tensor
+            for tensor, leaf in zip(
+                local_tensors, leaves_by_rank[local_rank], strict=True
+            )
+            if (leaf.dtype, leaf.device_type) == bucket
+        ]
+        flat = (
+            torch.cat([tensor.reshape(-1) for tensor in local_bucket_tensors])
+            if local_bucket_tensors
+            else torch.empty(0, dtype=dtype, device=device)
+        )
+        padded = F.pad(flat, (0, max_numel - flat.numel()))
+        if max_numel > 0:
+            gathered = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(gathered, padded, group=group)
+        else:
+            # Every rank's payload is empty; slicing below yields 0-numel views.
+            gathered = [padded] * world_size
+
+        bucket_payload: list[list[torch.Tensor]] = []
+        for rank_leaves, buffer in zip(leaves_by_rank, gathered, strict=True):
+            offset = 0
+            rank_tensors = []
+            for leaf in rank_leaves:
+                if (leaf.dtype, leaf.device_type) != bucket:
+                    continue
+                # Clone so results do not alias the padded gather buffers,
+                # which would otherwise pin world_size * max_rank_payload
+                # memory for the lifetime of the batch.
+                rank_tensors.append(
+                    buffer.narrow(0, offset, leaf.numel).view(leaf.shape).clone()
+                )
+                offset += leaf.numel
+            bucket_payload.append(rank_tensors)
+        payloads[bucket] = bucket_payload
+
+    results: list[list] = []
+    for rank_index, (skeletons, rank_leaves) in enumerate(
+        zip(all_skeletons, leaves_by_rank, strict=True)
+    ):
+        cursors = {
+            bucket: iter(bucket_payload[rank_index])
+            for bucket, bucket_payload in payloads.items()
+        }
+        ordered = [
+            next(cursors[(leaf.dtype, leaf.device_type)]) for leaf in rank_leaves
+        ]
+        results.append(_reconstruct_tensor_container(skeletons, iter(ordered)))
+    return results
+
+
 def broadcast_tensor_container(data, src_rank=0, group=None):
     if dist.get_rank() != src_rank:
         metadata = [None]

@@ -298,3 +298,39 @@ def test_synchronized_training_schedule_preserves_extra_local_microbatches(
     assert [
         TRANSPORT_DUMMY_KEY not in microbatch for microbatch in schedule
     ] == expected_semantic_steps
+
+
+def test_tensor_container_skeleton_round_trip():
+    item = {
+        "input_ids": torch.arange(6, dtype=torch.long).view(2, 3),
+        "nested": [torch.ones(2, dtype=torch.bool), {"logprobs": torch.randn(4)}],
+        "reward": 1.5,
+        "task": "math",
+    }
+
+    tensors: list[torch.Tensor] = []
+    skeleton = data_module._deconstruct_tensor_container(item, tensors)
+    rebuilt = data_module._reconstruct_tensor_container(skeleton, iter(tensors))
+
+    assert torch.equal(rebuilt["input_ids"], item["input_ids"])
+    assert torch.equal(rebuilt["nested"][0], item["nested"][0])
+    assert torch.equal(rebuilt["nested"][1]["logprobs"], item["nested"][1]["logprobs"])
+    assert rebuilt["reward"] == 1.5
+    assert rebuilt["task"] == "math"
+
+
+def test_skeleton_tensor_leaves_follow_depth_first_order():
+    tensors: list[torch.Tensor] = []
+    items = [
+        {"a": torch.zeros(1, dtype=torch.long), "b": [torch.zeros(2)]},
+        {"a": torch.zeros(3, dtype=torch.long)},
+    ]
+    skeletons = [
+        data_module._deconstruct_tensor_container(item, tensors) for item in items
+    ]
+
+    leaves = data_module._skeleton_tensor_leaves(skeletons)
+
+    assert [leaf.shape for leaf in leaves] == [(1,), (2,), (3,)]
+    assert [leaf.dtype for leaf in leaves] == [torch.long, torch.float32, torch.long]
+    assert [leaf.numel for leaf in leaves] == [1, 2, 3]

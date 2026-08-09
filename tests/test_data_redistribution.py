@@ -49,7 +49,8 @@ def _assert_redistribution_outputs(tmp_path, world_size):
         assert_tensor_container_close(x.data, expected_data)
 
 
-def test_redistribute_ragged_cpu(tmp_path):
+@pytest.mark.parametrize("ragged_flag", ["--ragged", "--ragged-empty"])
+def test_redistribute_ragged_cpu(tmp_path, ragged_flag):
     world_size = 2
     port = find_free_ports(1)[0]
     subprocess.run(
@@ -64,7 +65,7 @@ def test_redistribute_ragged_cpu(tmp_path):
             "tests/torchrun/redistribute.py",
             f"--dump-path={str(tmp_path)}",
             "--backend=gloo",
-            "--ragged",
+            ragged_flag,
         ],
         check=True,
         text=True,

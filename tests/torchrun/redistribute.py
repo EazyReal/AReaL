@@ -76,7 +76,13 @@ def main(args):
     else:
         device = "cpu"
 
-    bs = rank + 1 if args.ragged else 16
+    if args.ragged_empty:
+        # One rank contributes zero trajectories; the gather must still work.
+        bs = 3 * rank
+    elif args.ragged:
+        bs = rank + 1
+    else:
+        bs = 16
     prompt_lens = [random.randint(1, 10) for _ in range(bs)]
     ans_lens = [random.randint(1, 10) for _ in range(bs)]
     seqlens = [x + y for x, y in zip(prompt_lens, ans_lens)]
@@ -120,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-path", type=str)
     parser.add_argument("--backend", choices=["gloo", "nccl"], default="nccl")
     parser.add_argument("--ragged", action="store_true")
+    parser.add_argument("--ragged-empty", action="store_true")
     parser.add_argument("--hybrid-error", action="store_true")
     args = parser.parse_args()
     main(args)
