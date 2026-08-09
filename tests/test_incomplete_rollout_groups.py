@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from omegaconf import DictConfig
 
 from areal.api.cli_args import InferenceEngineConfig, NormConfig, PPOActorConfig
 from areal.experimental.openai import InteractionWithTokenLogpReward
@@ -14,10 +15,7 @@ from areal.infra.workflow_executor import (
     validate_rollout_group_sizes,
 )
 from areal.trainer.ppo.actor import _group_training_metrics
-from areal.trainer.rl_trainer import (
-    _collect_trainable_rollout_batch,
-    _minimum_usable_group_size,
-)
+from areal.trainer.rl_trainer import _collect_trainable_rollout_batch
 from areal.utils.functional import ppo_actor_loss_fn
 
 
@@ -258,20 +256,21 @@ def test_actor_loss_keeps_existing_token_weighted_group_reduction():
     [
         NormConfig(mean_level="group", std_level=None, group_size=4),
         NormConfig(mean_level=None, std_level="group", group_size=4),
+        {"mean_level": "group", "std_level": None, "group_size": 4},
+        DictConfig({"mean_level": None, "std_level": "group", "group_size": 4}),
     ],
 )
 def test_minimum_usable_group_size_is_owned_by_estimator(normalization):
     group_relative = PPOActorConfig(adv_norm=normalization)
 
-    assert _minimum_usable_group_size(group_relative, target_group_size=4) == 2
-    with pytest.raises(ValueError, match="at least two rollout slots"):
-        _minimum_usable_group_size(group_relative, target_group_size=1)
+    assert group_relative.minimum_usable_group_size(target_group_size=4) == 2
+    assert group_relative.minimum_usable_group_size(target_group_size=1) == 1
 
 
 def test_batch_relative_estimator_keeps_usable_singleton():
     actor = PPOActorConfig(adv_norm=NormConfig(mean_level="batch", std_level="batch"))
 
-    assert _minimum_usable_group_size(actor, target_group_size=4) == 1
+    assert actor.minimum_usable_group_size(target_group_size=4) == 1
 
 
 def test_dynamic_collection_backfills_from_ready_groups():
@@ -287,6 +286,52 @@ def test_dynamic_collection_backfills_from_ready_groups():
 
     assert result == [{"group": "first"}, {"group": "second"}]
     assert prepare_batch.call_count == 3
+
+
+def test_dynamic_collection_aborts_after_consecutive_empty_rounds():
+    prepare_batch = MagicMock(return_value=[])
+
+    with pytest.raises(RuntimeError, match="added no trainable group"):
+        _collect_trainable_rollout_batch(
+            prepare_batch,
+            dynamic_bs=True,
+            min_batch_size=1,
+            stall_timeout=0.0,
+        )
+
+    assert prepare_batch.call_count == 8
+
+
+def test_dynamic_collection_empty_streak_resets_on_progress():
+    prepare_batch = MagicMock(
+        side_effect=[[], [{"group": "first"}], [], [{"group": "second"}]]
+    )
+
+    result = _collect_trainable_rollout_batch(
+        prepare_batch,
+        dynamic_bs=True,
+        min_batch_size=2,
+        max_empty_rounds=2,
+        stall_timeout=0.0,
+    )
+
+    assert result == [{"group": "first"}, {"group": "second"}]
+    assert prepare_batch.call_count == 4
+
+
+def test_dynamic_collection_tolerates_fast_all_reject_bursts():
+    # A staleness flush drains many rejected rounds in near-zero time; the
+    # round bound alone must not abort while the stall timeout has not run.
+    prepare_batch = MagicMock(side_effect=[[]] * 20 + [[{"group": "fresh"}]])
+
+    result = _collect_trainable_rollout_batch(
+        prepare_batch,
+        dynamic_bs=True,
+        min_batch_size=1,
+    )
+
+    assert result == [{"group": "fresh"}]
+    assert prepare_batch.call_count == 21
 
 
 def test_fixed_collection_rejects_undersized_batch():

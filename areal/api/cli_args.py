@@ -77,6 +77,11 @@ class NormConfig:
         default=1, metadata={"help": "Group size for group-level normalization"}
     )
 
+    @property
+    def uses_group_statistics(self) -> bool:
+        """Whether normalization derives statistics from prompt groups."""
+        return self.mean_level == "group" or self.std_level == "group"
+
     def __post_init__(self):
         """Validate normalization configuration."""
         valid_levels = {"batch", "group", None}
@@ -1704,6 +1709,27 @@ class PPOActorConfig(TrainEngineConfig):
         default=1024,
         metadata={"help": "Maximum number of new tokens to generate"},
     )
+
+    def minimum_usable_group_size(self, target_group_size: int) -> int:
+        """Minimum usable rollout slots a group must keep to stay trainable.
+
+        Group-relative normalization needs at least two group members before
+        partial groups become a hazard; a singleton target group is complete
+        by definition, so it keeps the minimum of one.
+        """
+        for normalization in (self.reward_norm, self.adv_norm):
+            if normalization is None:
+                continue
+            if isinstance(normalization, (dict, DictConfig)):
+                uses_group_statistics = (
+                    normalization.get("mean_level") == "group"
+                    or normalization.get("std_level") == "group"
+                )
+            else:
+                uses_group_statistics = normalization.uses_group_statistics
+            if uses_group_statistics:
+                return min(2, target_group_size)
+        return 1
 
     def should_compute_prox_logp(self) -> bool:
         """Determine if forward pass is needed for proximal log-probabilities.

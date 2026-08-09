@@ -105,9 +105,13 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     def _validate_slot_cardinality(self, slot_sizes: list[int]) -> None:
         if self.min_usable_group_size > 1 and any(size != 1 for size in slot_sizes):
             raise WorkflowContractError(
-                "Group-relative normalization requires each logical rollout slot "
-                "to produce exactly one physical training member; got slot sizes "
-                f"{slot_sizes}."
+                "Group-relative reward/advantage normalization requires each "
+                "rollout slot to contribute exactly one training sample; got "
+                f"slot sizes {slot_sizes}. Either return one sample per "
+                "arun_episode call (for agent workflows, set "
+                "agent.export_style='concat'), or set mean_level/std_level to "
+                "'batch' in actor.reward_norm/actor.adv_norm. This contract "
+                "violation is non-retryable and stops training."
             )
 
     async def arun_episode(

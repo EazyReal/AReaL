@@ -543,7 +543,9 @@ def balanced_greedy_partition(nums: list[int], K: int) -> list[list[int]]:
 
     Returns indices (not values) for each group.
 
-    Greedy with capacity-aware assignment.
+    Greedy with capacity-aware assignment. When ``len(nums)`` is not divisible
+    by ``K``, group cardinalities differ by at most one (the first
+    ``len(nums) % K`` groups take the extra item).
 
     Args:
         nums: List of values to partition
@@ -551,9 +553,6 @@ def balanced_greedy_partition(nums: list[int], K: int) -> list[list[int]]:
 
     Returns:
         List of K lists, where each inner list contains the indices assigned to that group
-
-    Group cardinalities differ by at most one when ``len(nums)`` is not divisible
-    by ``K``.
 
     Raises:
         ValueError: If len(nums) < K

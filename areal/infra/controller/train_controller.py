@@ -131,10 +131,14 @@ def _pad_eval_batch(
 ) -> tuple[Any, ...]:
     """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
 
-    Called before dispatch for explicit evaluation controller paths so that
-    ``balanced_greedy_partition`` always receives a divisible input.
-    Dummy items have zero attention/loss masks and contribute nothing
-    to metrics or loss.
+    Called before dispatch for explicit evaluation controller paths: eval
+    batches may be smaller than ``dp_size`` or not group-aligned, and padding
+    guarantees every DP rank receives at least one full group
+    (``_dispatch_tensors`` rejects ``n_groups < dp_size`` and
+    ``n % group_size != 0``). Training batches are intentionally not padded —
+    incomplete rollout groups make them ragged, and engines absorb ragged
+    shards via transport padding. Dummy items have zero attention/loss masks
+    and contribute nothing to metrics or loss.
     """
     result = list(args)
     pad_target = dp_size * group_size

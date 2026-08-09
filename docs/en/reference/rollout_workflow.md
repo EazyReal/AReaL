@@ -214,9 +214,23 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    prompt-group boundary during reward and advantage normalization.
 1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
    or advantage normalization uses group statistics, because that statistic needs at
-   least two observations. Groups below that estimator-owned minimum return `None`; the
-   asynchronous collector then takes another ready prompt group. Batch-relative PPO and
-   REINFORCE retain a usable singleton.
+   least two observations; a singleton target group (`n_samples: 1`) is complete by
+   definition and keeps the minimum of `1`. Groups below that estimator-owned minimum
+   return `None`; the asynchronous collector then takes another ready prompt group.
+   Batch-relative PPO and REINFORCE retain a usable singleton.
+1. Group statistics constrain the workflow contract. When reward or advantage
+   normalization uses group statistics (`mean_level: group` or `std_level: group`) and
+   rollouts are grouped (`n_samples >= 2`), each `arun_episode` call must contribute
+   exactly one training sample — a tensor dict with batch size 1, or a single exported
+   interaction. All built-in workflows comply. A workflow returning several samples per
+   episode (one row per turn, tree-search branches, or a multi-turn agent with
+   `agent.export_style: individual`) raises a non-retryable `WorkflowContractError` that
+   terminates training, because group mean/std would otherwise treat same-episode rows
+   as independent group members. Ungrouped rollouts (`n_samples: 1`) install no group
+   wrapper and are not checked; a multi-sample episode is then normalized as its own
+   group of same-episode rows. To train such workflows, switch `mean_level`/`std_level`
+   to `batch` (or disable normalization), or merge each episode into one sequence
+   (`agent.export_style: concat`).
 
 PPO-family actor loss remains globally token-weighted by default. Consequently, a
 partial group with more valid response tokens contributes more loss weight than a

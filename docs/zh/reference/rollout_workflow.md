@@ -200,9 +200,18 @@ rollout:
 1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
 1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
 1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
-   使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`。低于该 estimator 自有下限的 group 返回 `None`，异步
-   collector 随后会接收另一个已就绪的 prompt group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的
-   singleton。
+   使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
+   （`n_samples: 1`）本身即是完整的，因此下限保持为 `1`。低于该 estimator 自有下限的 group 返回 `None`，异步 collector
+   随后会接收另一个已就绪的 prompt group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的 singleton。
+1. Group statistics 会约束 workflow 契约：当 reward 或 advantage normalization 使用 group
+   statistics（`mean_level: group` 或 `std_level: group`）且 rollout
+   分组（`n_samples >= 2`）时，每次 `arun_episode` 调用必须恰好贡献一个训练样本——batch size 为 1 的张量字典，或单个导出的
+   interaction。所有内置 workflow 均满足该契约。如果 workflow 每个 episode 返回多个样本（每 turn 一行、tree-search
+   分支，或使用 `agent.export_style: individual` 的多轮 agent），会抛出不可重试的 `WorkflowContractError`
+   并终止训练，因为 group mean/std 会把同一 episode 的多行当作独立的 group 成员。未分组的
+   rollout（`n_samples: 1`）不会安装 group wrapper，因此不做该检查；此时多样本 episode 会作为由同一 episode
+   各行组成的独立 group 参与 normalization。若要训练此类 workflow，请将 `mean_level`/`std_level` 改为
+   `batch`（或关闭 normalization），或把每个 episode 合并为单条序列（`agent.export_style: concat`）。
 
 PPO 系列 actor loss 默认仍按全局 token 加权。因此，有更多有效 response tokens 的 partial group 会比更小或更短的
 group 获得更高 loss weight。这是保持向后兼容的现有 estimator，并不表示各 prompt 隐式等权。
