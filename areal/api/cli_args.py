@@ -1619,6 +1619,17 @@ class PPOActorConfig(TrainEngineConfig):
         default=None, metadata={"help": "Normalization configuration for advantages."}
     )
 
+    # Partial rollout groups
+    min_usable_group_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "Minimum usable rollout slots a prompt group must keep to stay "
+            "trainable when some slots fail or are filtered. None derives the "
+            "minimum from reward_norm/adv_norm: 2 when either uses group "
+            "statistics (1 for a singleton target group), else 1."
+        },
+    )
+
     # KL Control
     kl_ctl: float = field(default=0.1, metadata={"help": "KL divergence coefficient"})
     kl_estimator: str = field(
@@ -1710,13 +1721,16 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "Maximum number of new tokens to generate"},
     )
 
-    def minimum_usable_group_size(self, target_group_size: int) -> int:
+    def resolve_min_usable_group_size(self, target_group_size: int) -> int:
         """Minimum usable rollout slots a group must keep to stay trainable.
 
-        Group-relative normalization needs at least two group members before
-        partial groups become a hazard; a singleton target group is complete
-        by definition, so it keeps the minimum of one.
+        An explicit ``min_usable_group_size`` wins. Otherwise group-relative
+        normalization needs at least two group members before partial groups
+        become a hazard; a singleton target group is complete by definition,
+        so it keeps the minimum of one.
         """
+        if self.min_usable_group_size is not None:
+            return self.min_usable_group_size
         for normalization in (self.reward_norm, self.adv_norm):
             if normalization is None:
                 continue

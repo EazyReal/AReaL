@@ -661,7 +661,7 @@ class PPOTrainer:
         config = self.config
         is_v1_rollout = config.rollout._version == "v1"
         min_usable_group_size = (
-            config.actor.minimum_usable_group_size(config.gconfig.n_samples)
+            config.actor.resolve_min_usable_group_size(config.gconfig.n_samples)
             if is_v1_rollout
             else 1
         )

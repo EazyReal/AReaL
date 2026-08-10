@@ -260,17 +260,26 @@ def test_actor_loss_keeps_existing_token_weighted_group_reduction():
         DictConfig({"mean_level": None, "std_level": "group", "group_size": 4}),
     ],
 )
-def test_minimum_usable_group_size_is_owned_by_estimator(normalization):
+def test_min_usable_group_size_defaults_to_estimator_minimum(normalization):
     group_relative = PPOActorConfig(adv_norm=normalization)
 
-    assert group_relative.minimum_usable_group_size(target_group_size=4) == 2
-    assert group_relative.minimum_usable_group_size(target_group_size=1) == 1
+    assert group_relative.resolve_min_usable_group_size(target_group_size=4) == 2
+    assert group_relative.resolve_min_usable_group_size(target_group_size=1) == 1
 
 
 def test_batch_relative_estimator_keeps_usable_singleton():
     actor = PPOActorConfig(adv_norm=NormConfig(mean_level="batch", std_level="batch"))
 
-    assert actor.minimum_usable_group_size(target_group_size=4) == 1
+    assert actor.resolve_min_usable_group_size(target_group_size=4) == 1
+
+
+def test_explicit_min_usable_group_size_overrides_derivation():
+    actor = PPOActorConfig(
+        adv_norm=NormConfig(mean_level="group", std_level="group", group_size=4),
+        min_usable_group_size=3,
+    )
+
+    assert actor.resolve_min_usable_group_size(target_group_size=4) == 3
 
 
 def test_dynamic_collection_backfills_from_ready_groups():

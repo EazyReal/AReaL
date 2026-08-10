@@ -215,9 +215,10 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
 1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
    or advantage normalization uses group statistics, because that statistic needs at
    least two observations; a singleton target group (`n_samples: 1`) is complete by
-   definition and keeps the minimum of `1`. Groups below that estimator-owned minimum
-   return `None`; the asynchronous collector then takes another ready prompt group.
-   Batch-relative PPO and REINFORCE retain a usable singleton.
+   definition and keeps the minimum of `1`. Setting `actor.min_usable_group_size`
+   replaces this derived value. Groups below the minimum return `None`; the asynchronous
+   collector then takes another ready prompt group. Batch-relative PPO and REINFORCE
+   retain a usable singleton.
 1. Group statistics constrain the workflow contract. When reward or advantage
    normalization uses group statistics (`mean_level: group` or `std_level: group`) and
    rollouts are grouped (`n_samples >= 2`), each `arun_episode` call must contribute
