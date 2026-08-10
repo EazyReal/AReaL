@@ -1773,7 +1773,13 @@ class FSDPEngine(TrainEngine):
                 full_param = param.data
 
             if dist.get_rank() == 0:
-                clean_name = re.sub(r"^base_model\.model\.", "", name)
+                # Emit PEFT-serving-standard keys. Drop the active-adapter
+                # segment (".default") so names match what
+                # PeftModel.save_pretrained produces
+                # (e.g. "...down_proj.lora_A.weight"). Keeping ".default"
+                # makes vLLM's parse_fine_tuned_lora_name reject the adapter
+                # with "unsupported LoRA weight" on disk-mode load.
+                clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
                 adapter_state[clean_name] = (
                     self._cast_to_compute_dtype(full_param.cpu())
                     if full_param.is_floating_point()
@@ -2105,6 +2111,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2135,6 +2142,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2195,6 +2203,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
                 logprobs, entropy = self._compute_logprobs_entropy(
@@ -2244,6 +2253,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
                 return result
             result = self._compute_logprobs(
