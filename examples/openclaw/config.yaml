@@ -80,7 +80,7 @@ actor:
     metric: ratio
     upper: 5.0
   reward_norm:
-    mean_level: group
+    mean_level: batch
     std_level: group
     group_size: ${gconfig.n_samples}
   adv_norm:
