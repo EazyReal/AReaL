@@ -22,10 +22,11 @@ class RolloutWorkflow(ABC):
         ----
         Returning `None` implies that this trajectory is rejected and will not be used for training.
 
-        When group-relative reward or advantage normalization is enabled
-        (``mean_level='group'`` or ``std_level='group'`` in
-        ``actor.reward_norm`` / ``actor.adv_norm``) and rollouts are grouped
-        (``n_samples >= 2``), each ``arun_episode`` call must contribute
+        When the resolved ``min_usable_group_size`` is at least 2 — derived
+        from group-relative normalization (``mean_level='group'`` or
+        ``std_level='group'`` in ``actor.reward_norm`` / ``actor.adv_norm``),
+        or set explicitly via ``actor.min_usable_group_size`` — and rollouts
+        are grouped (``n_samples >= 2``), each ``arun_episode`` call must contribute
         exactly one training sample: a tensor dict with batch size 1, or a
         dict containing a single interaction. Returning multiple samples per
         episode (e.g. one row per turn, or tree-search branches) raises a

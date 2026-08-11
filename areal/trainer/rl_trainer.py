@@ -730,6 +730,11 @@ class PPOTrainer:
     ):
         config = self.config
         is_v1_rollout = config.rollout._version == "v1"
+        if not is_v1_rollout and config.actor.min_usable_group_size is not None:
+            raise ValueError(
+                "The v2 rollout path does not support actor.min_usable_group_size "
+                "yet; unset it or use a v1 rollout backend."
+            )
         min_usable_group_size = (
             config.actor.resolve_min_usable_group_size(config.gconfig.n_samples)
             if is_v1_rollout

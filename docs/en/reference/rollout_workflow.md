@@ -220,18 +220,20 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    statistics are in use. Groups below the minimum return `None`; the asynchronous
    collector then takes another ready prompt group. Batch-relative PPO and REINFORCE
    retain a usable singleton.
-1. Group statistics constrain the workflow contract. When reward or advantage
-   normalization uses group statistics (`mean_level: group` or `std_level: group`) and
-   rollouts are grouped (`n_samples >= 2`), each `arun_episode` call must contribute
-   exactly one training sample — a tensor dict with batch size 1, or a single exported
-   interaction. All built-in workflows comply. A workflow returning several samples per
-   episode (one row per turn, tree-search branches, or a multi-turn agent with
-   `agent.export_style: individual`) raises a non-retryable `WorkflowContractError` that
-   terminates training, because group mean/std would otherwise treat same-episode rows
-   as independent group members. Ungrouped rollouts (`n_samples: 1`) install no group
-   wrapper and are not checked; a multi-sample episode is then normalized as its own
-   group of same-episode rows. To train such workflows, switch `mean_level`/`std_level`
-   to `batch` (or disable normalization), or merge each episode into one sequence
+1. Group statistics constrain the workflow contract. When the resolved
+   `min_usable_group_size` is at least `2` — derived from group statistics
+   (`mean_level: group` or `std_level: group`), or set explicitly via
+   `actor.min_usable_group_size` — and rollouts are grouped (`n_samples >= 2`), each
+   `arun_episode` call must contribute exactly one training sample — a tensor dict with
+   batch size 1, or a single exported interaction. All built-in workflows comply. A
+   workflow returning several samples per episode (one row per turn, tree-search
+   branches, or a multi-turn agent with `agent.export_style: individual`) raises a
+   non-retryable `WorkflowContractError` that terminates training, because group
+   mean/std would otherwise treat same-episode rows as independent group members.
+   Ungrouped rollouts (`n_samples: 1`) install no group wrapper and are not checked; a
+   multi-sample episode is then normalized as its own group of same-episode rows. To
+   train such workflows, switch `mean_level`/`std_level` to `batch` (or disable
+   normalization), or merge each episode into one sequence
    (`agent.export_style: concat`).
 
 PPO-family actor loss remains globally token-weighted by default. Consequently, a
