@@ -29,6 +29,13 @@ sequences and append the "attention_mask":
 
 ```python
 # areal/dataset/gsm8k.py
+def _common_prefix_len(left: list[int], right: list[int]) -> int:
+    for i, (left_id, right_id) in enumerate(zip(left, right)):
+        if left_id != right_id:
+            return i
+    return min(len(left), len(right))
+
+
 def get_gsm8k_sft_dataset(
     path: str,
     split: str,
