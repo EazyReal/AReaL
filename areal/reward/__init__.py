@@ -38,9 +38,12 @@ def _verify_in_subprocess(
 class MathVerifyWorker:
     """Thin wrapper over math_verify with configurable extraction/precision.
 
-    ``math_verify`` timeouts use ``SIGALRM``, which is invalid in reward
-    worker threads. This wrapper disables those nested timeouts and owns one
-    wall-clock bound around parsing + comparison.
+    ``verify()`` normally runs on a worker process's main thread, via
+    ``AsyncRewardWrapper``'s ``ProcessPoolExecutor``, where ``SIGALRM`` is
+    valid and bounds parsing + comparison directly. Off the main thread,
+    where ``SIGALRM`` is invalid, it falls back to a killable subprocess for
+    the same wall-clock bound. ``math_verify``'s own nested timeouts stay
+    disabled either way.
 
     Args:
         try_extract_without_anchor: When False, only answers with explicit anchors
