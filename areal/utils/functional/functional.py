@@ -504,6 +504,12 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
+        group_sizes: Trajectory count of each prompt group, summing to the number
+            of sequences. Required for loss_aggregation='prompt_mean'.
+        pg_reduction: PolicyGradientReduction selecting the loss aggregation mode.
+            None uses the default token-mean reduction.
+        denominator_mask: Original loss mask kept as the aggregation denominator
+            when rejection sampling narrows loss_mask.
     """
     # Rejection masking narrows the numerator but keeps the original denominator.
     orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
@@ -633,6 +639,9 @@ def sapo_loss_fn(
         loss_mask: Mask for valid tokens
         importance_sampling_level: "token" or "sequence" level importance sampling
         cu_seqlens: Cumulative sequence lengths for sequence-level IS
+        group_sizes: Per-prompt trajectory counts, required for prompt_mean aggregation
+        pg_reduction: PolicyGradientReduction selecting the loss aggregation mode
+        denominator_mask: Original loss mask kept as the aggregation denominator
 
     Returns:
         Tuple of (loss, statistics dict compatible with PPO)
@@ -749,6 +758,12 @@ def cispo_loss_fn(
             None disables it (pure on-policy CISPO).
         cu_seqlens: Cumulative sequence lengths for 1D packed inputs; required when
             ``rejection_sampling.level == "sequence"``.
+        group_sizes: Trajectory count of each prompt group, summing to the number
+            of sequences; required for ``loss_aggregation='prompt_mean'``.
+        pg_reduction: :class:`PolicyGradientReduction` selecting the aggregation
+            mode; ``None`` uses the default token-mean reduction.
+        denominator_mask: Original loss mask kept as the aggregation denominator
+            when rejection sampling narrows ``loss_mask``.
 
     Returns:
         ``(loss, stat)`` matching the PPO loss signature. ``stat['clip_mask']``

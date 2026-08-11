@@ -218,4 +218,3 @@ def test_cispo_config_validation():
         loss_aggregation="seq_mean",
     )
     PPOActorConfig(use_cispo_loss=True, eps_clip=1.0, eps_clip_higher=4.0)
-    # Token level only.
