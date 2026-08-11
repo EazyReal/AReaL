@@ -187,6 +187,22 @@ def get_type_description(field_type, all_dataclasses: dict[str, Any]) -> str:
 def format_default_value(field_obj) -> str:
     """Format default values for display."""
 
+    scalar_types = (str, int, float, bool, type(None))
+
+    def is_literal(default_value) -> bool:
+        """Whether a value is simple enough to print verbatim."""
+        if isinstance(default_value, scalar_types):
+            return True
+        elif isinstance(default_value, (list, tuple)):
+            return all(isinstance(item, scalar_types) for item in default_value)
+        elif isinstance(default_value, dict):
+            return all(
+                isinstance(item, scalar_types)
+                for pair in default_value.items()
+                for item in pair
+            )
+        return False
+
     def format_value(default_value) -> str:
         if default_value is OMEGACONF_MISSING:
             return "**Required**"
@@ -202,17 +218,12 @@ def format_default_value(field_obj) -> str:
     elif field_obj.default_factory is not DATACLASSES_MISSING:
         try:
             factory_result = field_obj.default_factory()
-            if (
-                factory_result
-                and isinstance(factory_result, list)
-                and all(
-                    isinstance(item, (str, int, float, bool)) for item in factory_result
-                )
-            ):
-                return format_value(factory_result)
-            return "**Required**"
         except Exception:
             return f"*default {field_obj.default_factory.__name__}*"
+        if is_literal(factory_result):
+            return format_value(factory_result)
+        # Composite defaults (nested configs) render as their type name.
+        return f"*{type(factory_result).__name__}*"
     else:
         return "**Required**"
 
