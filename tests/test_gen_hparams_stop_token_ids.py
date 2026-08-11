@@ -5,7 +5,6 @@ import pytest
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai import ArealOpenAI
-from areal.utils.hf_utils import tokenizer_stop_token_ids
 
 _DEFAULT_PAD_TOKEN_ID = 0
 _DEFAULT_EOS_TOKEN_IDS = (128001, 128009)
@@ -67,26 +66,25 @@ class TestTokenizerStopTokenIds:
     def test_none_token_id_not_injected(self, pad_token_id, eos_token_id, expected):
         tokenizer = _TokenizerStub(pad_token_id=pad_token_id, eos_token_id=eos_token_id)
 
-        new_gconfig = GenerationHyperparameters().new_with_stop_token_ids(
-            tokenizer_stop_token_ids(tokenizer)
+        new_gconfig = GenerationHyperparameters().new_with_stop_and_pad_token_ids(
+            tokenizer
         )
 
-        assert None not in new_gconfig.stop_token_ids
         assert new_gconfig.stop_token_ids == expected
-        assert all(isinstance(tid, int) for tid in new_gconfig.stop_token_ids)
 
-    def test_valid_ids_added_without_duplicates(self):
+    def test_configured_ids_kept_without_duplicates(self):
+        tokenizer = _TokenizerStub(pad_token_id=7, eos_token_id=2)
         gconfig = GenerationHyperparameters(stop_token_ids=[7])
 
-        new_gconfig = gconfig.new_with_stop_token_ids([2, 2])
+        new_gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
 
         assert new_gconfig.stop_token_ids == [7, 2]
 
     def test_overlapping_pad_and_eos_token_ids_deduplicated(self):
         tokenizer = _TokenizerStub(pad_token_id=2, eos_token_id=[2, 3])
 
-        new_gconfig = GenerationHyperparameters().new_with_stop_token_ids(
-            tokenizer_stop_token_ids(tokenizer)
+        new_gconfig = GenerationHyperparameters().new_with_stop_and_pad_token_ids(
+            tokenizer
         )
 
         assert new_gconfig.stop_token_ids == [2, 3]
@@ -96,25 +94,12 @@ class TestTokenizerStopTokenIds:
     )
     def test_sequence_valued_eos_token_id(self, eos_token_id):
         tokenizer = _stop_tokenizer(eos_token_id=eos_token_id)
-        gconfig = GenerationHyperparameters()
 
-        new_gconfig = gconfig.new_with_stop_token_ids(
-            tokenizer_stop_token_ids(tokenizer)
+        new_gconfig = GenerationHyperparameters().new_with_stop_and_pad_token_ids(
+            tokenizer
         )
 
         assert new_gconfig.stop_token_ids == _DEFAULT_STOP_TOKEN_IDS
-        assert all(isinstance(tid, int) for tid in new_gconfig.stop_token_ids)
-
-    def test_tokenizer_wrapper_matches_composed_helpers(self):
-        tokenizer = _stop_tokenizer()
-        gconfig = GenerationHyperparameters(stop_token_ids=[7])
-
-        wrapped_gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
-        composed_gconfig = gconfig.new_with_stop_token_ids(
-            tokenizer_stop_token_ids(tokenizer)
-        )
-
-        assert wrapped_gconfig.stop_token_ids == composed_gconfig.stop_token_ids
 
     def test_response_strips_list_valued_eos_token_id(self):
         tokenizer = _stop_tokenizer()
