@@ -216,7 +216,8 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    or advantage normalization uses group statistics, because that statistic needs at
    least two observations; a singleton target group (`n_samples: 1`) is complete by
    definition and keeps the minimum of `1`. Setting `actor.min_usable_group_size`
-   replaces this derived value. Groups below the minimum return `None`; the asynchronous
+   replaces this derived value; explicit values below `2` are rejected while group
+   statistics are in use. Groups below the minimum return `None`; the asynchronous
    collector then takes another ready prompt group. Batch-relative PPO and REINFORCE
    retain a usable singleton.
 1. Group statistics constrain the workflow contract. When reward or advantage

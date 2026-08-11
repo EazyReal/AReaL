@@ -282,6 +282,23 @@ def test_explicit_min_usable_group_size_overrides_derivation():
     assert actor.resolve_min_usable_group_size(target_group_size=4) == 3
 
 
+def test_group_statistics_reject_explicit_singleton_minimum():
+    with pytest.raises(ValueError, match="at least 2"):
+        PPOActorConfig(
+            adv_norm=NormConfig(mean_level="group", std_level="group", group_size=4),
+            min_usable_group_size=1,
+        )
+
+
+def test_batch_relative_estimator_accepts_explicit_singleton_minimum():
+    actor = PPOActorConfig(
+        adv_norm=NormConfig(mean_level="batch", std_level="batch"),
+        min_usable_group_size=1,
+    )
+
+    assert actor.resolve_min_usable_group_size(target_group_size=4) == 1
+
+
 def test_dynamic_collection_backfills_from_ready_groups():
     prepare_batch = MagicMock(
         side_effect=[[{"group": "first"}], [], [{"group": "second"}]]
