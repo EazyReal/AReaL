@@ -373,7 +373,8 @@ def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
     """Return tokenizer messages with mapping-shaped tool-call arguments.
 
     JSON strings are decoded; invalid or non-object arguments are wrapped under
-    ``arguments``. Only modified containers are copied.
+    ``arguments``. Tool calls that carry no ``arguments`` key keep none. Only
+    modified containers are copied.
     """
     result = []
     for msg in messages:
@@ -385,10 +386,10 @@ def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
         modified = False
         for tc in tool_calls:
             fn = tc.get("function") if isinstance(tc, dict) else None
-            if fn is None:
+            if fn is None or "arguments" not in fn:
                 new_tool_calls.append(tc)
                 continue
-            args = fn.get("arguments")
+            args = fn["arguments"]
             parsed = _mapping_shaped_tool_call_arguments(args)
             if parsed is not args:
                 tc = {**tc, "function": {**fn, "arguments": parsed}}

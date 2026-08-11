@@ -62,6 +62,20 @@ def test_non_mapping_arguments_are_wrapped(arguments, expected):
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
+def test_missing_arguments_key_is_left_absent():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "Bash"}}],
+        }
+    ]
+
+    out = _parse_tool_call_arguments(messages)
+
+    assert out[0] is messages[0]
+    assert out[0]["tool_calls"][0]["function"] == {"name": "Bash"}
+
+
 def test_messages_without_tool_calls_pass_through():
     messages = [{"role": "user", "content": "hi"}]
 
