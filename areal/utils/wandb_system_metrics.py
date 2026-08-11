@@ -4,28 +4,38 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any
+from functools import partial
+from typing import TYPE_CHECKING, Any
 
 from areal.api.cli_args import BaseExperimentConfig
 from areal.infra.rpc.serialization import deserialize_value
 from areal.utils import logging
 
+if TYPE_CHECKING:
+    from areal.infra.rpc.guard.app import GuardState
+
 logger = logging.getLogger("WandBSystemMetrics", "system")
 
 _worker_wandb_run: Any | None = None
 _worker_wandb_lock = threading.Lock()
-_SERVICE_ROLE_SUFFIXES = ("-data", "-guard")
+# Data service guards run under the worker role name plus this suffix.
+_DATA_SERVICE_SUFFIX = "-data"
 
 
 def prepare_wandb_run_identity(config: BaseExperimentConfig | None) -> None:
-    """Freeze the W&B run id on the controller so workers resolve the same one."""
+    """Pin a ``"timestamp"`` run id suffix before workers receive the config.
+
+    Workers rebuild the run id from the config they are configured with, so the
+    suffix must stop depending on the wall clock for them to join the same run.
+    """
     if config is None:
         return
-    if not config.stats_logger.wandb.system_metrics.enabled:
+    wandb_config = config.stats_logger.wandb
+    if not wandb_config.system_metrics.enabled:
         return
-    from areal.utils.stats_logger import resolve_wandb_run_id
+    from areal.utils.stats_logger import resolve_wandb_id_suffix
 
-    resolve_wandb_run_id(config.stats_logger)
+    wandb_config.id_suffix = resolve_wandb_id_suffix(wandb_config)
 
 
 def worker_system_metrics_enabled(
@@ -43,7 +53,7 @@ def worker_system_metrics_enabled(
             "stats_logger.wandb.system_metrics.enabled requires "
             "stats_logger.wandb.mode='shared'."
         )
-    if role is None or role.endswith(_SERVICE_ROLE_SUFFIXES):
+    if role is None or role.endswith(_DATA_SERVICE_SUFFIX):
         return False
     roles = system_metrics_config.roles
     return roles is None or role in roles
@@ -138,7 +148,9 @@ def finish_worker_wandb_system_metrics() -> None:
             _worker_wandb_run = None
 
 
-def configure_worker_wandb_system_metrics(data: dict) -> dict[str, Any]:
+def configure_worker_wandb_system_metrics(
+    state: GuardState, data: dict
+) -> dict[str, Any]:
     config_data = data.get("config")
     if config_data is None:
         raise ValueError("Missing 'config' field in request")
@@ -148,11 +160,11 @@ def configure_worker_wandb_system_metrics(data: dict) -> dict[str, Any]:
         raise ValueError("Missing 'rank' field in request")
 
     config = deserialize_value(config_data)
-    role = data.get("role")
-    enabled = init_worker_wandb_system_metrics(config, role=role, rank=rank)
+    enabled = init_worker_wandb_system_metrics(config, role=state.role, rank=rank)
     return {"wandb_system_metrics": "enabled" if enabled else "skipped"}
 
 
-def register_worker_wandb_system_metrics_hooks(state) -> None:
-    state.register_configure_hook(configure_worker_wandb_system_metrics)
+def register_worker_wandb_system_metrics_hooks(state: GuardState) -> None:
+    """Register the ``/configure`` and cleanup hooks on the :class:`GuardState`."""
+    state.register_configure_hook(partial(configure_worker_wandb_system_metrics, state))
     state.register_cleanup_hook(finish_worker_wandb_system_metrics)

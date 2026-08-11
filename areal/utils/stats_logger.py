@@ -12,7 +12,7 @@ import wandb
 from tensorboardX import SummaryWriter
 
 from areal.api import FinetuneSpec
-from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
+from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig, WandBConfig
 from areal.utils import logging
 from areal.utils.printing import tabulate_stats
 from areal.version import version_info
@@ -20,16 +20,16 @@ from areal.version import version_info
 logger = logging.getLogger("StatsLogger", "system")
 
 
-def resolve_wandb_run_id(config: StatsLoggerConfig) -> str:
-    """Stable W&B run id ``{experiment}_{trial}_{suffix}``.
+def resolve_wandb_id_suffix(config: WandBConfig) -> str | None:
+    """Resolve ``id_suffix``, expanding the ``"timestamp"`` alias."""
+    if config.id_suffix == "timestamp":
+        return time.strftime("%Y_%m_%d_%H_%M_%S")
+    return config.id_suffix
 
-    A ``"timestamp"`` suffix is resolved once and frozen back into ``config`` so
-    that the controller and any shared-mode worker clients resolve the same id.
-    """
-    suffix = config.wandb.id_suffix
-    if suffix == "timestamp":
-        suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
-        config.wandb.id_suffix = suffix
+
+def resolve_wandb_run_id(config: StatsLoggerConfig) -> str:
+    """Build the W&B run id ``{experiment}_{trial}_{suffix}``."""
+    suffix = resolve_wandb_id_suffix(config.wandb)
     return f"{config.experiment_name}_{config.trial_name}_{suffix}"
 
 
@@ -69,15 +69,15 @@ class StatsLogger:
             "version": version_info.full_version_with_dirty_description,
         }
 
-        wandb_settings = None
-        if self.config.wandb.mode == "shared":
-            wandb_settings = wandb.Settings(
+        settings = None
+        if self.config.wandb.system_metrics.enabled:
+            settings = wandb.Settings(
                 mode="shared",
                 x_primary=True,
                 x_label="controller",
             )
 
-        wandb_init_kwargs = dict(
+        wandb.init(
             mode=self.config.wandb.mode,
             entity=self.config.wandb.entity,
             project=self.config.wandb.project or self.config.experiment_name,
@@ -92,10 +92,8 @@ class StatsLogger:
             force=True,
             id=resolve_wandb_run_id(self.config),
             resume="allow",
+            settings=settings,
         )
-        if wandb_settings is not None:
-            wandb_init_kwargs["settings"] = wandb_settings
-        wandb.init(**wandb_init_kwargs)
 
         swanlab_config = self.config.swanlab
         if swanlab_config.mode != "disabled":
