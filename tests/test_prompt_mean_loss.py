@@ -297,5 +297,7 @@ def test_loss_aggregation_config_validation():
         PPOActorConfig(loss_aggregation="constant", loss_aggregation_divisor=0)
     with pytest.raises(ValueError, match="only used"):
         PPOActorConfig(loss_aggregation="seq_mean", loss_aggregation_divisor=10)
+    with pytest.raises(ValueError, match="tree"):
+        PPOActorConfig(loss_aggregation="seq_mean", enable_tree_training=True)
 
     PPOActorConfig(loss_aggregation="constant", loss_aggregation_divisor=10)

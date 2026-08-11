@@ -1896,6 +1896,12 @@ class PPOActorConfig(TrainEngineConfig):
                 "loss_aggregation_divisor is only used when "
                 "loss_aggregation='constant'."
             )
+        if self.enable_tree_training and self.loss_aggregation != "token_mean":
+            raise ValueError(
+                f"loss_aggregation={self.loss_aggregation!r} needs per-sequence "
+                "boundaries, which tree-packed batches do not carry; tree "
+                "training supports only 'token_mean'."
+            )
         # Validate CISPO configuration
         if self.use_cispo_loss:
             if self.use_sapo_loss:
