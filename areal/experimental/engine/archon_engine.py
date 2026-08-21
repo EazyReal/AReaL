@@ -978,6 +978,7 @@ class ArchonEngine(TrainEngine):
 
         # Extract trie_node for tree training (if present)
         trie_node = inputs.pop("trie_node", None)
+        inputs.pop("turn_ids", None)
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)
@@ -1325,6 +1326,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
             return logprobs, entropy, vocab_min, vocab_max
 
@@ -1334,6 +1336,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         vocab_min, vocab_max = self._get_vocab_min_max_logits(logits)
 
@@ -1365,6 +1368,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
 
         assert ctx.labels is not None
@@ -1373,6 +1377,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
 
         if self._cp_group is not None:

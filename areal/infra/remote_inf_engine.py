@@ -353,7 +353,11 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get request to abort all in-flight requests."""
+        ...
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get request to offload model memory.
 
         Returns
@@ -452,11 +456,33 @@ class RemoteInfEngine(InferenceEngine):
         except ValueError:
             base_url = f"http://{address}"
         tik = time.time()
+        last_report = tik
         while time.time() - tik < self.config.setup_timeout:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Inference server process (pid={process.pid}) exited with "
+                    f"code {process.returncode} before becoming healthy at "
+                    f"{address}. Search the worker log above for the server "
+                    "traceback (e.g. scheduler init errors, port EADDRINUSE)."
+                )
             if self.check_health(base_url):
                 return
+            now = time.time()
+            if now - last_report >= 60:
+                logger.info(
+                    "Still waiting for inference server at %s to become "
+                    "healthy (%.0fs elapsed, timeout %.0fs, process alive=%s)",
+                    address,
+                    now - tik,
+                    self.config.setup_timeout,
+                    process is not None and process.poll() is None,
+                )
+                last_report = now
             time.sleep(1)
-        raise TimeoutError("server launch failed")
+        raise TimeoutError(
+            f"Inference server at {address} failed to become healthy within "
+            f"{self.config.setup_timeout}s"
+        )
 
     def check_health(self, base_url):
         """Check if server is healthy."""
@@ -937,11 +963,17 @@ class RemoteInfEngine(InferenceEngine):
             while self.workflow_executor.is_paused():
                 await asyncio.sleep(0.5)
 
+            # Pin the version that serves this request. A trajectory may span
+            # several weight versions, so each segment must be attributed to the
+            # version that actually generated it rather than to whichever
+            # version is current once the response arrives.
+            request_version = self.get_version()
+
             # Build request using backend
             http_req = self.backend.build_generation_request(
                 req,
                 with_lora=self.config.use_lora,
-                version=self.get_version(),
+                version=request_version,
             )
 
             # Loop until the generation is complete
@@ -980,7 +1012,7 @@ class RemoteInfEngine(InferenceEngine):
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
             accumulated_versions.extend(
-                [self.get_version()] * len(gen_result.output_tokens)
+                [request_version] * len(gen_result.output_tokens)
             )
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
@@ -1367,8 +1399,14 @@ class RemoteInfEngine(InferenceEngine):
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
         """Pause request submission for async rollout."""
-        pause_req = self.backend.get_pause_request()
-        self._run_request_on_all_servers(pause_req)
+        get_pause_requests = getattr(self.backend, "get_pause_requests", None)
+        pause_requests = (
+            get_pause_requests()
+            if get_pause_requests is not None
+            else [self.backend.get_pause_request()]
+        )
+        for pause_req in pause_requests:
+            self._run_request_on_all_servers(pause_req)
 
         # The above http request may require some time to be scheduled and executed.
         # The following line waits until all requests are indeed dropped.
@@ -1390,10 +1428,22 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
-        offload_req = self.backend.get_offload_request()
+        offload_req = self.backend.get_offload_request(tags=tags)
+        self.logger.info(
+            "RemoteInfEngine.offload(tags=%s) sending to %s: endpoint=%s",
+            tags,
+            self.addresses,
+            offload_req.endpoint,
+        )
         self._run_request_on_all_servers(offload_req)
+        self.logger.info("RemoteInfEngine.offload(tags=%s) completed", tags)
+
+    def abort_all_requests(self) -> None:
+        """Abort all in-flight requests on all servers."""
+        abort_req = self.backend.get_abort_all_request()
+        self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Onload model memory on all servers."""
@@ -1439,10 +1489,8 @@ class RemoteInfEngine(InferenceEngine):
             self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
             return server_info
-        except TimeoutError:
-            logger.warning(
-                f"Launch local server timeouted at {address} after {self.config.setup_timeout}s."
-            )
+        except (TimeoutError, RuntimeError) as e:
+            logger.warning(f"Launch local server failed at {address}: {e}")
             self._shutdown_one_server(server_info)
             raise
 
