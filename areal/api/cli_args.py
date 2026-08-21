@@ -374,6 +374,8 @@ class GenerationHyperparameters:
 class OptimizerConfig:
     """Configuration for model optimization during training."""
 
+    DEFAULT_WARMUP_STEPS_PROPORTION: ClassVar[float] = 0.001
+
     type: str = field(
         default="adam",
         metadata={
@@ -417,9 +419,21 @@ class OptimizerConfig:
         },
     )
     warmup_steps_proportion: float = field(
-        default=0.001,
+        default=DEFAULT_WARMUP_STEPS_PROPORTION,
         metadata={
-            "help": "Proportion of training steps for warmup",
+            "help": "Non-negative proportion of training steps for warmup. "
+            "Ignored when warmup_steps is set. For Megatron, the resolved "
+            "warmup steps must be less than the total training steps.",
+        },
+    )
+    warmup_steps: int | None = field(
+        default=None,
+        metadata={
+            "help": "Fixed number of learning-rate scheduler steps for warmup. "
+            "Must be non-negative. For Megatron, it must also be less than the "
+            "total training steps. "
+            "When both options are explicitly configured, warmup_steps takes "
+            "precedence over warmup_steps_proportion and a warning is emitted.",
         },
     )
     initial_loss_scale: float = field(
@@ -437,6 +451,18 @@ class OptimizerConfig:
     gradient_clipping: float = field(
         default=1.0, metadata={"help": "Gradient clipping threshold"}
     )
+
+    def __post_init__(self) -> None:
+        if (
+            self.warmup_steps is not None
+            and self.warmup_steps_proportion != self.DEFAULT_WARMUP_STEPS_PROPORTION
+        ):
+            warnings.warn(
+                "Both warmup_steps and warmup_steps_proportion are configured; "
+                "warmup_steps takes precedence and warmup_steps_proportion is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass
@@ -1015,10 +1041,10 @@ class MegatronEngineConfig:
     enable_fp32_lm_head: bool = field(
         default=False,
         metadata={
-            "help": "Deprecated. This option is ignored when enable_chunked_logits=True; "
-            "AReaL's fused LM Head always produces FP32 logits. When "
-            "enable_chunked_logits=False, preserve the legacy behavior of forwarding "
-            "the option to supported mbridge model configurations."
+            "help": "Compute the lm_head projection with FP32 input and weight "
+            "operands for numerical stability. With enable_chunked_logits=True, "
+            "the local vocab-parallel weight is converted once per microbatch "
+            "LM-head forward and reused across sequence chunks."
         },
     )
     cross_entropy_loss_fusion: bool = field(
@@ -1182,6 +1208,16 @@ class SchedulingSpec:
     )
     nodelist: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--nodelist` option for slurm."}
+    )
+    reservation: str | None = field(
+        default=None,
+        metadata={"help": "sbatch's `--reservation` option for slurm."},
+    )
+    exclusive: bool = field(
+        default=False,
+        metadata={
+            "help": "sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs."
+        },
     )
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
@@ -1673,8 +1709,34 @@ class PPOActorConfig(TrainEngineConfig):
     discount: float = field(
         default=1.0, metadata={"help": "Discount factor for future rewards"}
     )
-    gae_lambda: float = field(
-        default=1.0, metadata={"help": "Lambda parameter for GAE"}
+    gae_lambda: float | str = field(
+        default=1.0,
+        metadata={
+            "help": "Lambda parameter for GAE, either a static float or a dotted "
+            "path to a batch-vectorized per-sample lambda function. The function "
+            "receives a context dict containing effective_token_lengths, "
+            "turn_counts, and timestep_lengths tensors and must return one lambda "
+            "per local trajectory."
+        },
+    )
+    gae_lambda_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Keyword arguments passed to a custom gae_lambda function. "
+            "Ignored when gae_lambda is a float."
+        },
+    )
+    # NOTE: not annotated as Literal["token", "turn"] because the pinned
+    # OmegaConf version rejects Literal annotations in structured configs.
+    # Validated in __post_init__ instead.
+    gae_timestep_unit: str = field(
+        default="token",
+        metadata={
+            "help": "Timestep unit used by GAE. 'token' preserves standard "
+            "token-level GAE; 'turn' applies discount and lambda once per "
+            "generated turn.",
+            "choices": ["token", "turn"],
+        },
     )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
@@ -1826,6 +1888,22 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if isinstance(self.gae_lambda, bool) or not isinstance(
+            self.gae_lambda, int | float | str
+        ):
+            raise ValueError(
+                "gae_lambda must be a float or dotted function path, got "
+                f"{self.gae_lambda!r}"
+            )
+        if isinstance(self.gae_lambda, str) and not self.gae_lambda:
+            raise ValueError("gae_lambda function path must not be empty")
+
+        if self.gae_timestep_unit not in {"token", "turn"}:
+            raise ValueError(
+                "gae_timestep_unit must be 'token' or 'turn', got "
+                f"{self.gae_timestep_unit!r}"
+            )
+
         if self.min_usable_group_size is not None:
             if self.min_usable_group_size < 1:
                 raise ValueError(
@@ -2676,14 +2754,18 @@ class RecoverConfig(_Timer):
         default=False,
         metadata={
             "help": "Do not save optimizer state in recovery checkpoints. "
-            "Required when using use_distributed_optimizer with Megatron "
-            "(flattened_range incompatibility)."
+            "Shrinks checkpoints and speeds up saving, but recovery then "
+            "resumes with a freshly initialized optimizer (Adam moments "
+            "reset), which can destabilize training. Leave this off unless "
+            "the run never needs to resume optimizer state, e.g. profiling."
         },
     )
     no_load_optim: bool = field(
         default=False,
         metadata={
-            "help": "Do not load optimizer state when recovering from checkpoint."
+            "help": "Do not load optimizer state when recovering from checkpoint. "
+            "Same caveat as no_save_optim: training resumes with reset Adam "
+            "moments."
         },
     )
 
