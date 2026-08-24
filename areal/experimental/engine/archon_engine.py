@@ -699,6 +699,7 @@ class ArchonEngine(TrainEngine):
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Perform rollout using connected inference engine."""
         self._check_rollout_engine_connected()
@@ -707,6 +708,7 @@ class ArchonEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )
@@ -721,6 +723,7 @@ class ArchonEngine(TrainEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Prepare batch from dataloader with rollout."""
         self._check_rollout_engine_connected()
@@ -730,6 +733,7 @@ class ArchonEngine(TrainEngine):
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -985,6 +989,7 @@ class ArchonEngine(TrainEngine):
 
         # Extract trie_node for tree training (if present)
         trie_node = inputs.pop("trie_node", None)
+        inputs.pop("turn_ids", None)
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)
@@ -1342,6 +1347,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
             return logprobs, entropy, vocab_min, vocab_max
 
@@ -1351,6 +1357,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         vocab_min, vocab_max = self._get_vocab_min_max_logits(logits)
 
@@ -1382,6 +1389,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
 
         assert ctx.labels is not None
@@ -1390,6 +1398,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
 
         if self._cp_group is not None:

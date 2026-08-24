@@ -46,8 +46,8 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
-from areal.utils.data import concat_padded_tensors
+from areal.utils import logging, name_resolve, names, stats_tracker
+from areal.utils.data import concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
     find_free_ports,
@@ -57,7 +57,12 @@ from areal.utils.network import (
 )
 from areal.utils.perf_tracer import trace_perf
 
-from .workflow_executor import WorkflowExecutor
+from .workflow_executor import (
+    WorkflowContractError,
+    WorkflowExecutor,
+    WorkflowTaskResult,
+    validate_rollout_group_sizes,
+)
 
 if TYPE_CHECKING:
     from areal.experimental.openai import InteractionWithTokenLogpReward
@@ -75,28 +80,79 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         logger: Logger,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ):
-        if group_size < 1:
-            raise ValueError(f"group_size must be >= 1, got {group_size}")
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         self.workflow = workflow
         self.group_size = group_size
+        self.min_usable_group_size = min_usable_group_size
         self.logger = logger
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
+
+    def _record_group_stats(self, usable_slot_count: int, *, trainable: bool) -> None:
+        trainable_slot_count = usable_slot_count if trainable else 0
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            target_slot_count=self.group_size,
+            usable_slot_count=usable_slot_count,
+            trainable_slot_count=trainable_slot_count,
+            fully_masked_group=usable_slot_count == 0,
+            singleton_slot_group=usable_slot_count == 1,
+            pre_filter_usable_slot_yield=usable_slot_count / self.group_size,
+            pre_filter_trainable_slot_yield=trainable_slot_count / self.group_size,
+        )
+
+    def _validate_slot_cardinality(self, slot_sizes: list[int]) -> None:
+        if self.min_usable_group_size > 1 and any(size != 1 for size in slot_sizes):
+            raise WorkflowContractError(
+                "min_usable_group_size >= 2 (derived from group-relative "
+                "normalization, or set via actor.min_usable_group_size) requires "
+                "each rollout slot to contribute exactly one training sample; got "
+                f"slot sizes {slot_sizes}. Either return one sample per "
+                "arun_episode call (for agent workflows, set "
+                "agent.export_style='concat'), set mean_level/std_level to "
+                "'batch' in actor.reward_norm/actor.adv_norm, or unset "
+                "actor.min_usable_group_size. This contract violation is "
+                "non-retryable and stops training."
+            )
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+        async def run_sample(sample_idx: int) -> tuple[int, Any]:
+            from areal.infra import workflow_context
+            from areal.infra.workflow_context import WorkflowContext
+
+            parent = workflow_context.get()
+            workflow_context.set(
+                WorkflowContext(
+                    is_eval=parent.is_eval,
+                    task_id=parent.task_id,
+                    sample_idx=sample_idx,
+                )
+            )
+            result = await self.workflow.arun_episode(engine, data)
+            return sample_idx, result
+
+        indexed_results = await asyncio.gather(
+            *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
         )
+        indexed_results.sort(key=lambda item: item[0])
+        sample_indices = [sample_idx for sample_idx, _ in indexed_results]
+        if sample_indices != list(range(self.group_size)):
+            raise RuntimeError(
+                "Grouped rollout returned invalid sample indices: "
+                f"expected {list(range(self.group_size))}, got {sample_indices}"
+            )
+        results = [result for _, result in indexed_results]
 
         valid_results = [r for r in results if r is not None]
+        usable_slot_count = len(valid_results)
 
-        # All results None -> return None
         if not valid_results:
+            self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
         # Some results None -> drop entire group if requested. Reward
@@ -110,12 +166,22 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     "(drop_incomplete_group=True). prepare_batch will retry "
                     "with a new prompt from the dataloader."
                 )
+                self._record_group_stats(usable_slot_count, trainable=False)
                 return None
             if not self.reward_normalization:
+                action = (
+                    "dropping group below min_usable_group_size"
+                    if usable_slot_count < self.min_usable_group_size
+                    else "using remaining results"
+                )
                 self.logger.warning(
                     f"GroupedRolloutWorkflow: {n_failed}/{len(results)} "
-                    "trajectories returned None, using remaining results"
+                    f"trajectories returned None, {action}"
                 )
+
+        if usable_slot_count < self.min_usable_group_size:
+            self._record_group_stats(usable_slot_count, trainable=False)
+            return None
 
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]
@@ -126,17 +192,24 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 isinstance(v, InteractionWithTokenLogpReward) for v in first.values()
             )
         ):
+            self._validate_slot_cardinality([len(result) for result in valid_results])
             if self.reward_normalization and self.group_size > 1:
                 if not self._normalize_group_rewards(results):
+                    self._record_group_stats(usable_slot_count, trainable=False)
                     return None
             # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
             merged: dict[str, InteractionWithTokenLogpReward] = {}
             for result in valid_results:
                 merged.update(result)
+            self._record_group_stats(usable_slot_count, trainable=bool(merged))
             return merged if merged else None
 
         # Otherwise, tensor dicts - concatenate
+        self._validate_slot_cardinality(
+            [get_batch_size(result) for result in valid_results]
+        )
         concatenated = concat_padded_tensors(valid_results)
+        self._record_group_stats(usable_slot_count, trainable=bool(concatenated))
         return concatenated if concatenated else None
 
     def _normalize_group_rewards(
@@ -353,7 +426,11 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get request to abort all in-flight requests."""
+        ...
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get request to offload model memory.
 
         Returns
@@ -452,11 +529,33 @@ class RemoteInfEngine(InferenceEngine):
         except ValueError:
             base_url = f"http://{address}"
         tik = time.time()
+        last_report = tik
         while time.time() - tik < self.config.setup_timeout:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Inference server process (pid={process.pid}) exited with "
+                    f"code {process.returncode} before becoming healthy at "
+                    f"{address}. Search the worker log above for the server "
+                    "traceback (e.g. scheduler init errors, port EADDRINUSE)."
+                )
             if self.check_health(base_url):
                 return
+            now = time.time()
+            if now - last_report >= 60:
+                logger.info(
+                    "Still waiting for inference server at %s to become "
+                    "healthy (%.0fs elapsed, timeout %.0fs, process alive=%s)",
+                    address,
+                    now - tik,
+                    self.config.setup_timeout,
+                    process is not None and process.poll() is None,
+                )
+                last_report = now
             time.sleep(1)
-        raise TimeoutError("server launch failed")
+        raise TimeoutError(
+            f"Inference server at {address} failed to become healthy within "
+            f"{self.config.setup_timeout}s"
+        )
 
     def check_health(self, base_url):
         """Check if server is healthy."""
@@ -676,7 +775,9 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> RolloutWorkflow:
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         resolved: RolloutWorkflow
 
         # 0. None workflow = online mode (config-driven)
@@ -697,6 +798,7 @@ class RemoteInfEngine(InferenceEngine):
                     self.logger,
                     reward_normalization=reward_normalization,
                     drop_incomplete_group=drop_incomplete_group,
+                    min_usable_group_size=min_usable_group_size,
                 )
             return resolved
 
@@ -794,6 +896,7 @@ class RemoteInfEngine(InferenceEngine):
                 self.logger,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
+                min_usable_group_size=min_usable_group_size,
             )
 
         return resolved
@@ -937,11 +1040,17 @@ class RemoteInfEngine(InferenceEngine):
             while self.workflow_executor.is_paused():
                 await asyncio.sleep(0.5)
 
+            # Pin the version that serves this request. A trajectory may span
+            # several weight versions, so each segment must be attributed to the
+            # version that actually generated it rather than to whichever
+            # version is current once the response arrives.
+            request_version = self.get_version()
+
             # Build request using backend
             http_req = self.backend.build_generation_request(
                 req,
                 with_lora=self.config.use_lora,
-                version=self.get_version(),
+                version=request_version,
             )
 
             # Loop until the generation is complete
@@ -980,7 +1089,7 @@ class RemoteInfEngine(InferenceEngine):
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
             accumulated_versions.extend(
-                [self.get_version()] * len(gen_result.output_tokens)
+                [request_version] * len(gen_result.output_tokens)
             )
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
@@ -1177,6 +1286,7 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1193,6 +1303,9 @@ class RemoteInfEngine(InferenceEngine):
         group_size : int
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
+        min_usable_group_size : int
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
         task_id : int, optional
             The task ID to use. If None, a new task ID will be generated internally.
         is_eval : bool, optional
@@ -1216,6 +1329,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -1260,6 +1374,13 @@ class RemoteInfEngine(InferenceEngine):
         """Wait for a specific submitted task to complete."""
         return self.workflow_executor.wait_for_task(task_id, timeout, raise_timeout)
 
+    def _wait_for_task_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> WorkflowTaskResult | None:
+        return self.workflow_executor._wait_for_task_result(
+            task_id, timeout, raise_timeout
+        )
+
     def rollout_batch(
         self,
         data: list[dict[str, Any]],
@@ -1268,6 +1389,7 @@ class RemoteInfEngine(InferenceEngine):
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -1300,6 +1422,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )
@@ -1319,6 +1442,7 @@ class RemoteInfEngine(InferenceEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1337,6 +1461,9 @@ class RemoteInfEngine(InferenceEngine):
             Default is 1 (no grouping).
         dynamic_bs : bool, optional
             If True, enables dynamic batch sizing. Default is False.
+        min_usable_group_size : int
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------
@@ -1352,6 +1479,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )
@@ -1367,8 +1495,14 @@ class RemoteInfEngine(InferenceEngine):
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
         """Pause request submission for async rollout."""
-        pause_req = self.backend.get_pause_request()
-        self._run_request_on_all_servers(pause_req)
+        get_pause_requests = getattr(self.backend, "get_pause_requests", None)
+        pause_requests = (
+            get_pause_requests()
+            if get_pause_requests is not None
+            else [self.backend.get_pause_request()]
+        )
+        for pause_req in pause_requests:
+            self._run_request_on_all_servers(pause_req)
 
         # The above http request may require some time to be scheduled and executed.
         # The following line waits until all requests are indeed dropped.
@@ -1390,10 +1524,22 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
-        offload_req = self.backend.get_offload_request()
+        offload_req = self.backend.get_offload_request(tags=tags)
+        self.logger.info(
+            "RemoteInfEngine.offload(tags=%s) sending to %s: endpoint=%s",
+            tags,
+            self.addresses,
+            offload_req.endpoint,
+        )
         self._run_request_on_all_servers(offload_req)
+        self.logger.info("RemoteInfEngine.offload(tags=%s) completed", tags)
+
+    def abort_all_requests(self) -> None:
+        """Abort all in-flight requests on all servers."""
+        abort_req = self.backend.get_abort_all_request()
+        self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Onload model memory on all servers."""
@@ -1439,10 +1585,8 @@ class RemoteInfEngine(InferenceEngine):
             self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
             return server_info
-        except TimeoutError:
-            logger.warning(
-                f"Launch local server timeouted at {address} after {self.config.setup_timeout}s."
-            )
+        except (TimeoutError, RuntimeError) as e:
+            logger.warning(f"Launch local server failed at {address}: {e}")
             self._shutdown_one_server(server_info)
             raise
 
