@@ -646,6 +646,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         max_total_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
         n: int | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         stop: str | None | list[str] | None | NotGiven = NOT_GIVEN,
         store: bool | None | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -669,6 +670,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         max_total_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
         n: int | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         stop: str | None | list[str] | None | NotGiven = NOT_GIVEN,
         store: bool | None | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -691,6 +693,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         max_total_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
         n: int | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         stop: str | None | list[str] | None | NotGiven = NOT_GIVEN,
         store: bool | None | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -883,6 +886,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            seed=None if is_omitted(seed) else seed,
         ).new_with_stop_and_pad_token_ids(self.tokenizer)
 
         model_request = ModelRequest(
@@ -1133,6 +1137,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         instructions: str | None | NotGiven = NOT_GIVEN,
         max_output_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         tool_choice: response_create_params.ToolChoice | NotGiven = NOT_GIVEN,
         tools: Iterable[ToolParam] | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -1288,6 +1293,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            seed=None if is_omitted(seed) else seed,
         ).new_with_stop_and_pad_token_ids(self.tokenizer)
 
         model_request = ModelRequest(
