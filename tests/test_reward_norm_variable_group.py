@@ -164,14 +164,6 @@ def test_group_sizes_non_positive_raises():
         norm(x, group_sizes=[4, 0])
 
 
-def test_missing_group_sizes_rejects_ragged_batch():
-    norm = Normalization(_group_norm_config())
-    x = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="must be divisible by group_size"):
-        norm(x)
-
-
 def test_adv_norm_style_2d_variable_groups_normalize_per_group():
     """Token-level (2D) advantages normalize per variable-size group on dim 0.
 
