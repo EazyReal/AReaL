@@ -226,6 +226,7 @@ class RolloutController:
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
             terminal_error_fn=get_workflow_result_error,
+            deterministic_order=getattr(self.config, "deterministic_sampling", False),
         )
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)

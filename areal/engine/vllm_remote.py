@@ -80,6 +80,8 @@ class VLLMBackend:
         }
         if gconfig.stop:
             payload["stop"] = gconfig.stop
+        if gconfig.seed is not None:
+            payload["seed"] = gconfig.seed
 
         if with_lora:
             lora_name = gconfig.lora_name

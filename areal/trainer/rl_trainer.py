@@ -53,6 +53,7 @@ from areal.infra.workflow_executor import (
 )
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
+from areal.utils.dte import apply_dte_config_envvars
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
@@ -216,6 +217,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
         )
@@ -1172,6 +1174,10 @@ class PPOTrainer:
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
+
+    def _apply_dte_config_envvars(self) -> None:
+        """Export delta weight-transfer config to worker runtime switches."""
+        apply_dte_config_envvars(self.config)
 
     def _create_dataloader(
         self,
