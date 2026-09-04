@@ -126,6 +126,10 @@ class TestControllerWorkflowResolution:
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
+            agent=AgentConfig(
+                agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
+                drop_retry_orphans=True,
+            ),
         )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -140,11 +144,16 @@ class TestControllerWorkflowResolution:
         assert resolved.controller is controller
         assert resolved.agent is None
         assert resolved.timeout == 3.0
+        assert resolved.drop_retry_orphans is True
 
     def test_resolve_workflow_agent_class_creates_offline_workflow(self):
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
+            agent=AgentConfig(
+                agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
+                drop_retry_orphans=True,
+            ),
         )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -162,6 +171,31 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert isinstance(resolved.agent, MockAgent)
+        assert resolved.drop_retry_orphans is True
+
+    def test_resolve_workflow_forwards_reward_normalization(self):
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(
+                backend="sglang:d1",
+                admin_api_key="test-admin-key",
+            ),
+            scheduler=MagicMock(n_gpus_per_node=8),
+        )
+        controller._gateway_addr = "http://test:8080"
+
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                return 1.0
+
+        resolved = controller._resolve_workflow(
+            MockAgent,
+            group_size=2,
+            reward_normalization=True,
+        )
+
+        assert isinstance(resolved, InferenceServiceWorkflow)
+        assert resolved.group_size == 2
+        assert resolved.reward_normalization is True
 
     def test_resolve_should_accept_fn_none(self):
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
@@ -416,6 +450,11 @@ class TestRolloutControllerV2Construction:
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
+                message_preprocessors=[
+                    "examples.swe.preprocessors.StripAnthropicBillingHeader",
+                    "examples.swe.preprocessors.StripAllSystemReminders",
+                ],
+                prefix_matcher="examples.swe.prefix_matchers.swe_prefix_matcher",
             ),
             scheduling_spec=(
                 SchedulingSpec(
@@ -457,6 +496,15 @@ class TestRolloutControllerV2Construction:
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
         assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
+        assert data_proxy_cmd.count("--message-preprocessor") == 2
+        first = data_proxy_cmd.index("--message-preprocessor")
+        second = data_proxy_cmd.index("--message-preprocessor", first + 1)
+        assert data_proxy_cmd[first + 1].endswith("StripAnthropicBillingHeader")
+        assert data_proxy_cmd[second + 1].endswith("StripAllSystemReminders")
+        matcher = data_proxy_cmd.index("--prefix-matcher")
+        assert data_proxy_cmd[matcher + 1] == (
+            "examples.swe.prefix_matchers.swe_prefix_matcher"
+        )
 
 
 class TestOnlineCallbackFlow:
@@ -643,8 +691,53 @@ class TestInferenceServiceWorkflow:
             mock_http_session,
             [session_id for session_id, _ in sessions],
             group_id="grp-test-42",
+            discard_trajectory=failing_member is not None,
         )
         return result, max_active, start_order, tracker, workflow
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_forwards_drop_retry_orphans(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            drop_retry_orphans=True,
+        )
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={"traj": {}})
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post = MagicMock(return_value=context)
+
+        result = await workflow._export_interactions(session, ["session-1"])
+
+        assert result == {}
+        assert session.post.call_args.kwargs["json"]["drop_retry_orphans"] is True
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_forwards_reward_normalization(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            reward_normalization=True,
+        )
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={"traj": {}})
+        response_context = MagicMock()
+        response_context.__aenter__ = AsyncMock(return_value=response)
+        response_context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post.return_value = response_context
+
+        result = await workflow._export_interactions(session, ["session-1"])
+
+        assert result == {}
+        assert session.post.call_args.kwargs["json"]["reward_normalization"] is True
 
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
@@ -748,7 +841,49 @@ class TestInferenceServiceWorkflow:
         workflow._start_session.assert_awaited_once()
         workflow._set_last_reward.assert_awaited_once()
         workflow._export_interactions.assert_awaited_once_with(
-            mock_http_session, ["sess-1"], group_id="grp-test-1"
+            mock_http_session,
+            ["sess-1"],
+            group_id="grp-test-1",
+            discard_trajectory=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_discards_export_when_agent_fails(self):
+        class FailingAgent:
+            async def run(self, data, **kwargs):
+                raise RuntimeError("agent failed")
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=FailingAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=2,
+            reward_normalization=True,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=(
+                "grp-test-1",
+                [("sess-1", "key-1"), ("sess-2", "key-2")],
+            )
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(return_value={})
+
+        with patch(
+            "areal.v2.inference_service.controller.workflow.workflow_context"
+        ) as context:
+            context.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            context.get.return_value = MagicMock(task_id=42)
+            context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is None
+        workflow._export_interactions.assert_awaited_once_with(
+            context.get_aiohttp_session.return_value,
+            ["sess-1", "sess-2"],
+            group_id="grp-test-1",
+            discard_trajectory=True,
         )
 
     @pytest.mark.asyncio
@@ -930,6 +1065,7 @@ class TestMultiNodeConfig:
 
         # Track async client .post calls to /alloc_ports and /fork
         alloc_port_counter = 0
+        alloc_calls = []
         fork_calls = []
 
         async def mock_async_post(url, json=None, timeout=None):
@@ -939,10 +1075,13 @@ class TestMultiNodeConfig:
             resp.raise_for_status = MagicMock()
             if "/alloc_ports" in url:
                 alloc_port_counter += 1
+                alloc_calls.append(json)
+                port_count = json["count"]
+                first_port = 30000 + 2 * alloc_port_counter
                 resp.json.return_value = {
                     "status": "success",
                     "host": url.split("//")[1].split(":")[0],
-                    "ports": [30000 + alloc_port_counter],
+                    "ports": list(range(first_port, first_port + port_count)),
                 }
             elif "/fork" in url:
                 fork_calls.append(json)
@@ -980,9 +1119,13 @@ class TestMultiNodeConfig:
         job = create_call.kwargs.get("job") or create_call.args[0]
         assert job.replicas == 2
 
-        # Async client .post calls for inf server fork:
-        # 1 rendezvous alloc (nnodes_per_instance > 1) + 2 node allocs + 2 forks = 5
-        assert alloc_port_counter == 3  # 1 rendezvous + 2 per-node
+        # One owner-bound reservation per inference worker. The head reserves
+        # both its HTTP port and the distributed rendezvous port.
+        assert alloc_port_counter == 2
+        assert alloc_calls == [
+            {"count": 2, "role": "inf-server", "worker_index": 0},
+            {"count": 1, "role": "inf-server", "worker_index": 1},
+        ]
         assert len(fork_calls) == 2  # 1 per node in the group
 
         # Verify fork payloads have correct worker_index and role
@@ -1014,3 +1157,67 @@ class TestMultiNodeConfig:
             c for c in mock_fork.call_args_list if c.kwargs.get("role") == "data-proxy"
         ]
         assert len(data_proxy_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_fork_inf_servers_failure_releases_owned_ports(self):
+        worker = MagicMock()
+        worker.ip = "10.0.0.1"
+        worker.worker_ports = [18000]
+
+        cfg = InferenceEngineConfig(
+            tokenizer_path="mock-tokenizer",
+            backend="sglang:d1",
+        )
+        controller = RolloutControllerV2(
+            config=cfg, scheduler=MagicMock(n_gpus_per_node=8)
+        )
+        requests = []
+
+        async def mock_async_post(url, json=None, timeout=None):
+            requests.append((url, json))
+            resp = MagicMock()
+            if url.endswith("/alloc_ports"):
+                resp.json.return_value = {
+                    "status": "success",
+                    "host": "10.0.0.1",
+                    "ports": [30000],
+                }
+            elif url.endswith("/fork"):
+                resp.raise_for_status.side_effect = RuntimeError("fork failed")
+            return resp
+
+        mock_async_client = AsyncMock()
+        mock_async_client.post = mock_async_post
+
+        with (
+            patch.object(
+                controller, "_get_async_client", return_value=mock_async_client
+            ),
+            patch(
+                "areal.api.cli_args.SGLangConfig.build_cmd_from_args",
+                return_value=["python", "-m", "sglang.launch_server"],
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="fork failed"):
+                await controller._async_fork_inf_servers(
+                    cfg=cfg,
+                    alloc=None,
+                    inf_backend="sglang",
+                    inf_workers=[worker],
+                    dp_size=1,
+                    nnodes_per_instance=1,
+                    worker_env={},
+                    server_args=None,
+                )
+
+        assert requests[0] == (
+            "http://10.0.0.1:18000/alloc_ports",
+            {"count": 1, "role": "inf-server", "worker_index": 0},
+        )
+        assert [url.rsplit("/", 1)[-1] for url, _ in requests[-2:]] == [
+            "kill_forked_worker",
+            "release_ports",
+        ]
+        assert controller._inf_addrs == []
+        assert controller._server_infos == []
+        assert controller._forked_services == []
