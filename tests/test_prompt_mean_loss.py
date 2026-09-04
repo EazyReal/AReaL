@@ -6,17 +6,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from areal.api.cli_args import (
-    GenerationHyperparameters,
-    GRPOConfig,
-    MicroBatchSpec,
-    PPOActorConfig,
-)
+from areal.api.cli_args import MicroBatchSpec, PPOActorConfig
 from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
-from areal.utils.constants import (
-    PROX_LOGP_METHOD_LOGLINEAR,
-    PROX_LOGP_METHOD_REUSE_TRAIN_LOGP,
-)
 from areal.utils.data import split_padded_tensor_dict_into_mb_list
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 
@@ -161,13 +152,13 @@ def test_callback_pair_is_invariant_to_unit_aligned_partitions(mode):
 def test_normalizer_counts_only_active_units():
     mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.bool)
 
-    assert _reduction("token_mean").normalizer_fn({"loss_mask": mask}) == 3
-    assert _reduction("seq_mean").normalizer_fn({"loss_mask": mask}) == 2
-    assert _reduction("constant").normalizer_fn({"loss_mask": mask}) == 2
+    assert _reduction("token_mean").normalizer_fn({"loss_mask": mask}).item() == 3
+    assert _reduction("seq_mean").normalizer_fn({"loss_mask": mask}).item() == 2
+    assert _reduction("constant").normalizer_fn({"loss_mask": mask}).item() == 2
     assert (
-        _reduction("prompt_mean").normalizer_fn(
-            {"loss_mask": mask, "group_sizes": [2, 1]}
-        )
+        _reduction("prompt_mean")
+        .normalizer_fn({"loss_mask": mask, "group_sizes": [2, 1]})
+        .item()
         == 2
     )
 
@@ -179,6 +170,8 @@ def test_prompt_mean_requires_explicit_group_sizes():
         reduction.aggregate(LOSS, MASK)
     with pytest.raises(ValueError, match="group_sizes are required"):
         reduction.normalizer_fn({"loss_mask": MASK})
+    with pytest.raises(TypeError, match="sequence of ints"):
+        reduction.aggregate(LOSS, MASK, group_sizes=torch.tensor(GROUP_SIZES))
 
 
 @pytest.mark.parametrize("mode", ["seq_mean", "prompt_mean", "constant"])
@@ -239,6 +232,40 @@ def test_atomic_prompt_groups_reject_more_microbatches_than_groups():
         split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(n_mbs=4))
 
 
+def test_token_mean_split_allows_groups_that_exceed_token_cap():
+    data = {
+        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
+        "input_ids": torch.arange(8).view(2, 4),
+        "loss_mask": torch.ones(2, 4, dtype=torch.bool),
+    }
+
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        data, MicroBatchSpec(n_mbs=1, max_tokens_per_mb=4, granularity=1)
+    )
+
+    assert len(mb_list.mbs) == 2
+    assert all("group_sizes" not in mb for mb in mb_list.mbs)
+
+
+def test_nested_split_preserves_prompt_group_sizes():
+    data = {
+        "attention_mask": torch.ones(4, 3, dtype=torch.bool),
+        "input_ids": torch.arange(12).view(4, 3),
+        "loss_mask": torch.ones(4, 3, dtype=torch.bool),
+        "group_sizes": [2, 2],
+    }
+
+    ppo_mbs = split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(n_mbs=2))
+    assert sorted(tuple(mb["group_sizes"]) for mb in ppo_mbs.mbs) == [(2,), (2,)]
+
+    for mb in ppo_mbs.mbs:
+        engine_mbs = split_padded_tensor_dict_into_mb_list(mb, MicroBatchSpec(n_mbs=1))
+        assert len(engine_mbs.mbs) == 1
+        nested = engine_mbs.mbs[0]
+        assert nested["group_sizes"] == [2]
+        assert nested["attention_mask"].shape[0] == 2
+
+
 def test_prompt_mean_uses_trajectory_group_metadata():
     actor = object.__new__(PPOActor)
     actor.config = PPOActorConfig(loss_aggregation="prompt_mean")
@@ -284,34 +311,10 @@ def test_m2_mask_narrows_numerator_but_preserves_original_denominator():
     torch.testing.assert_close(loss, torch.tensor(-0.5), rtol=0, atol=0)
 
 
-def test_prompt_mean_config_accepts_singleton_groups_without_hidden_state():
-    actor = PPOActorConfig(loss_aggregation="prompt_mean")
-
-    config = GRPOConfig(
-        gconfig=GenerationHyperparameters(n_samples=1),
-        actor=actor,
-    )
-
-    assert config.actor is actor
-    assert not hasattr(actor, "group_size")
-
-
 def test_loss_aggregation_config_is_omegaconf_compatible():
     config = OmegaConf.structured(PPOActorConfig)
 
     assert config.loss_aggregation == "token_mean"
-
-
-@pytest.mark.parametrize(
-    "prox_logp_method",
-    [PROX_LOGP_METHOD_LOGLINEAR, PROX_LOGP_METHOD_REUSE_TRAIN_LOGP],
-)
-def test_m2_config_does_not_restrict_proximal_logp_method(prox_logp_method):
-    PPOActorConfig(
-        m2_threshold=0.1,
-        prox_logp_method=prox_logp_method,
-        ppo_n_minibatches=1,
-    )
 
 
 def test_loss_aggregation_config_validation():

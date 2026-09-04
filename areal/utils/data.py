@@ -764,23 +764,23 @@ def _resolve_microbatch_sequence_groups(
     return groups, sizes
 
 
-def _raise_if_atomic_groups_infeasible(
+def _infeasible_atomic_groups_message(
     mb_spec: MicroBatchSpec,
     group_token_counts: Sequence[int],
-) -> None:
-    """Fail before packing when prompt groups cannot be placed as atomic units.
+) -> str | None:
+    """Return why prompt groups cannot be packed as atomic units, if at all.
 
     ``group_sizes`` changes the allocation unit from one sequence to one whole
-    prompt group. An oversized group or a microbatch count above the group
-    count would otherwise raise inside :func:`allocate_balanced_mbs` on only
-    some DP ranks, leaving the rest blocked in ``all_gather_object``.
+    prompt group. When a process group is supplied, the caller all-gathers this
+    message so every rank raises together. Without a group the check is
+    rank-local, matching other packing errors.
     """
     counts = [int(n) for n in group_token_counts]
     capacity = mb_spec.max_tokens_per_mb
     if capacity is not None:
         oversized = [n for n in counts if n > capacity]
         if oversized:
-            raise RuntimeError(
+            return (
                 "group_sizes keeps each prompt group in one microbatch, but a "
                 f"group has {max(oversized)} tokens which exceeds "
                 f"max_tokens_per_mb={capacity}. Raise max_tokens_per_mb or "
@@ -791,12 +791,25 @@ def _raise_if_atomic_groups_infeasible(
     if min_groups is None or min_groups < n_groups_divisor:
         min_groups = n_groups_divisor
     if len(counts) < min_groups:
-        raise RuntimeError(
+        return (
             "group_sizes keeps each prompt group in one microbatch, so the "
             f"split needs at least {min_groups} groups, but this batch has "
             f"{len(counts)}. Lower ppo_n_minibatches / n_mbs, or include more "
             "prompts per update."
         )
+    return None
+
+
+def _raise_synced_infeasible_atomic_groups(
+    message: str | None,
+    group: dist.ProcessGroup | None,
+) -> None:
+    if dist.is_initialized() and group is not None:
+        gathered: list[str | None] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, message, group=group)
+        message = next((item for item in gathered if item is not None), None)
+    if message is not None:
+        raise RuntimeError(message)
 
 
 def split_padded_tensor_dict_into_mb_list(
@@ -830,7 +843,10 @@ def split_padded_tensor_dict_into_mb_list(
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
     input_lens = [sum(seq_lens[i] for i in group) for group in seq_groups]
     if explicit_group_sizes is not None:
-        _raise_if_atomic_groups_infeasible(mb_spec, input_lens)
+        _raise_synced_infeasible_atomic_groups(
+            _infeasible_atomic_groups_message(mb_spec, input_lens),
+            group,
+        )
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}

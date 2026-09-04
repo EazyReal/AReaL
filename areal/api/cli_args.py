@@ -1812,10 +1812,10 @@ class PPOActorConfig(TrainEngineConfig):
             "'prompt_mean': average per-prompt-group token means; each prompt "
             "group stays in one microbatch, so max_tokens_per_mb must fit the "
             "largest group. "
-            "'constant': average each response's masked token sum divided by "
-            "loss_aggregation_divisor. Non-token modes require sequence "
-            "boundaries; tree-packed actor training currently supports only "
-            "'token_mean'.",
+            "'constant': mean of each response's masked token sum divided by "
+            "(n_active_responses * loss_aggregation_divisor). Non-token modes "
+            "require sequence boundaries; tree-packed actor training currently "
+            "supports only 'token_mean'.",
             "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
         },
     )

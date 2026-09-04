@@ -14,7 +14,7 @@ import torch
 LossAggregationMode = Literal["token_mean", "seq_mean", "prompt_mean", "constant"]
 _LOSS_AGGREGATIONS = ("token_mean", "seq_mean", "prompt_mean", "constant")
 
-GroupSizes = Sequence[int] | torch.Tensor
+GroupSizes = Sequence[int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,11 +185,6 @@ class PolicyGradientReduction:
         sequence_ids = torch.arange(
             n_sequences, device=values.device
         ).repeat_interleave(sequence_lengths, output_size=values.numel())
-        if sequence_ids.numel() != values.numel():
-            raise ValueError(
-                "cu_seqlens does not describe the packed loss: "
-                f"expected {sequence_ids.numel()} tokens, got {values.numel()}."
-            )
         result = torch.zeros(n_sequences, dtype=values.dtype, device=values.device)
         return result.scatter_add_(0, sequence_ids, values)
 
@@ -200,11 +195,13 @@ class PolicyGradientReduction:
         if group_sizes is None:
             raise ValueError("group_sizes are required for explicit prompt groups.")
         if torch.is_tensor(group_sizes):
-            raw_sizes = group_sizes.detach().cpu().tolist()
-        else:
-            raw_sizes = list(group_sizes)
-        sizes = [int(size) for size in raw_sizes]
+            raise TypeError(
+                "group_sizes must be a sequence of ints, not a tensor; "
+                "passing a GPU tensor would synchronize every microbatch."
+            )
+        sizes = [int(size) for size in group_sizes]
         if any(size <= 0 for size in sizes):
+            raise ValueError(f"group_sizes must be positive, got {sizes}.")
             raise ValueError(f"group_sizes must be positive, got {sizes}.")
         if sum(sizes) != n_sequences:
             raise ValueError(
