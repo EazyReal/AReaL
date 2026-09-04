@@ -764,6 +764,41 @@ def _resolve_microbatch_sequence_groups(
     return groups, sizes
 
 
+def _raise_if_atomic_groups_infeasible(
+    mb_spec: MicroBatchSpec,
+    group_token_counts: Sequence[int],
+) -> None:
+    """Fail before packing when prompt groups cannot be placed as atomic units.
+
+    ``group_sizes`` changes the allocation unit from one sequence to one whole
+    prompt group. An oversized group or a microbatch count above the group
+    count would otherwise raise inside :func:`allocate_balanced_mbs` on only
+    some DP ranks, leaving the rest blocked in ``all_gather_object``.
+    """
+    counts = [int(n) for n in group_token_counts]
+    capacity = mb_spec.max_tokens_per_mb
+    if capacity is not None:
+        oversized = [n for n in counts if n > capacity]
+        if oversized:
+            raise RuntimeError(
+                "group_sizes keeps each prompt group in one microbatch, but a "
+                f"group has {max(oversized)} tokens which exceeds "
+                f"max_tokens_per_mb={capacity}. Raise max_tokens_per_mb or "
+                "reduce n_samples / sequence length."
+            )
+    min_groups = mb_spec.n_mbs
+    n_groups_divisor = mb_spec.n_mbs_divisor
+    if min_groups is None or min_groups < n_groups_divisor:
+        min_groups = n_groups_divisor
+    if len(counts) < min_groups:
+        raise RuntimeError(
+            "group_sizes keeps each prompt group in one microbatch, so the "
+            f"split needs at least {min_groups} groups, but this batch has "
+            f"{len(counts)}. Lower ppo_n_minibatches / n_mbs, or include more "
+            "prompts per update."
+        )
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
@@ -794,6 +829,8 @@ def split_padded_tensor_dict_into_mb_list(
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
     input_lens = [sum(seq_lens[i] for i in group) for group in seq_groups]
+    if explicit_group_sizes is not None:
+        _raise_if_atomic_groups_infeasible(mb_spec, input_lens)
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}

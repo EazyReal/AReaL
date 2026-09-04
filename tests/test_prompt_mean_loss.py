@@ -213,6 +213,32 @@ def test_split_padded_batch_keeps_ragged_prompt_groups_atomic():
     assert sorted(mb["attention_mask"].shape[0] for mb in mb_list.mbs) == [1, 2]
 
 
+def test_atomic_prompt_groups_reject_oversize_token_cap():
+    data = {
+        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
+        "input_ids": torch.arange(8).view(2, 4),
+        "loss_mask": torch.ones(2, 4, dtype=torch.bool),
+        "group_sizes": [2],
+    }
+
+    with pytest.raises(RuntimeError, match="max_tokens_per_mb"):
+        split_padded_tensor_dict_into_mb_list(
+            data, MicroBatchSpec(n_mbs=1, max_tokens_per_mb=4)
+        )
+
+
+def test_atomic_prompt_groups_reject_more_microbatches_than_groups():
+    data = {
+        "attention_mask": torch.ones(2, 3, dtype=torch.bool),
+        "input_ids": torch.arange(6).view(2, 3),
+        "loss_mask": torch.ones(2, 3, dtype=torch.bool),
+        "group_sizes": [1, 1],
+    }
+
+    with pytest.raises(RuntimeError, match="at least 4 groups"):
+        split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(n_mbs=4))
+
+
 def test_prompt_mean_uses_trajectory_group_metadata():
     actor = object.__new__(PPOActor)
     actor.config = PPOActorConfig(loss_aggregation="prompt_mean")

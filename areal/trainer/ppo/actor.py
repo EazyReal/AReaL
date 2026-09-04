@@ -390,6 +390,8 @@ class PPOActor:
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
         batched, meta = concat_batch(data)
         if self.config.loss_aggregation == "prompt_mean":
+            # Each input dict is one prompt group; concat_batch records that
+            # batch dim so microbatch splits cannot cut a group in half.
             batched["group_sizes"] = meta.traj_group_sizes
         self._ppo_update(batched)
 
