@@ -155,8 +155,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
-        # Some results None -> drop entire group if requested. Reward
-        # normalization also requires a complete group and will log/drop below.
+        # Some results None -> drop entire group if requested.
         if len(valid_results) < len(results):
             n_failed = len(results) - len(valid_results)
             if self.drop_incomplete_group:
@@ -194,7 +193,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         ):
             self._validate_slot_cardinality([len(result) for result in valid_results])
             if self.reward_normalization and self.group_size > 1:
-                if not self._normalize_group_rewards(results):
+                if not self._normalize_group_rewards(valid_results):
                     self._record_group_stats(usable_slot_count, trainable=False)
                     return None
             # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
@@ -214,14 +213,13 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
 
     def _normalize_group_rewards(
         self,
-        results: list[dict[str, InteractionWithTokenLogpReward] | None],
+        results: list[dict[str, InteractionWithTokenLogpReward]],
     ) -> bool:
-        """Apply per-prompt reward normalization across the n_samples rollouts.
+        """Apply per-prompt reward normalization across the usable rollouts.
 
         One scalar reward per rollout is taken from the last interaction in
-        each result. If any rollout failed or has no reward, the whole group is
-        dropped so the normalization base always matches the configured group
-        size.
+        each result after incomplete-group and minimum-size filtering. A usable
+        rollout without a terminal reward still causes the group to be dropped.
         """
         import torch
 
@@ -237,7 +235,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         if none_count > 0:
             self.logger.warning(
                 f"reward_normalization: dropping group ({none_count}/"
-                f"{self.group_size} rollouts have None reward)"
+                f"{len(results)} usable rollouts have None reward)"
             )
             return False
 

@@ -212,6 +212,10 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    nor duplicates a usable result.
 1. Usable slots are retained exactly once and concatenated. Their actual count remains a
    prompt-group boundary during reward and advantage normalization.
+1. With `reward_normalization=True`, interaction rewards are normalized across the
+   usable rollouts after the group passes the minimum-size filter.
+   `drop_incomplete_group=True` still requires every original slot to succeed. A
+   surviving rollout without a terminal reward causes the group to be dropped.
 1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
    or advantage normalization uses group statistics, because that statistic needs at
    least two observations; a singleton target group (`n_samples: 1`) is complete by

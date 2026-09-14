@@ -199,6 +199,9 @@ rollout:
 1. 每个 slot 可用时返回正常结果类型，不可用时返回 `None`。`None` 有意保持不透明；原因分类与重试策略仍由 producer 负责。
 1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
 1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
+1. 设置 `reward_normalization=True` 时，group 通过最小大小检查后，只对可用 rollout 的 interaction rewards
+   进行归一化。`drop_incomplete_group=True` 仍要求所有原始 slot 成功；若保留的 rollout 缺少最终 reward，整个 group
+   会被丢弃。
 1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
    使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
    （`n_samples: 1`）本身即是完整的，因此下限保持为 `1`。设置 `actor.min_usable_group_size` 可覆盖该推导值；使用 group

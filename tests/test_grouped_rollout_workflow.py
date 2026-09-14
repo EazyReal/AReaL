@@ -107,10 +107,59 @@ async def test_grouped_rollout_workflow_drops_incomplete_group():
 
 
 @pytest.mark.asyncio
-async def test_grouped_rollout_workflow_reward_normalization_requires_full_group():
-    logger = _Logger()
+@pytest.mark.parametrize("failed_slot", [0, 1, 2])
+async def test_grouped_rollout_workflow_normalizes_usable_slots(failed_slot):
+    first = _interaction(1.0)
+    second = _interaction(3.0)
+    results = [{"a": first}, {"b": second}]
+    results.insert(failed_slot, None)
     workflow = GroupedRolloutWorkflow(
-        _ListWorkflow([{"a": _interaction(1.0)}, None]),
+        _ListWorkflow(results),
+        group_size=3,
+        min_usable_group_size=2,
+        logger=_Logger(),
+        reward_normalization=True,
+    )
+
+    result = await workflow.arun_episode(engine=None, data={})
+
+    assert result == {"a": first, "b": second}
+    assert first.reward == pytest.approx(-1.0)
+    assert second.reward == pytest.approx(1.0)
+    assert first.original_reward == pytest.approx(1.0)
+    assert second.original_reward == pytest.approx(3.0)
+    assert first._cache["rewards"].item() == pytest.approx(-1.0)
+    assert second._cache["rewards"].item() == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("minimum", "drop_incomplete"), [(3, False), (2, True)])
+async def test_grouped_rollout_reward_normalization_preserves_group_filters(
+    minimum, drop_incomplete
+):
+    first = _interaction(1.0)
+    second = _interaction(3.0)
+    workflow = GroupedRolloutWorkflow(
+        _ListWorkflow([{"a": first}, None, {"b": second}]),
+        group_size=3,
+        min_usable_group_size=minimum,
+        drop_incomplete_group=drop_incomplete,
+        logger=_Logger(),
+        reward_normalization=True,
+    )
+
+    assert await workflow.arun_episode(engine=None, data={}) is None
+    assert first.reward == 1.0
+    assert second.reward == 3.0
+
+
+@pytest.mark.asyncio
+async def test_grouped_rollout_reward_normalization_rejects_missing_reward():
+    logger = _Logger()
+    missing_reward = _interaction(3.0)
+    missing_reward.reward = None
+    workflow = GroupedRolloutWorkflow(
+        _ListWorkflow([{"a": _interaction(1.0)}, {"b": missing_reward}]),
         group_size=2,
         logger=logger,
         reward_normalization=True,
