@@ -34,9 +34,12 @@ from areal.api.cli_args import (
     InferenceEngineConfig,
     PerfTracerConfig,
     SchedulingSpec,
+    SchedulingStrategyType,
 )
+from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
+from areal.infra.utils.inference_targets import write_inference_targets
 from areal.utils import logging, perf_tracer
 from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
@@ -49,6 +52,49 @@ from ..workflow_executor import BatchTaskDispatcher, TaskIdGenerator
 logger = logging.getLogger("RolloutController")
 
 
+def _merge_worker_stats(
+    all_raw_stats: list[dict[str, float]],
+) -> dict[str, float]:
+    """Merge independently aggregated stats from rollout workers.
+
+    Scalar means carry a ``__count`` companion. PRM structured count/sum
+    metrics have explicitly known SUM semantics. Other tensor statistics
+    lack reduction metadata in the export, so retain the existing behavior
+    of omitting them rather than guessing their denominator or reduction.
+    """
+    sums = defaultdict(float)
+    scalar_weighted_sums = defaultdict(float)
+    scalar_counts = defaultdict(float)
+
+    for raw_stats in all_raw_stats:
+        for key, value in raw_stats.items():
+            if key.endswith("__count"):
+                continue
+
+            scalar_count_key = f"{key}__count"
+            if scalar_count_key in raw_stats:
+                count = raw_stats[scalar_count_key]
+                scalar_weighted_sums[key] += value * count
+                scalar_counts[key] += count
+                continue
+
+            metric_key = key.removeprefix("rollout/").removeprefix("eval-rollout/")
+            segments = metric_key.split("/")
+            if (
+                len(segments) == 5
+                and segments[0] == "prm_metric"
+                and segments[1] in {"turn", "trajectory"}
+                and segments[-1] in {"count", "sum", "observed_count"}
+            ):
+                sums[key] += value
+
+    merged = dict(sums)
+    for key, weighted_sum in scalar_weighted_sums.items():
+        if scalar_counts[key] > 0:
+            merged[key] = weighted_sum / scalar_counts[key]
+    return merged
+
+
 # NOTE: remote task input has a slightly different
 # type annotation, which disallows workflow object or types
 @dataclass
@@ -58,6 +104,7 @@ class _RemoteRolloutTaskInput:
     workflow: str | None
     workflow_kwargs: dict[str, Any]
     should_accept_fn: str | None
+    mopd_route: str | None = None
     is_eval: bool = False
     group_size: int = 1
     proxy_addr: str | None = None
@@ -89,6 +136,7 @@ class RolloutController:
         self.workers: list[Worker] = []  # List of Worker objects from scheduler
         self.server_infos: list[LocalInfServerInfo] = []
         self._worker_role: str
+        self._gpus_per_server: int = 1
 
         # Round-robin scheduling
         self._current_worker_idx = 0
@@ -98,6 +146,7 @@ class RolloutController:
         self._version = 0
 
         self._task_id_generator = TaskIdGenerator()
+        self._mopd_routing_enabled = False
 
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
@@ -157,6 +206,43 @@ class RolloutController:
         """
         return f"{self._worker_role}/{rank}"
 
+    def enable_mopd_routing(self) -> None:
+        """Require dataset-source route metadata for training rollouts."""
+        self._mopd_routing_enabled = True
+
+    def _extract_mopd_route(
+        self, data: dict[str, Any], *, required: bool
+    ) -> tuple[dict[str, Any], str | None]:
+        """Remove internal route metadata before data reaches the workflow."""
+        if MOPD_ROUTE_METADATA_KEY not in data:
+            if required:
+                raise ValueError("MOPD dataset-source route metadata is missing")
+            return data, None
+
+        provenance = data[MOPD_ROUTE_METADATA_KEY]
+        if not isinstance(provenance, DatasetRoute):
+            raise ValueError(
+                "MOPD dataset-source route must contain DatasetRoute provenance"
+            )
+        prepared = dict(data)
+        prepared.pop(MOPD_ROUTE_METADATA_KEY)
+        return prepared, provenance.route
+
+    @staticmethod
+    def _propagate_mopd_route(
+        route: str | None, trajectory: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Attach one source route to every trajectory derived from that source."""
+        if route is None:
+            return trajectory
+        existing = trajectory.get("mopd_route")
+        if existing is not None and str(existing) != route:
+            raise ValueError(
+                f"Workflow changed mopd_route from {route!r} to {existing!r}"
+            )
+        trajectory["mopd_route"] = route
+        return trajectory
+
     def initialize(
         self,
         role: str,
@@ -174,6 +260,7 @@ class RolloutController:
             self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
         )
         dp_size = self.rollout_alloc.parallel.dp_size
+        self._gpus_per_server = instance_size
 
         # The first element of `self.config.scheduling_spec` is the resource spec
         # of workers, aka the RPC server process. Since a worker exactly matches
@@ -219,12 +306,24 @@ class RolloutController:
             task_factory=self._create_submit_callback,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            deterministic_order=getattr(self.config, "deterministic_sampling", False),
         )
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
 
         # Start callback server for weight sync coordination
         self._start_callback_server()
+
+    def _write_inference_targets(self, source: str) -> None:
+        write_inference_targets(
+            inf_engine=self.inf_engine,
+            server_infos=self.server_infos,
+            fileroot=self.config.fileroot,
+            experiment_name=self.config.experiment_name,
+            trial_name=self.config.trial_name,
+            role=self._worker_role,
+            source=source,
+        )
 
     async def _async_initialize(
         self,
@@ -276,6 +375,9 @@ class RolloutController:
                 len(self.server_infos),
                 len(self.workers),
             )
+            # Evaluation reuses targets already published by the training owner.
+            if self._worker_role != "eval-rollout":
+                await asyncio.to_thread(self._write_inference_targets, "provided")
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
@@ -292,16 +394,87 @@ class RolloutController:
                 )
             ]
             await asyncio.gather(*tasks)
-        else:
-            self.server_infos = await self._collective_rpc_async(
-                "launch_server", server_args=server_args
+        elif (
+            self.config.scheduling_strategy.type
+            == SchedulingStrategyType.colocation.value
+        ):
+            # Colocation (AWEX) path: multiple servers share a node, so SLURM does
+            # NOT isolate GPUs per worker. We must compute base_gpu_id explicitly and
+            # inject `_awex_gpus_per_server` so the worker recomputes base_gpu_id from
+            # its own SLURM_LOCALID at runtime (the only value guaranteed unique per
+            # node-slot). See SGLangBackend.launch_server.
+            #
+            # NOTE: this assumes a server fits within one node
+            # (gpus_per_server <= n_gpus_per_node). Cross-node TP servers would
+            # collapse slots_per_node to 1 and collide; only the SLURM_LOCALID
+            # path is collision-safe in that case.
+            slots_per_node = max(
+                1,
+                getattr(self.scheduler, "n_gpus_per_node", 8) // self._gpus_per_server,
             )
+            launch_tasks = []
+            for rank, worker in enumerate(self.workers):
+                per_worker_args = {
+                    **server_args,
+                    "base_gpu_id": (rank % slots_per_node) * self._gpus_per_server,
+                    "_awex_gpus_per_server": self._gpus_per_server,
+                }
+                # A non-forked colocated rollout aliases the actor worker:
+                # [0] is RPC and [1] is the actor rendezvous TCPStore, so
+                # SGLang needs a separately reserved third port. A forked
+                # rollout owns its worker and can use its second port. Always
+                # override the global server argument because replicas on the
+                # same node cannot safely share one explicit NCCL port.
+                port_index = 1 if self.config.scheduling_strategy.fork else 2
+                if len(worker.worker_ports) <= port_index:
+                    required = port_index + 1
+                    raise ValueError(
+                        f"Colocated rollout worker {worker.id!r} needs at least "
+                        f"{required} allocated ports, but has "
+                        f"{len(worker.worker_ports)}. Set SchedulingSpec.port_count="
+                        f"{required} for the colocated target role."
+                    )
+                per_worker_args["nccl_port"] = int(worker.worker_ports[port_index])
+                launch_tasks.append(
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="launch_server",
+                        engine_name=self._engine_name(rank),
+                        server_args=per_worker_args,
+                    )
+                )
+            self.server_infos = await asyncio.gather(*launch_tasks)
+            await asyncio.to_thread(self._write_inference_targets, "colocation")
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
                     method="initialize",
                     engine_name=self._engine_name(rank),
-                    # args in `engine_api`
+                    engine_id=str(rank),
+                    addr=f"{info.host}:{info.port}",
+                    *args,
+                    **kwargs,
+                )
+                for rank, (worker, info) in enumerate(
+                    zip(self.workers, self.server_infos)
+                )
+            ]
+            await asyncio.gather(*tasks)
+        else:
+            # Separation path: each rollout server gets its own SLURM-isolated GPUs,
+            # so we must NOT override base_gpu_id (SLURM already sets
+            # CUDA_VISIBLE_DEVICES per worker). Use the collective launch + addr-less
+            # initialize that the verified disaggregated baseline relies on; the
+            # worker discovers its server address via name_resolve.
+            self.server_infos = await self._collective_rpc_async(
+                "launch_server", server_args=server_args
+            )
+            await asyncio.to_thread(self._write_inference_targets, "separation")
+            tasks = [
+                self.scheduler.async_call_engine(
+                    worker_id=worker.id,
+                    method="initialize",
+                    engine_name=self._engine_name(rank),
                     engine_id=str(rank),
                     *args,
                     **kwargs,
@@ -313,33 +486,68 @@ class RolloutController:
         logger.info("All engines are initialized...")
 
     def destroy(self):
-        # Stop background threads and shutdown the async task runner
+        errors: list[str] = []
+
+        # Stop externally reachable/background work before deleting any role.
+        self._stop_proxy_gateway()
         if self._dispatcher is not None:
             self._dispatcher.destroy()
-
         self._stop_callback_server()
 
-        self._collective_rpc("destroy", http_timeout=60.0)
+        # Proxy is a logical leaf of rollout. Destroy its engines and workers
+        # while the rollout alias still resolves to the actual process owner.
+        if self._proxy_started or self.proxy_workers:
+            if self.proxy_workers:
+                try:
+
+                    async def _destroy_proxy_engines():
+                        tasks = [
+                            self.scheduler.async_call_engine(
+                                worker_id=worker.id,
+                                method="destroy",
+                                engine_name=self._proxy_engine_name(rank),
+                            )
+                            for rank, worker in enumerate(self.proxy_workers)
+                        ]
+                        return await asyncio.gather(*tasks, return_exceptions=True)
+
+                    results = run_async_task(_destroy_proxy_engines)
+                    errors.extend(
+                        f"proxy engine {rank}: {result}"
+                        for rank, result in enumerate(results)
+                        if isinstance(result, BaseException)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"proxy engine destroy: {exc}")
+            try:
+                self.scheduler.delete_workers(role=self._proxy_role)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"proxy worker delete: {exc}")
+            else:
+                self.proxy_workers.clear()
+                self.proxy_addrs.clear()
+                self._proxy_started = False
+                logger.info("Proxy workers deleted")
+
+        try:
+            self._collective_rpc("destroy", http_timeout=60.0)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"rollout engine destroy: {exc}")
 
         # Delete workers via scheduler
         if hasattr(self, "_worker_role"):
             try:
                 self.scheduler.delete_workers(role=self._worker_role)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"rollout worker delete: {exc}")
+            else:
                 self.workers.clear()
                 logger.info("Workers deleted")
-            except Exception:
-                logger.error(f"Error deleting workers: {traceback.format_exc()}")
 
-        # Delete proxy workers if initialized
-        if self._proxy_started:
-            try:
-                self.scheduler.delete_workers(role=self._proxy_role)
-                self.proxy_workers.clear()
-                self.proxy_addrs.clear()
-                self._proxy_started = False
-                logger.info("Proxy workers deleted")
-            except Exception:
-                logger.error(f"Error deleting proxy workers: {traceback.format_exc()}")
+        with self._futures_lock:
+            self._pending_futures.clear()
+        if errors:
+            raise RuntimeError("RolloutController cleanup failed: " + "; ".join(errors))
 
         # Shutdown proxy gateway if initialized
         self._stop_proxy_gateway()
@@ -363,8 +571,21 @@ class RolloutController:
                 "Call initialize() first."
             )
 
-        run_async_task(self._async_start_proxy)
-        self._proxy_started = True
+        try:
+            run_async_task(self._async_start_proxy)
+        except Exception:
+            try:
+                self.scheduler.delete_workers(role=self._proxy_role)
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Failed to rollback partially initialized proxy workers:\n%s",
+                    traceback.format_exc(),
+                )
+            self.proxy_workers.clear()
+            self.proxy_addrs.clear()
+            raise
+        else:
+            self._proxy_started = True
 
     async def _async_start_proxy(self) -> None:
         """Async implementation of proxy worker initialization."""
@@ -586,6 +807,20 @@ class RolloutController:
         @app.route("/callback/continue_generation", methods=["POST"])
         def continue_generation():
             self._callback_loop.run_until_complete(self.continue_generation())
+            return jsonify({"status": "ok"})
+
+        @app.route("/callback/onload", methods=["POST"])
+        def onload():
+            payload = request.get_json() or {}
+            tags = payload.get("tags")
+            self.onload(tags=tags)
+            return jsonify({"status": "ok"})
+
+        @app.route("/callback/offload", methods=["POST"])
+        def offload():
+            payload = request.get_json() or {}
+            tags = payload.get("tags")
+            self.offload(tags=tags)
             return jsonify({"status": "ok"})
 
         @app.route("/callback/rollout_complete", methods=["POST"])
@@ -835,6 +1070,7 @@ class RolloutController:
 
                 traj = result
                 if traj is not None:
+                    traj = self._propagate_mopd_route(pending_task.mopd_route, traj)
                     manager.on_rollout_accepted()
                     if self.config.enable_rollout_tracing:
                         logger.info(
@@ -880,6 +1116,9 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        data, mopd_route = self._extract_mopd_route(
+            data, required=self._mopd_routing_enabled and not is_eval
+        )
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         if workflow_kwargs is None:
@@ -896,6 +1135,7 @@ class RolloutController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             task_id=task_id,
+            mopd_route=mopd_route,
             is_eval=is_eval,
             group_size=group_size,
             proxy_addr=proxy_addr,
@@ -975,12 +1215,16 @@ class RolloutController:
         def task_input_generator():
             for data in cycle_dataloader(dataloader):
                 for item in data:
+                    workflow_data, mopd_route = self._extract_mopd_route(
+                        item, required=self._mopd_routing_enabled
+                    )
                     yield _RemoteRolloutTaskInput(
-                        data=item,
+                        data=workflow_data,
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,
                         task_id=self._task_id_generator.next(),
+                        mopd_route=mopd_route,
                         group_size=group_size,
                         reward_normalization=reward_normalization,
                         drop_incomplete_group=drop_incomplete_group,
@@ -1094,16 +1338,11 @@ class RolloutController:
     async def pause_generation(self):
         await self._collective_rpc_async("pause_generation")
 
+    def pause_generation_sync(self):
+        self._collective_rpc("pause_generation", http_timeout=120.0)
+
     async def continue_generation(self):
         await self._collective_rpc_async("continue_generation")
-
-    def offload(self) -> None:
-        """Offload rollout model memory on all inference workers."""
-        self._collective_rpc("offload")
-
-    def onload(self, tags: list[str] | None = None) -> None:
-        """Onload rollout model memory on all inference workers."""
-        self._collective_rpc("onload", tags=tags)
 
     def set_version(self, version: int) -> None:
         with self._version_lock:
@@ -1120,31 +1359,39 @@ class RolloutController:
 
     def pause(self):
         self.dispatcher.pause()
+        if self._proxy_started:
+            self._proxy_collective_rpc("pause", http_timeout=60.0)
         self._collective_rpc("pause", http_timeout=60.0)
 
     def resume(self):
         self._collective_rpc("resume", http_timeout=60.0)
+        if self._proxy_started:
+            self._proxy_collective_rpc("resume", http_timeout=60.0)
         self.dispatcher.resume()
+
+    def offload(self, tags: list[str] | None = None):
+        self._collective_rpc("offload", tags=tags, http_timeout=120.0)
+
+    def abort_all_requests(self):
+        self._collective_rpc("abort_all_requests", http_timeout=60.0)
+
+    def onload(self, tags: list[str] | None = None):
+        self._collective_rpc("onload", tags=tags, http_timeout=120.0)
 
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
-        stats = defaultdict(float)
-        counts = defaultdict(int)
-
-        for raw_stats in all_raw_stats:
-            for k, v in raw_stats.items():
-                if k.endswith("__count"):
-                    counts[k] += v
-                else:
-                    stats[k] += v * raw_stats.get(k + "__count", 0)
-
-        # Average non-count stats
-        final_stats = {}
-        for k, v in stats.items():
-            count_key = k + "__count"
-            if count_key in counts and counts[count_key] > 0:
-                final_stats[k] = v / counts[count_key]
-        return final_stats
+        agent_config = self.config.agent
+        if (
+            self._proxy_started
+            and self.proxy_workers
+            and agent_config is not None
+            and agent_config.prm.enabled
+            and any(scorer.enabled for scorer in agent_config.prm.scorers)
+        ):
+            all_raw_stats += self._proxy_collective_rpc(
+                method="export_stats", http_timeout=60.0
+            )
+        return _merge_worker_stats(all_raw_stats)
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():
