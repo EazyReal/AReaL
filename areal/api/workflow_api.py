@@ -22,21 +22,22 @@ class RolloutWorkflow(ABC):
         ----
         Returning `None` implies that this trajectory is rejected and will not be used for training.
 
-        When the resolved ``min_usable_group_size`` is at least 2 — derived
-        from group-relative normalization (``mean_level='group'`` or
-        ``std_level='group'`` in ``actor.reward_norm`` / ``actor.adv_norm``),
-        or set explicitly via ``actor.min_usable_group_size`` — and rollouts
-        are grouped (``n_samples >= 2``), each ``arun_episode`` call must contribute
-        exactly one training sample: a tensor dict with batch size 1, or a
-        dict containing a single interaction. Returning multiple samples per
-        episode (e.g. one row per turn, or tree-search branches) raises a
-        non-retryable ``WorkflowContractError`` that terminates training,
-        because group statistics would otherwise treat same-episode rows as
-        independent group members. Ungrouped rollouts (``n_samples=1``)
-        install no group wrapper and are not checked; a multi-sample episode
-        is then normalized as its own group of same-episode rows. To train
-        multi-sample workflows, use batch-level normalization or merge each
-        episode into a single sequence.
+        Each v1 ``arun_episode`` call is one logical rollout, even when context
+        compaction exports multiple tensor rows or interactions. The collector
+        carries ``RolloutGroup`` metadata through training so reward statistics
+        count each rollout once. Advantage statistics remain token-based.
+
+        If row rewards differ and reward normalization is enabled, supply one
+        finite ``rollout_reward`` scalar in a tensor result, or on its exported
+        interactions (all supplied values must agree). This reference defines
+        group/batch reward statistics while each row retains its own reward.
+        Explicit references bypass row-length overlong penalties; actor reward
+        bias, scaling and clipping apply to both rows and references.
+
+        Tensor trajectories should include an ``is_truncated`` boolean tensor with
+        one value per trajectory when the workflow can determine whether the final
+        model response stopped because it reached a length limit. PPO uses this
+        metadata for reward masking, value bootstrapping, and truncation metrics.
 
         See concrete example implementations under the `areal/workflow` directory.
 

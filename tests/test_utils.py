@@ -12,6 +12,7 @@ from areal.trainer.rw.rw_engine import _rw_loss_weight
 from areal.utils.data import (
     TRANSPORT_DUMMY_KEY,
     MicroBatchList,
+    align_mb_list_sequences,
     pack_tensor_dict,
     pad_and_stack_tensors_along_first_dim,
     pad_mb_list,
@@ -20,12 +21,64 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
     split_training_batch_into_microbatches,
     unpack_sequence,
+    unpad_logits,
 )
 
 BS = 16
 MAX_ANSWER_LEN = 16
 MAX_PROMPT_LEN = 8
 VOCAB_SIZE = 100
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "seq_align_to", "expected_cu_seqlens"),
+    [
+        ([14010], 1, [0, 14010]),
+        ([7, 130], 8, [0, 8, 144]),
+    ],
+)
+def test_align_mb_list_sequences_does_not_add_batch_row(
+    seq_lens, seq_align_to, expected_cu_seqlens
+):
+    """BSHD sequence alignment must preserve the number of real batch rows."""
+    total_length = sum(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32
+    )
+    input_ids = torch.arange(total_length)
+    mb = {
+        "input_ids": input_ids,
+        "position_ids": torch.cat([torch.arange(length) for length in seq_lens]),
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max(seq_lens),
+    }
+    mb_list = MicroBatchList(
+        data=mb,
+        mb_spec=MicroBatchSpec(),
+        mbs=[mb],
+        group_lens=[total_length],
+    )
+
+    aligned = align_mb_list_sequences(mb_list, seq_align_to=seq_align_to)
+
+    assert aligned.padded_mbs is not None
+    assert aligned.old_cu_seqlens_list is not None
+    padded_mb = aligned.padded_mbs[0]
+    assert padded_mb["cu_seqlens"].tolist() == expected_cu_seqlens
+    assert padded_mb["cu_seqlens"].numel() == len(seq_lens) + 1
+    assert aligned.padding_lengths == [0]
+    assert aligned.padded_to_lengths == [expected_cu_seqlens[-1]]
+    assert torch.all(
+        (padded_mb["cu_seqlens"][1:] - padded_mb["cu_seqlens"][:-1]) % seq_align_to == 0
+    ).item()
+
+    restored_ids = unpad_logits(
+        padded_mb["input_ids"],
+        padding_length=0,
+        cu_seqlens=padded_mb["cu_seqlens"],
+        old_cu_seqlens=aligned.old_cu_seqlens_list[0],
+    )
+    torch.testing.assert_close(restored_ids, input_ids, rtol=0, atol=0)
 
 
 @pytest.fixture
@@ -129,7 +182,8 @@ def test_transport_padding_bypasses_objective_weight(loss_weight_fn):
     )
 
 
-def test_noop_packed_padding_preserves_semantic_transport_marker():
+@pytest.mark.parametrize("sequence_alignment", [False, True])
+def test_noop_packed_padding_preserves_semantic_transport_marker(sequence_alignment):
     transport_mb = pack_tensor_dict(
         {
             "input_ids": torch.zeros(1, 1, dtype=torch.long),
@@ -145,19 +199,18 @@ def test_noop_packed_padding_preserves_semantic_transport_marker():
         transport_dummy_count=1,
     )
 
-    pad_mb_list(mb_list, pad_to_maximum=True)
+    if sequence_alignment:
+        align_mb_list_sequences(mb_list)
+    else:
+        pad_mb_list(mb_list, pad_to_maximum=True)
 
     assert mb_list.padding_lengths == [0]
     assert mb_list.mbs[0][TRANSPORT_DUMMY_KEY] is True
     assert mb_list.padded_mbs is not None
     assert TRANSPORT_DUMMY_KEY not in mb_list.padded_mbs[0]
 
-    callback_called = False
-
     def _loss_weight(_microbatch):
-        nonlocal callback_called
-        callback_called = True
-        return torch.tensor(1.0)
+        pytest.fail("transport dummy reached the objective weight callback")
 
     torch.testing.assert_close(
         compute_microbatch_loss_weight(mb_list.mbs[0], _loss_weight),
@@ -165,7 +218,6 @@ def test_noop_packed_padding_preserves_semantic_transport_marker():
         rtol=0.0,
         atol=0.0,
     )
-    assert callback_called is False
 
 
 def test_forward_transport_padding_is_removed_from_outputs():
@@ -269,8 +321,8 @@ def test_synchronized_training_schedule_preserves_extra_local_microbatches(
         del value, group
         output[:] = [3, 1]
 
-    def _split_into_local_microbatches(data, mb_spec, synchronize):
-        del synchronize
+    def _split_into_local_microbatches(data, mb_spec, sync_mbs):
+        assert sync_mbs is False
         microbatches = [
             {key: value[index : index + 1] for key, value in data.items()}
             for index in range(batch_size)

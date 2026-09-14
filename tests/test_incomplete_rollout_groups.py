@@ -145,7 +145,7 @@ async def test_grouped_rollout_keeps_singleton_by_default(rollout_stats):
 
 
 @pytest.mark.asyncio
-async def test_group_relative_tensor_slot_must_produce_one_member(rollout_stats):
+async def test_group_relative_tensor_slot_retains_split_rows(rollout_stats):
     grouped = GroupedRolloutWorkflow(
         _SequenceWorkflow([_trajectory(11, batch_size=2), _trajectory(22)]),
         group_size=2,
@@ -153,12 +153,13 @@ async def test_group_relative_tensor_slot_must_produce_one_member(rollout_stats)
         min_usable_group_size=2,
     )
 
-    with pytest.raises(WorkflowContractError, match="slot sizes \\[2, 1\\]"):
-        await grouped.arun_episode(MagicMock(), {})
+    result = await grouped.arun_episode(MagicMock(), {})
+    assert result["rollout_group"].row_counts == (2, 1)
+    torch.testing.assert_close(result["input_ids"], torch.tensor([[11], [11], [22]]))
 
 
 @pytest.mark.asyncio
-async def test_group_relative_interaction_slot_must_produce_one_member(rollout_stats):
+async def test_group_relative_interaction_slot_retains_split_rows(rollout_stats):
     grouped = GroupedRolloutWorkflow(
         _SequenceWorkflow(
             [
@@ -174,14 +175,14 @@ async def test_group_relative_interaction_slot_must_produce_one_member(rollout_s
         min_usable_group_size=2,
     )
 
-    with pytest.raises(WorkflowContractError, match="slot sizes \\[2, 1\\]"):
-        await grouped.arun_episode(MagicMock(), {})
+    result = await grouped.arun_episode(MagicMock(), {})
+    assert [v.rollout_index for v in result.values()] == [0, 0, 1]
 
 
 @pytest.mark.parametrize("dynamic_bs", [False, True])
 def test_executor_propagates_group_contract_error_without_retry(dynamic_bs):
     workflow = _SequenceWorkflow(
-        [_trajectory(11, batch_size=2), _trajectory(22, batch_size=2)]
+        [dict(_trajectory(11), rollout_reward=float("nan")), _trajectory(22)]
     )
     grouped = GroupedRolloutWorkflow(
         workflow,
@@ -202,7 +203,9 @@ def test_executor_propagates_group_contract_error_without_retry(dynamic_bs):
     executor.initialize()
 
     try:
-        with pytest.raises(WorkflowContractError, match="slot sizes \\[2, 2\\]"):
+        with pytest.raises(
+            WorkflowContractError, match="rollout_reward must be finite"
+        ):
             executor.prepare_batch(
                 _CyclingDataLoader(),
                 grouped,

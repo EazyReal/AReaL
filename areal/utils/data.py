@@ -4,6 +4,7 @@
 # Copyright (c) 2023, Tri Dao.
 
 import copy
+import math
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -13,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import MicroBatchSpec, NormConfig
@@ -359,6 +361,45 @@ def split_and_unpad_tensor(
     return result
 
 
+@dataclass(frozen=True)
+class RolloutGroup:
+    """Logical rollouts within one prompt, each occupying contiguous tensor rows.
+
+    Workflows own optional raw reward references. A reference is required when
+    reward normalization consumes a rollout whose row rewards differ.
+    """
+
+    row_counts: tuple[int, ...]
+    rewards: tuple[float | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "row_counts", tuple(self.row_counts))
+        object.__setattr__(self, "rewards", tuple(self.rewards))
+        if not self.row_counts or any(
+            type(count) is not int or count < 1 for count in self.row_counts
+        ):
+            raise ValueError("rollout row_counts must be positive integers")
+        if not self.rewards:
+            object.__setattr__(self, "rewards", (None,) * len(self.row_counts))
+        if len(self.rewards) != len(self.row_counts):
+            raise ValueError("rollout rewards must match row_counts")
+        if any(
+            r is not None and (type(r) not in (int, float) or not math.isfinite(r))
+            for r in self.rewards
+        ):
+            raise ValueError("rollout_reward must be finite")
+
+    def validate_rows(self, rows: int) -> "RolloutGroup":
+        # RPC restores dataclass fields without running the constructor and
+        # encodes tuples as lists. Revalidate at the consuming boundary.
+        group = RolloutGroup(self.row_counts, self.rewards)
+        if sum(group.row_counts) != rows:
+            raise ValueError(
+                f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"
+            )
+        return group
+
+
 @dataclass
 class TrajBatchMeta:
     """Metadata for reversing concat_batch: traj counts, group sizes, seqlens."""
@@ -366,6 +407,16 @@ class TrajBatchMeta:
     n_trajs: int
     traj_group_sizes: list[int]
     traj_seqlens: list[int]
+    rollout_groups: list[RolloutGroup | None] | None = None
+
+    @property
+    def logical_group_sizes(self) -> list[int]:
+        if self.rollout_groups is None:
+            return self.traj_group_sizes
+        return [
+            len(group.row_counts) if group is not None else rows
+            for group, rows in zip(self.rollout_groups, self.traj_group_sizes)
+        ]
 
 
 def concat_batch(
@@ -375,21 +426,22 @@ def concat_batch(
     assert isinstance(data, list) and all(isinstance(d, dict) for d in data), (
         f"Expected list[dict], got {type(data)}"
     )
-    traj_group_sizes = []
-    for d in data:
-        first_tensor = next(
-            (v for v in d.values() if isinstance(v, torch.Tensor)), None
-        )
-        traj_group_sizes.append(
-            first_tensor.shape[0] if first_tensor is not None else 1
-        )
+    traj_group_sizes = [get_batch_size(d) for d in data]
+    rollout_groups = [d.get("rollout_group") for d in data]
+    for i, (group, rows) in enumerate(zip(rollout_groups, traj_group_sizes)):
+        if group is not None:
+            if not isinstance(group, RolloutGroup):
+                raise ValueError("rollout_group must be a RolloutGroup")
+            rollout_groups[i] = group.validate_rows(rows)
     traj_seqlens = [d["attention_mask"].shape[-1] for d in data]
     meta = TrajBatchMeta(
         n_trajs=len(data),
         traj_group_sizes=traj_group_sizes,
         traj_seqlens=traj_seqlens,
+        rollout_groups=rollout_groups,
     )
-    return concat_padded_tensors(data), meta
+    tensors = [{k: v for k, v in d.items() if k != "rollout_group"} for d in data]
+    return concat_padded_tensors(tensors), meta
 
 
 def split_batch(
@@ -397,9 +449,14 @@ def split_batch(
     meta: TrajBatchMeta,
 ) -> list[Any] | None:
     """Inverse of concat_batch: split batched result back into per-trajectory list."""
-    return split_and_unpad_tensor(
+    split = split_and_unpad_tensor(
         result, meta.n_trajs, meta.traj_group_sizes, meta.traj_seqlens
     )
+    if isinstance(result, dict) and meta.rollout_groups is not None:
+        for item, group in zip(split, meta.rollout_groups):
+            if group is not None:
+                item["rollout_group"] = group
+    return split
 
 
 def batched_call(
@@ -572,13 +629,19 @@ def tensor_container_to(
     if torch.is_tensor(d):
         return d.to(*args, **kwargs)
 
-    if isinstance(d, list) or isinstance(d, tuple):
+    if isinstance(d, list):
         return [tensor_container_to(v, *args, **kwargs) for v in d]
+
+    if isinstance(d, tuple):
+        values = [tensor_container_to(v, *args, **kwargs) for v in d]
+        if hasattr(d, "_fields"):
+            return type(d)(*values)
+        return tuple(values)
 
     if isinstance(d, dict):
         new_dict = {}
         for key, value in d.items():
-            if isinstance(value, dict) or isinstance(value, list):
+            if isinstance(value, (dict, list, tuple)):
                 new_dict[key] = tensor_container_to(value, *args, **kwargs)
             elif torch.is_tensor(value):
                 new_dict[key] = value.to(*args, **kwargs)
@@ -605,6 +668,35 @@ class MicroBatchItem(NamedTuple):
     padding_length: int
     old_cu_seqlens: torch.Tensor | None
     padded_to_length: int | None = None
+
+    def to(
+        self,
+        *args,
+        **kwargs,
+    ) -> "MicroBatchItem":
+        """Return a device-local copy without mutating the CPU source item.
+
+        Tree batches intentionally alias ``orig_mb`` and ``padded_mb``;
+        preserve that alias so the input is not duplicated on the accelerator.
+        """
+        padded_mb = tensor_container_to(self.padded_mb, *args, **kwargs)
+        orig_mb = (
+            padded_mb
+            if self.orig_mb is self.padded_mb
+            else tensor_container_to(self.orig_mb, *args, **kwargs)
+        )
+        old_cu_seqlens = (
+            self.old_cu_seqlens.to(*args, **kwargs)
+            if self.old_cu_seqlens is not None
+            else None
+        )
+        return MicroBatchItem(
+            orig_mb=orig_mb,
+            padded_mb=padded_mb,
+            padding_length=self.padding_length,
+            old_cu_seqlens=old_cu_seqlens,
+            padded_to_length=self.padded_to_length,
+        )
 
 
 @dataclass
@@ -764,7 +856,8 @@ def split_padded_tensor_dict_into_mb_list(
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
     allow_transport_padding: bool = False,
-    synchronize: bool = True,
+    *,
+    sync_mbs: bool = True,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -772,9 +865,10 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
-        allow_transport_padding: Add model-valid rows when synchronized execution
-            requires more micro-batches than local semantic data can provide.
-        synchronize: Synchronize the micro-batch count across ``group``.
+        allow_transport_padding: Add model-valid rows when execution requires
+            more micro-batches than local semantic data can provide.
+        sync_mbs: Synchronize micro-batch counts across ranks. Engines that pad
+            execution with zero-contribution forwards can disable this.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -823,13 +917,13 @@ def split_padded_tensor_dict_into_mb_list(
         if not allow_transport_padding:
             group_indices = (
                 allocate_balanced_mbs_synced(allocation_spec, input_lens, group=group)
-                if synchronize
+                if sync_mbs
                 else allocate_balanced_mbs(allocation_spec, input_lens)
             )
             break
 
         group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
-        if not synchronize or not dist.is_initialized():
+        if not sync_mbs or not dist.is_initialized():
             break
         all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
         dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
@@ -947,7 +1041,7 @@ def split_training_batch_into_microbatches(
     local_mbs = split_padded_tensor_dict_into_mb_list(
         data,
         MicroBatchSpec(n_mbs=local_n_mbs),
-        synchronize=False,
+        sync_mbs=False,
     ).mbs
     if not dist.is_initialized():
         if local_n_mbs < n_mbs:
@@ -1006,10 +1100,10 @@ N_TOKENS_PER_PAGE = 256
 
 def pad_packed_tensor_dict(
     data: dict[str, Any],
-    pad_to_length: int,
+    pad_to_length: int | None,
     pad_value: float = 0.0,
     seq_align_to: int | None = None,
-) -> tuple[dict[str, Any], int, torch.Tensor, int]:
+) -> tuple[dict[str, Any], int, torch.Tensor, int | None]:
     """Pad a packed dict of tensors to a specified length.
     This function assumes that the input data contains "cu_seqlens" and "max_seqlen" key,
     and all other tensors of shape [total_length, ] will be padded to `pad_to_length`.
@@ -1018,7 +1112,9 @@ def pad_packed_tensor_dict(
 
     Args:
         data (Dict): Dictionary containing tensors to be packed.
-        pad_to_length (int): The length to pad the tensors to. All tensors
+        pad_to_length (int | None): The total packed length to pad tensors to.
+            If None, only align individual sequences without appending a
+            batch-level padding sequence.
 
     Returns:
         Dict: Dictionary with padded tensors and modified "cu_seqlens" and
@@ -1104,18 +1200,21 @@ def pad_packed_tensor_dict(
 
         data = sequence_padded_data
         align_to_length = cu_seqlens_padded[-1].item()
-        # ensure pad_to_length is a integer multiple of both seq_align_to and N_TOKENS_PER_PAGE
-        lcm = np.lcm(seq_align_to, N_TOKENS_PER_PAGE).item()
-        pad_to_length = (pad_to_length + lcm - 1) // lcm * lcm
-
         cu_seqlens = data["cu_seqlens"]
         max_seqlen = data["max_seqlen"]
         total_length = data["cu_seqlens"][-1].item()
-        if pad_to_length < total_length:
-            # NOTE: In some occasion where sequence lengths, sequence padding will make total length
-            # exceed expected `pad_to_length`. This happens more often when sequence lengths are small.
-            # In this case, we increase pad_to_length.
-            pad_to_length = (total_length + lcm - 1) // lcm * lcm
+        if pad_to_length is not None:
+            # Ensure pad_to_length is an integer multiple of both
+            # seq_align_to and N_TOKENS_PER_PAGE.
+            lcm = np.lcm(seq_align_to, N_TOKENS_PER_PAGE).item()
+            pad_to_length = (pad_to_length + lcm - 1) // lcm * lcm
+            if pad_to_length < total_length:
+                # Sequence alignment can make the total exceed the original
+                # target, especially when sequences are short.
+                pad_to_length = (total_length + lcm - 1) // lcm * lcm
+
+    if pad_to_length is None:
+        return data, 0, old_cu_seqlens, align_to_length
 
     # Pad batch
     pad_length = pad_to_length - total_length
@@ -1165,6 +1264,43 @@ def pad_packed_tensor_dict(
         old_cu_seqlens,
         align_to_length,
     )
+
+
+def align_mb_list_sequences(
+    mb_list: MicroBatchList,
+    pad_value: float = 0.0,
+    seq_align_to: int = 1,
+) -> MicroBatchList:
+    """Align real sequences without adding a synthetic padding sequence.
+
+    This projection is for model inputs that are reconstructed as BSHD. A
+    trailing batch-level padding segment in ``cu_seqlens`` would become an
+    extra batch row rather than inert packed-token padding.
+    """
+    padded_mbs = []
+    old_cu_seqlens_list = []
+    align_to_lengths = []
+    for mb in mb_list.mbs:
+        padded_mb, _, old_cu_seqlens, align_to_length = pad_packed_tensor_dict(
+            mb,
+            pad_to_length=None,
+            pad_value=pad_value,
+            seq_align_to=seq_align_to,
+        )
+        assert align_to_length is not None
+        padded_mb = {
+            key: value for key, value in padded_mb.items() if key != TRANSPORT_DUMMY_KEY
+        }
+        padded_mbs.append(padded_mb)
+        old_cu_seqlens_list.append(old_cu_seqlens)
+        align_to_lengths.append(align_to_length)
+
+    mb_list.padded_mbs = padded_mbs
+    mb_list.padding_lengths = [0] * len(padded_mbs)
+    mb_list.padded_to_lengths = align_to_lengths.copy()
+    mb_list.old_cu_seqlens_list = old_cu_seqlens_list
+    mb_list.align_to_lengths = align_to_lengths
+    return mb_list
 
 
 def pad_mb_list(
@@ -1613,6 +1749,15 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(None, src_rank=src_rank, group=group)
                 for _ in range(length)
             ]
+        elif data_type == "tuple":
+            length, container_type = info
+            values = [
+                broadcast_tensor_container(None, src_rank=src_rank, group=group)
+                for _ in range(length)
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif data_type == "dict":
             keys = info
             return {
@@ -1641,6 +1786,17 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(d, src_rank=src_rank, group=group)
                 for d in data
             ]
+        elif isinstance(data, tuple):
+            container_type = type(data) if hasattr(data, "_fields") else None
+            metadata = [("tuple", (len(data), container_type))]
+            dist.broadcast_object_list(metadata, src=src_rank, group=group)
+            values = [
+                broadcast_tensor_container(d, src_rank=src_rank, group=group)
+                for d in data
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif isinstance(data, dict):
             metadata = [("dict", list(data.keys()))]
             dist.broadcast_object_list(metadata, src=src_rank, group=group)
@@ -1719,13 +1875,88 @@ def bcast_mb_list(
 def cycle_dataloader(dataloader: StatefulDataLoader, num_cycles: int = -1):
     """Cycle through a dataloader indefinitely."""
     epoch = 0
+    if hasattr(dataloader, "sampler") and isinstance(
+        dataloader.sampler, DistributedSampler
+    ):
+        # Respect an epoch restored by the trainer. Starting from zero here
+        # overwrites the sampler epoch after StatefulDataLoader.load_state_dict
+        # and changes the sample order after recovery.
+        epoch = dataloader.sampler.epoch
+    completed_cycles = 0
     while True:
         if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
             dataloader.sampler.set_epoch(epoch)
         yield from dataloader
         epoch += 1
-        if num_cycles > 0 and epoch >= num_cycles:
+        completed_cycles += 1
+        if num_cycles > 0 and completed_cycles >= num_cycles:
             break
+
+
+def normalize_rollout_rewards(
+    row_rewards: torch.Tensor,
+    norm: "Normalization",
+    meta: TrajBatchMeta,
+    *,
+    reward_bias: float = 0.0,
+    reward_scaling: float = 1.0,
+    reward_clip: float = float("inf"),
+    unpenalized_rewards: torch.Tensor | None = None,
+    reduce_group=None,
+) -> torch.Tensor:
+    """Normalize row scores against one reference per logical rollout.
+
+    Explicit references bypass row-length penalties; all scores share the
+    actor's bias, scaling and clipping. Missing references require equal rows.
+    """
+    scores = ((row_rewards + reward_bias) * reward_scaling).clamp(
+        min=-reward_clip, max=reward_clip
+    )
+    if norm.mean_level is None and norm.std_level is None:
+        return scores.float()
+    counts: list[int] = []
+    explicit: list[float | None] = []
+    groups = meta.rollout_groups or [None] * meta.n_trajs
+    for group, rows in zip(groups, meta.traj_group_sizes):
+        counts.extend(group.row_counts if group is not None else [1] * rows)
+        explicit.extend(group.rewards if group is not None else [None] * rows)
+    repeats = torch.tensor(counts, device=row_rewards.device, dtype=torch.long)
+    starts = repeats.cumsum(0) - repeats
+    member = torch.repeat_interleave(
+        torch.arange(len(counts), device=row_rewards.device),
+        repeats,
+        output_size=row_rewards.shape[0],
+    )
+    supplied = torch.tensor(
+        [r is not None for r in explicit], device=row_rewards.device, dtype=torch.bool
+    )
+    reference = torch.where(
+        supplied,
+        scores.new_tensor([r if r is not None else 0.0 for r in explicit]),
+        row_rewards[starts],
+    )
+    equal_rows = row_rewards == reference[member]
+    if unpenalized_rewards is not None:
+        equal_rows &= unpenalized_rewards == unpenalized_rewards[starts][member]
+    invalid_reference = torch.any(~supplied[member] & ~equal_rows)
+    if dist.is_initialized() and (
+        norm.mean_level == "batch" or norm.std_level == "batch"
+    ):
+        dist.all_reduce(invalid_reference, op=dist.ReduceOp.MAX, group=reduce_group)
+    torch._assert_async(
+        ~invalid_reference,
+        "Split rollout row rewards differ; supply an explicit rollout_reward "
+        "for reward normalization.",
+    )
+    reference = ((reference + reward_bias) * reward_scaling).clamp(
+        min=-reward_clip, max=reward_clip
+    )
+    mean, scale = norm.affine_parameters(
+        reference,
+        group_sizes=meta.logical_group_sizes,
+        reduce_group=reduce_group,
+    )
+    return ((scores - mean[member]) / scale[member]).float()
 
 
 class Normalization:
@@ -1785,18 +2016,50 @@ class Normalization:
         high_precision: bool = True,
         reduce_group=None,
         group_sizes: list[int] | None = None,
+        group_member_counts: list[int] | None = None,
     ) -> torch.Tensor:
-        bs = x.size(0)
-        eps = self.eps
-
-        # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
+        mean, scale = self.affine_parameters(
+            x,
+            loss_mask,
+            high_precision,
+            reduce_group,
+            group_sizes,
+            group_member_counts,
+        )
+        centered = x - mean
+        if loss_mask is not None:
+            centered = centered * loss_mask
+        return (centered / scale).float()
+
+    @torch.no_grad()
+    def affine_parameters(
+        self,
+        x: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+        high_precision: bool = True,
+        reduce_group=None,
+        group_sizes: list[int] | None = None,
+        group_member_counts: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the baseline and divisor, retaining masked token statistics.
+
+        Logical member counts only select singleton fallbacks; they do not
+        change the token weights used for advantage normalization.
+        """
+        bs = x.size(0)
+        eps = self.eps
 
         # Pre-compute group slices once (variable-size groups via group_sizes).
         group_slices = None
         if self.mean_level == "group" or self.std_level == "group":
             group_slices = self._build_group_slices(bs, group_sizes)
+            if group_member_counts is not None and (
+                len(group_member_counts) != len(group_slices)
+                or any(count < 1 for count in group_member_counts)
+            ):
+                raise ValueError("group_member_counts must match the prompt groups")
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1811,10 +2074,14 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for s in group_slices:
+            for i, s in enumerate(group_slices):
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
-                group_sz = s.stop - s.start
+                group_sz = (
+                    group_member_counts[i]
+                    if group_member_counts is not None
+                    else s.stop - s.start
+                )
 
                 # A singleton group has no peer to leave out. Use itself as the
                 # baseline so leave-one-out normalization outputs zero instead
@@ -1836,12 +2103,6 @@ class Normalization:
         else:  # mean_level == "none"
             mean = torch.zeros_like(x)
 
-        # Subtract mean
-        x_centered = x - mean
-        # mask unrelevant elements as 0
-        if loss_mask is not None:
-            x_centered = x_centered * loss_mask
-
         # Step 2: Compute std
         if self.std_level == "batch":
             std = self._compute_std(
@@ -1856,11 +2117,15 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for s in group_slices:
+            for i, s in enumerate(group_slices):
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
-                group_sz = s.stop - s.start
+                group_sz = (
+                    group_member_counts[i]
+                    if group_member_counts is not None
+                    else s.stop - s.start
+                )
 
                 # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
                 if group_sz == 1 and self.std_unbiased:
@@ -1883,8 +2148,7 @@ class Normalization:
             std = torch.ones_like(x)
             eps = 0.0
 
-        # Normalize
-        return (x_centered / (std + eps)).float()
+        return mean, std + eps
 
     @staticmethod
     def _compute_mean(
@@ -2047,33 +2311,58 @@ class KLEstimator:
         return log_ratio
 
 
-def make_dummy_eval_item(template: dict[str, Any]) -> dict[str, Any]:
+def make_dummy_eval_item(
+    template: dict[str, Any], *, active_attention: bool = False
+) -> dict[str, Any]:
     """Create a zero-contribution dummy item matching *template*'s schema.
 
     Every tensor field is replaced with a minimal all-zeros tensor that
-    preserves dtype and device.  ``attention_mask`` and ``loss_mask`` are
-    set to zero so that downstream loss/metric code treats the item as
-    contributing nothing.
+    preserves dtype, device, and all leading dimensions.  Keeping the
+    trajectory group dimension is required when distributed ranks synchronize
+    their microbatch counts: a padded rank must be able to create as many
+    microbatches as a rank holding a real multi-sample trajectory.
+    ``attention_mask`` and ``loss_mask`` are normally zero so downstream
+    loss/metric code treats the item as contributing nothing.
+    ``active_attention=True`` creates one attended token per sequence for
+    pipeline evaluation; callers must discard its output.
     """
+    from areal.infra.rpc.rtensor import RTensor
 
-    def _zero_tensor_like(tensor: torch.Tensor) -> torch.Tensor:
-        return torch.zeros((1, 1), dtype=tensor.dtype, device=tensor.device)
+    def _minimal_tensor_like(
+        tensor: torch.Tensor | RTensor, *, fill_value: int = 0
+    ) -> torch.Tensor:
+        if isinstance(tensor, RTensor):
+            device = torch.device("cpu")
+        else:
+            device = tensor.device
+        shape = (*tensor.shape[:-1], 1) if tensor.ndim > 0 else (1,)
+        return torch.full(shape, fill_value, dtype=tensor.dtype, device=device)
+
+    group_size = 1
+    attention_mask = template.get("attention_mask")
+    if isinstance(attention_mask, (torch.Tensor, RTensor)) and attention_mask.ndim >= 2:
+        group_size = attention_mask.shape[0]
 
     dummy: dict[str, Any] = {}
     for key, value in template.items():
         if key in {"attention_mask", "loss_mask"}:
-            if isinstance(value, torch.Tensor):
-                dummy[key] = _zero_tensor_like(value)
+            if isinstance(value, (torch.Tensor, RTensor)):
+                fill_value = int(active_attention and key == "attention_mask")
+                dummy[key] = _minimal_tensor_like(value, fill_value=fill_value)
             else:
-                dummy[key] = torch.zeros((1, 1), dtype=torch.bool)
+                dummy[key] = torch.full(
+                    (1, 1),
+                    int(active_attention and key == "attention_mask"),
+                    dtype=torch.bool,
+                )
             continue
 
         if key.startswith("multi_modal_input"):
-            dummy[key] = [{}]
+            dummy[key] = [{} for _ in range(group_size)]
             continue
 
-        if isinstance(value, torch.Tensor):
-            dummy[key] = _zero_tensor_like(value)
+        if isinstance(value, (torch.Tensor, RTensor)):
+            dummy[key] = _minimal_tensor_like(value)
         else:
             dummy[key] = copy.deepcopy(value)
 

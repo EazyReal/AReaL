@@ -200,23 +200,24 @@ rollout:
 1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
 1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
 1. 设置 `reward_normalization=True` 时，group 通过最小大小检查后，只对可用 rollout 的 interaction rewards
-   进行归一化。`drop_incomplete_group=True` 仍要求所有原始 slot 成功；若保留的 rollout 缺少最终 reward，整个 group
-   会被丢弃。
+   进行归一化。`drop_incomplete_group=True` 仍要求所有原始 slot 成功；若保留的 rollout 缺少某一行的 reward，整个
+   group 会被丢弃。
 1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
    使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
    （`n_samples: 1`）本身即是完整的，因此下限保持为 `1`。设置 `actor.min_usable_group_size` 可覆盖该推导值；使用 group
    statistics 时，低于 `2` 的显式值会被拒绝。低于下限的 group 返回 `None`，异步 collector 随后会接收另一个已就绪的 prompt
    group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的 singleton。
-1. Group statistics 会约束 workflow 契约：当解析后的 `min_usable_group_size` 至少为 `2` ——由 group
-   statistics（`mean_level: group` 或 `std_level: group`）推导，或通过
-   `actor.min_usable_group_size` 显式设置——且 rollout 分组（`n_samples >= 2`）时，每次 `arun_episode`
-   调用必须恰好贡献一个训练样本——batch size 为 1 的张量字典，或单个导出的 interaction。所有内置 workflow 均满足该契约。如果
-   workflow 每个 episode 返回多个样本（每 turn 一行、tree-search 分支，或使用
-   `agent.export_style: individual` 的多轮 agent），会抛出不可重试的 `WorkflowContractError` 并终止训练，因为
-   group mean/std 会把同一 episode 的多行当作独立的 group 成员。未分组的 rollout（`n_samples: 1`）不会安装 group
-   wrapper，因此不做该检查；此时多样本 episode 会作为由同一 episode 各行组成的独立 group 参与 normalization。若要训练此类
-   workflow，请将 `mean_level`/`std_level` 改为 `batch`（或关闭 normalization），或把每个 episode
-   合并为单条序列（`agent.export_style: concat`）。
+1. v1 每次 `arun_episode` 调用对应一个逻辑 rollout。上下文压缩或 `agent.export_style: individual`
+   可以导出多行，group 不会因此中止。Collector 在轨迹的 `rollout_group` 字段中保存 `RolloutGroup`，记录每个 rollout
+   的连续行数和可选 reward 参考值。Batch 合并将其移入 `TrajBatchMeta`，拆分时再恢复。可用 group 大小按逻辑 rollout
+   计数，`n_samples: 1` 也遵循该规则。
+1. Group 和 batch reward normalization 都对每个逻辑 rollout 使用一个参考值。若同一 rollout 各行 reward
+   不同，workflow 必须在张量字典中或导出的 `InteractionWithTokenLogpReward` 上 提供有限标量
+   `rollout_reward`；同一 rollout 中所有显式参考值必须一致。省略时，只能从相等的 行 reward 取得参考值。每一行保留自己的
+   reward，并使用相同的平移和缩放；leave-one-out 基线排除整个逻辑 rollout。不会从不同行 reward 猜测最终值、总和或均值。
+1. 内置按行长度计算的 overlong penalty 不改变显式参考值；actor 的 reward bias、scaling 和 clipping 同时作用于行
+   reward 与参考值。未提供显式参考值时，施加长度惩罚后的行 reward 仍须相等。Advantage normalization 保持现有 masked token
+   统计及按 token 的 leave-one-out 行为，逻辑计数仅用于 singleton 回退。GAE 仍分别在各行上计算。
 
 PPO 系列 actor loss 默认仍按全局 token 加权。因此，有更多有效 response tokens 的 partial group 会比更小或更短的
 group 获得更高 loss weight。这是保持向后兼容的现有 estimator，并不表示各 prompt 隐式等权。

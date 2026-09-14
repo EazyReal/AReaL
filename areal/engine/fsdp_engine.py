@@ -116,6 +116,7 @@ from areal.utils import (
 )
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 from areal.utils.data import (
+    TRANSPORT_DUMMY_KEY,
     MicroBatchItem,
     MicroBatchList,
     amend_position_ids,
@@ -743,7 +744,41 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        for mb_item in mb_list:
+        mb_items = list(mb_list)
+        n_micro_batches = len(mb_items)
+        if not self.enable_tree_training:
+            counts = torch.tensor(
+                [n_micro_batches, int(not mb_items)], dtype=torch.int64, device="cpu"
+            )
+            dist.all_reduce(counts, op=dist.ReduceOp.MAX, group=self.cpu_group)
+            if counts[1]:
+                raise ValueError("FSDP requires at least one real micro-batch per rank")
+            n_micro_batches = int(counts[0])
+
+        # Model configuration is shared by all ranks, including text-only peers.
+        if self.is_vision_model:
+            has_dummy = torch.tensor(
+                n_micro_batches > len(mb_items)
+                or any(mb.get(TRANSPORT_DUMMY_KEY) is True for mb in mb_list.mbs),
+                dtype=torch.int32,
+                device="cpu",
+            )
+            dist.all_reduce(has_dummy, op=dist.ReduceOp.MAX, group=self.cpu_group)
+            if has_dummy.item():
+                raise ValueError(
+                    "FSDP transport padding is not supported for vision-language "
+                    "models: text-only dummies can skip sharded vision layers "
+                    "and mismatch collectives. Use batches and microbatch settings "
+                    "that require no transport padding. All training ranks stopped "
+                    "before model execution."
+                )
+
+        # Preserve real packing and output metadata while short ranks participate
+        # in every FSDP forward/backward with their shortest valid input.
+        dummy_index = min(range(len(mb_items)), key=mb_list.group_lens.__getitem__)
+        for mb_index in range(n_micro_batches):
+            is_dummy = mb_index >= len(mb_items)
+            mb_item = mb_items[dummy_index if is_dummy else mb_index]
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 
             # Lazily create tree attention metadata just before forward.
@@ -769,8 +804,13 @@ class FSDPEngine(TrainEngine):
             for key in tree_attn_keys:
                 del inputs[key]
 
-            ctx_dict = ctx.to_dict()
-            loss = process_output_fn(logits, ctx_dict)
+            if is_dummy:
+                # No output callback: dummy rows must not affect returned
+                # logprobs, loss normalization, or training statistics.
+                loss = None if forward_only else logits.mean() * 0.0
+            else:
+                ctx_dict = ctx.to_dict()
+                loss = process_output_fn(logits, ctx_dict)
 
             if not forward_only and loss is not None:
                 with trace_scope("fsdp_engine.backward"):
@@ -1962,8 +2002,8 @@ class FSDPEngine(TrainEngine):
         mb_list = split_padded_tensor_dict_into_mb_list(
             input_,
             self.config.mb_spec,
-            group=self.data_parallel_group if allow_transport_padding else None,
             allow_transport_padding=allow_transport_padding,
+            sync_mbs=False,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
@@ -2065,6 +2105,7 @@ class FSDPEngine(TrainEngine):
             ulysses_pad_size = 0
 
         inputs.pop("turn_ids", None)
+        inputs.pop("is_truncated", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,
@@ -2284,6 +2325,9 @@ class FSDPPPOActor(FSDPEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
+    def configure_mopd_loss(self, config) -> None:
+        self.actor.configure_mopd_loss(config)
+
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
         return self.actor.compute_logp(*args, **kwargs)
@@ -2291,6 +2335,9 @@ class FSDPPPOActor(FSDPEngine):
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
+
+    def prepare_mopd_batch(self, *args, **kwargs) -> list[dict[str, Any]]:
+        return self.actor.prepare_mopd_batch(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)

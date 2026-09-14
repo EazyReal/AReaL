@@ -2,6 +2,7 @@
 
 from __future__ import annotations  # noqa
 
+import asyncio
 import json
 import os
 import random
@@ -34,15 +35,19 @@ from .workflow_context import WorkflowContext
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
+    concat_tensor_interactions,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
-from areal.utils.data import concat_padded_tensors, cycle_dataloader
+from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
 if TYPE_CHECKING:
     from .remote_inf_engine import RemoteInfEngine
+
+
+_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS = 5.0
 
 
 def check_trajectory_format(
@@ -877,7 +882,6 @@ class WorkflowExecutor:
 
         self.config = config
         self.inference_engine = inference_engine
-
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
         self._staleness_manager = staleness_manager
@@ -1218,6 +1222,39 @@ class WorkflowExecutor:
             f"rejected: {stats.rejected}."
         )
 
+    async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
+        """Best-effort cleanup for remote shards that will not reach training."""
+        shards_by_node = RTensor.collect_shards(traj)
+        if not shards_by_node:
+            return
+
+        async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+            await asyncio.wait_for(
+                RTensor.clear_node(node_addr, shard_ids),
+                timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+            )
+
+        results = await asyncio.gather(
+            *(
+                _clear_node(node_addr, shard_ids)
+                for node_addr, shard_ids in shards_by_node.items()
+            ),
+            return_exceptions=True,
+        )
+        for node_addr, result in zip(shards_by_node, results):
+            if isinstance(result, TimeoutError):
+                self.logger.warning(
+                    "Timed out after %.1fs clearing rejected trajectory shards on %s",
+                    _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+                    node_addr,
+                )
+            elif isinstance(result, BaseException):
+                self.logger.warning(
+                    "Failed to clear rejected trajectory shards on %s: %s",
+                    node_addr,
+                    result,
+                )
+
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
     ) -> Callable[[], Awaitable[WorkflowTaskResult | None]]:
@@ -1257,21 +1294,32 @@ class WorkflowExecutor:
             reason: str | None = None
 
             try:
-                traj = await pending_task.workflow.arun_episode(
-                    self.inference_engine, pending_task.data
-                )
+                workflow_data = pending_task.data
+                if workflow_data is not None:
+                    traj = await pending_task.workflow.arun_episode(
+                        self.inference_engine, workflow_data
+                    )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
+                    format_data = (
+                        {
+                            k: v
+                            for k, v in traj.items()
+                            if k not in {"rollout_reward", "rollout_group"}
+                        }
+                        if "input_ids" in traj
+                        else traj
+                    )
                     check_trajectory_format(
-                        traj,
+                        format_data,
                         expected_keys=self._expected_trajectory_keys,
                         logger=self.logger,
                     )
                     # Track expected keys for consistency checking
                     if isinstance(traj, dict) and "input_ids" in traj:
                         if self._expected_trajectory_keys is None:
-                            self._expected_trajectory_keys = set(traj.keys())
+                            self._expected_trajectory_keys = set(format_data.keys())
                             self.logger.info(
                                 "Trajectory format check: tracking keys %s",
                                 self._expected_trajectory_keys,
@@ -1285,13 +1333,27 @@ class WorkflowExecutor:
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
                     if all(v.has_tensor_data for v in traj.values()):
-                        traj = concat_padded_tensors(
-                            [v.to_tensor_dict() for v in traj.values()]
-                        )
+                        try:
+                            traj = concat_tensor_interactions(traj)
+                        except (TypeError, ValueError) as exc:
+                            raise WorkflowContractError(str(exc)) from exc
                     else:
                         traj = concat_string_interactions(traj)
 
                 assert traj is None or isinstance(traj, dict), traj
+                if traj is not None and "input_ids" in traj:
+                    try:
+                        rows = traj["input_ids"].shape[0]
+                        group = traj.get("rollout_group")
+                        if group is None:
+                            group = RolloutGroup((rows,), (traj.get("rollout_reward"),))
+                        if not isinstance(group, RolloutGroup):
+                            raise ValueError("rollout_group must be a RolloutGroup")
+                        group = group.validate_rows(rows)
+                        traj = {k: v for k, v in traj.items() if k != "rollout_reward"}
+                        traj["rollout_group"] = group
+                    except (TypeError, ValueError) as exc:
+                        raise WorkflowContractError(str(exc)) from exc
 
                 if traj is None:
                     should_accept_traj = False
@@ -1342,6 +1404,7 @@ class WorkflowExecutor:
                     self.logger.info(
                         f"Finish but reject rollout. {self._rollout_stats()}",
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
             except WorkflowContractError as exc:
@@ -1371,6 +1434,7 @@ class WorkflowExecutor:
                     self.logger.error(
                         "Workflow execution failed: %s", exc, exc_info=True
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
         return _execute_workflow
