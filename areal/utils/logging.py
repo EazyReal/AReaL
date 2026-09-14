@@ -60,6 +60,7 @@ LOGGER_COLORS_EXACT = {
     # Stats/Perf - green
     "StatsLogger": "light_green",
     "StatsTracker": "light_green",
+    "InferenceTargets": "light_green",
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
@@ -112,8 +113,10 @@ LOGGER_COLORS_EXACT = {
     "OpenAIProxy": "light_purple",
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
+    "PRMRunner": "light_purple",
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
+    "ArenaStreamAgent": "light_purple",
     "SWETrain": "light_green",
     # Agent Service - purple
     "AgentGateway": "light_purple",

@@ -793,6 +793,8 @@ def split_padded_tensor_dict_into_mb_list(
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
     allow_transport_padding: bool = False,
+    *,
+    sync_mbs: bool = True,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -800,8 +802,10 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
-        allow_transport_padding: Add model-valid rows when synchronized execution
-            requires more micro-batches than local semantic data can provide.
+        allow_transport_padding: Add model-valid rows when execution requires
+            more micro-batches than local semantic data can provide.
+        sync_mbs: Synchronize micro-batch counts across ranks. Engines that pad
+            execution with zero-contribution forwards can disable this.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -848,13 +852,15 @@ def split_padded_tensor_dict_into_mb_list(
             input_lens[-transport_dummy_count // granularity :] = 0
 
         if not allow_transport_padding:
-            group_indices = allocate_balanced_mbs_synced(
-                allocation_spec, input_lens, group=group
+            group_indices = (
+                allocate_balanced_mbs_synced(allocation_spec, input_lens, group=group)
+                if sync_mbs
+                else allocate_balanced_mbs(allocation_spec, input_lens)
             )
             break
 
         group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
-        if not dist.is_initialized():
+        if not sync_mbs or not dist.is_initialized():
             break
         all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
         dist.all_gather_object(all_n_mbs, len(group_indices), group=group)

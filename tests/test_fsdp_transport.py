@@ -16,7 +16,14 @@ from areal.utils.data import (
 )
 
 
-def _make_batch(rank: int, dummy_rank: int, *, tree: bool, vision: bool = True):
+def _make_batch(
+    rank: int,
+    dummy_rank: int,
+    *,
+    tree: bool,
+    vision: bool = True,
+    sync_mbs: bool = True,
+):
     batch_size = 1 if rank == dummy_rank else 2
     data = {
         "input_ids": torch.arange(batch_size * 128).reshape(batch_size, 128),
@@ -36,9 +43,10 @@ def _make_batch(rank: int, dummy_rank: int, *, tree: bool, vision: bool = True):
         )
     mb_list = split_padded_tensor_dict_into_mb_list(
         data,
-        MicroBatchSpec(n_mbs=2),
+        MicroBatchSpec(n_mbs=2 if sync_mbs else 1, max_tokens_per_mb=128),
         group=dist.group.WORLD,
         allow_transport_padding=True,
+        sync_mbs=sync_mbs,
     )
     mb_list.padded_mbs = [
         {key: value for key, value in mb.items() if key != TRANSPORT_DUMMY_KEY}
@@ -64,13 +72,15 @@ def _check_fsdp_transport_ranks(rank: int, rendezvous: str) -> None:
         engine.parallel_helper = SimpleNamespace(sp_size=1)
         engine.model = Mock(side_effect=AssertionError("model must not run"))
 
-        for tree in (False, True):
+        for tree, sync_mbs in ((False, True), (False, False), (True, True)):
             engine.enable_tree_training = tree
             for dummy_rank in (0, 1):
-                mb_list = _make_batch(rank, dummy_rank, tree=tree)
+                mb_list = _make_batch(rank, dummy_rank, tree=tree, sync_mbs=sync_mbs)
                 assert any(
                     mb.get(TRANSPORT_DUMMY_KEY) is True for mb in mb_list.mbs
-                ) == (rank == dummy_rank)
+                ) == (sync_mbs and rank == dummy_rank)
+                if not sync_mbs:
+                    assert len(mb_list.mbs) == (1 if rank == dummy_rank else 2)
                 for forward_only in (False, True):
                     with pytest.raises(ValueError, match="FSDP transport padding"):
                         engine.forward_backward_batch(
