@@ -6,9 +6,6 @@ import signal
 import threading
 import time
 
-from math_verify.grader import verify as math_verify_verify
-from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
-
 from areal.utils import logging
 
 logger = logging.getLogger("RewardUtils")
@@ -60,6 +57,8 @@ class MathVerifyWorker:
         precision: int = 6,
         timeout: float | None = 5.0,
     ):
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+
         self.gold_extraction_target = (
             ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
             LatexExtractionConfig(),
@@ -73,6 +72,9 @@ class MathVerifyWorker:
 
     def _verify_impl(self, response: str, ground_truth: str) -> float:
         """Core verification logic without timeout wrapper."""
+        from math_verify.grader import verify as math_verify_verify
+        from math_verify.parser import parse
+
         gold_parsed = parse(
             ground_truth,
             extraction_config=self.gold_extraction_target,
@@ -175,6 +177,7 @@ __all__ = [
     "gsm8k_reward_fn",
     "geometry3k_reward_fn",
     "clevr_count_70k_reward_fn",
+    "if_gap_reward_fn",
 ]
 
 
@@ -182,6 +185,7 @@ _LAZY_IMPORTS = {
     "gsm8k_reward_fn": "areal.reward.gsm8k",
     "geometry3k_reward_fn": "areal.reward.geometry3k",
     "clevr_count_70k_reward_fn": "areal.reward.clevr_count_70k",
+    "if_gap_reward_fn": "areal.reward.if_gap",
 }
 
 
