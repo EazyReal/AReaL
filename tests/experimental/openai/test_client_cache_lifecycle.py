@@ -21,7 +21,7 @@ async def test_prompt_construction_failure_discards_cached_interaction(api):
 
     with (
         patch(
-            "areal.experimental.openai.client.concat_prompt_token_ids_with_parent",
+            "areal.experimental.openai.client._concat_prompt_token_ids_with_parent",
             side_effect=ValueError("invalid parent token prefix"),
         ),
         pytest.raises(ValueError, match="invalid parent token prefix"),
