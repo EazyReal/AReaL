@@ -1026,6 +1026,7 @@ class WorkflowExecutor:
         traj: dict[str, Any] | None,
         task_id: int,
         is_eval: bool,
+        sample_metadata: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, str]:
         if traj is None:
             return False, "trajectory is None"
@@ -1079,6 +1080,12 @@ class WorkflowExecutor:
 
             # Handle batched trajectories
             batch_size = input_ids.shape[0]
+            if sample_metadata is not None and len(sample_metadata) != batch_size:
+                return (
+                    False,
+                    "sample metadata count does not match trajectory batch size: "
+                    f"{len(sample_metadata)} != {batch_size}",
+                )
 
             file_path = os.path.join(version_dir, f"{task_id}.jsonl")
             async with aiofiles.open(file_path, "a") as f:
@@ -1119,6 +1126,20 @@ class WorkflowExecutor:
                     }
                     if split["segments"] is not None:
                         record["segments"] = split["segments"]
+                    if sample_metadata is not None and sample_metadata[i]:
+                        metadata = sample_metadata[i]
+                        record["metadata"] = metadata
+                        # Promote stable Arena join fields so rollout and
+                        # arena_results shards can be joined directly without
+                        # parsing nested metadata or relying on row order.
+                        for key in (
+                            "session_id",
+                            "arena_task_id",
+                            "arena_status",
+                            "harness_outcome_code",
+                        ):
+                            if key in metadata:
+                                record[key] = metadata[key]
 
                     original_rewards = traj.get("original_rewards")
                     if original_rewards is not None:
@@ -1289,6 +1310,7 @@ class WorkflowExecutor:
 
             manager = self.staleness_manager
             traj: dict[str, Any] | None = None
+            trajectory_metadata: list[dict[str, Any]] | None = None
             should_accept_fn = pending_task.should_accept_fn
             should_accept: bool | None = None
             reason: str | None = None
@@ -1332,6 +1354,13 @@ class WorkflowExecutor:
                 if isinstance(traj, dict) and all(
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
+                    if self.config.dump_to_file:
+                        # rollout_post hooks currently only augment the tensor
+                        # dict. They must preserve batch row order so this
+                        # side-channel stays aligned with concatenated branches.
+                        trajectory_metadata = [
+                            dict(v.metadata or {}) for v in traj.values()
+                        ]
                     if all(v.has_tensor_data for v in traj.values()):
                         try:
                             traj = concat_tensor_interactions(traj)
@@ -1370,7 +1399,10 @@ class WorkflowExecutor:
                 # Dump trajectory to file
                 if self.config.dump_to_file:
                     dump_success, dump_reason = await self._dump_trajectory(
-                        traj, task_id, pending_task.is_eval
+                        traj,
+                        task_id,
+                        pending_task.is_eval,
+                        sample_metadata=trajectory_metadata,
                     )
                     if not dump_success:
                         self.logger.warning(
