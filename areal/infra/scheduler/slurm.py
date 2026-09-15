@@ -57,6 +57,34 @@ from areal.utils.offload import get_tms_env_vars
 logger = logging.getLogger("SlurmScheduler")
 
 
+def _resolve_fork_python_executable(spec: SchedulingSpec | None) -> str:
+    """Resolve Python inside the worker that will own a forked process."""
+    if spec is None or not spec.cmd:
+        return sys.executable
+    try:
+        command = shlex.split(spec.cmd)
+    except ValueError:
+        return sys.executable
+    if not command:
+        return sys.executable
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(command[0]).name):
+        try:
+            module_flag = command.index("-m", 1)
+        except ValueError:
+            pass
+        else:
+            if module_flag + 1 < len(command):
+                return command[0]
+    return sys.executable
+
+
+def _resolve_srun_additional_args(spec: SchedulingSpec, scheduler_args: str) -> str:
+    """Prefer an explicit role override while preserving scheduler defaults."""
+    if spec.srun_additional_args != SchedulingSpec().srun_additional_args:
+        return spec.srun_additional_args
+    return scheduler_args
+
+
 @dataclass
 class SlurmWorkerInfo:
     """Slurm worker information."""
@@ -494,6 +522,7 @@ class SlurmScheduler(Scheduler):
         target_wi: SlurmWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> SlurmWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -504,12 +533,21 @@ class SlurmScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
+        port_cnt = len(target_wi.worker.worker_ports)
+        ports_reserved = False
 
         try:
             # 1. Allocate a port on the target guard
             async with session.post(
                 f"{guard_url}/alloc_ports",
-                json={"count": 1},
+                json={
+                    "count": port_cnt,
+                    "role": role,
+                    "worker_index": idx,
+                    "exclude_ports": [
+                        int(port) for port in target_wi.worker.worker_ports
+                    ],
+                },
             ) as alloc_resp:
                 if alloc_resp.status != 200:
                     error_text = await alloc_resp.text()
@@ -520,12 +558,14 @@ class SlurmScheduler(Scheduler):
                     )
                 alloc_data = await alloc_resp.json()
                 forked_host = alloc_data["host"]
-                forked_port = alloc_data["ports"][0]
+                forked_ports = alloc_data["ports"]
+                forked_port = forked_ports[0]
+                ports_reserved = True
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
             raw_cmd = [
-                sys.executable,
+                _resolve_fork_python_executable(target_wi.spec),
                 "-m",
                 module_path,
                 "--host",
@@ -557,6 +597,7 @@ class SlurmScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -602,34 +643,31 @@ class SlurmScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except aiohttp.ClientError as e:
-            raise WorkerCreationError(
-                role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
-                str(e),
-            ) from e
+        except BaseException as e:
+            if ports_reserved:
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        async with session.post(
+                            f"{guard_url}/{endpoint}",
+                            json={"role": role, "worker_index": idx},
+                        ):
+                            pass
+                    except Exception:
+                        pass
+            if isinstance(e, aiohttp.ClientError):
+                raise WorkerCreationError(
+                    role,
+                    f"Failed to fork worker {idx} from {target_role}/{idx}",
+                    str(e),
+                ) from e
+            raise
 
         worker = Worker(
             id=worker_id,
             ip=forked_host,
-            worker_ports=[str(forked_port)],
+            worker_ports=list(map(str, forked_ports)),
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
-        if port_cnt > 1:
-            async with session.post(
-                f"http://{format_hostport(forked_host, forked_port)}/alloc_ports",
-                json=dict(count=port_cnt - 1),
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise WorkerCreationError(
-                        role,
-                        f"Fork failed for worker {idx}",
-                        f"HTTP {response.status}: {error_text}",
-                    )
-                new_ports = (await response.json())["ports"]
-                worker.worker_ports += list(map(str, new_ports))
 
         return SlurmWorkerInfo(
             worker=worker,
@@ -707,6 +745,7 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         target_workers: list[SlurmWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -724,7 +763,13 @@ class SlurmScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -770,9 +815,15 @@ class SlurmScheduler(Scheduler):
         )
 
         # Configure forked workers if exp_config is available
-        if self.exp_config is not None:
-            for worker_rank, worker_info in enumerate(workers):
-                self._configure_worker(worker_info, worker_rank)
+        try:
+            if self.exp_config is not None:
+                for worker_rank, worker_info in enumerate(workers):
+                    self._configure_worker(worker_info, worker_rank)
+        except BaseException:
+            await self._cleanup_forked_workers_async(role, target_role, workers)
+            self._workers.pop(role, None)
+            self._colocated_roles.pop(role, None)
+            raise
 
         return worker_ids
 
@@ -781,6 +832,7 @@ class SlurmScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -813,6 +865,7 @@ class SlurmScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -898,24 +951,37 @@ class SlurmScheduler(Scheduler):
 
         bash_cmds = (spec.additional_bash_cmds or []).copy()
 
-        # Set CUDA_VISIBLE_DEVICES based on SLURM_LOCALID before any Python imports.
-        # This MUST happen before Python starts, otherwise CUDA runtime ignores the
-        # env var change once it's initialized.
-        # We use bash commands instead of env_vars_dict because SLURM_LOCALID is only
-        # available at runtime and each task needs a different value.
+        # Slice Slurm's node-local allocation before CUDA is initialized. Rebuilding
+        # device IDs from zero can put separate jobs on the same physical GPU.
+        # Preserve the runtime namespace, including cgroup remapping and UUIDs.
         if total_gpus > 0:
             gpus_per_task = spec.gpu
-            if gpus_per_task == 1:
-                cuda_setup_cmd = (
-                    f"export CUDA_VISIBLE_DEVICES=$((SLURM_LOCALID * {gpus_per_task}))"
-                )
-            else:
-                cuda_setup_cmd = (
-                    f"export CUDA_VISIBLE_DEVICES=$(seq -s, $((SLURM_LOCALID * {gpus_per_task})) "
-                    f"$((SLURM_LOCALID * {gpus_per_task} + {gpus_per_task} - 1)))"
-                )
+            cuda_setup_cmd = (
+                f"areal_device_offset=$((SLURM_LOCALID * {gpus_per_task}));\n"
+                'if [[ -z "${CUDA_VISIBLE_DEVICES-}" && -z "${ASCEND_RT_VISIBLE_DEVICES-}" ]]; then\n'
+                '  echo "Missing Slurm-visible device allocation" >&2; exit 1;\n'
+                "fi;\n"
+                "for areal_device_var in CUDA_VISIBLE_DEVICES ASCEND_RT_VISIBLE_DEVICES; do\n"
+                '  [[ -v "$areal_device_var" ]] || continue;\n'
+                '  areal_visible="${!areal_device_var}";\n'
+                '  [[ -n "$areal_visible" ]] || continue;\n'
+                '  if [[ "$areal_visible" == ,* || '
+                '"$areal_visible" == *, || "$areal_visible" == *,,* || '
+                '",$areal_visible," == *,-1,* ]]; then\n'
+                '    echo "Invalid Slurm-visible device allocation" >&2; exit 1;\n'
+                "  fi;\n"
+                '  IFS=, read -r -a areal_devices <<< "$areal_visible";\n'
+                f"  if (( ${{#areal_devices[@]}} < areal_device_offset + {gpus_per_task} )); then\n"
+                '    echo "Insufficient Slurm-visible devices for worker '
+                '${SLURM_LOCALID}; expected a node-local device allocation" >&2; exit 1;\n'
+                "  fi;\n"
+                '  printf -v "$areal_device_var" "%s" "$(IFS=,; echo '
+                f'"${{areal_devices[*]:areal_device_offset:{gpus_per_task}}}")";\n'
+                '  export "$areal_device_var";\n'
+                "done"
+            )
             # Also set ASCEND_RT_VISIBLE_DEVICES for Ascend NPU compatibility
-            ascend_setup_cmd = "export ASCEND_RT_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+            ascend_setup_cmd = 'export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES-${CUDA_VISIBLE_DEVICES-}}"'
             bash_cmds.insert(0, cuda_setup_cmd)
             bash_cmds.insert(1, ascend_setup_cmd)
 
@@ -950,9 +1016,10 @@ class SlurmScheduler(Scheduler):
         merged_log = self._merged_log_path()
 
         # Build srun command with streaming log pipeline
-        srun_cmd = (
-            f"srun {self.srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
+        srun_additional_args = _resolve_srun_additional_args(
+            spec, self.srun_additional_args
         )
+        srun_cmd = f"srun {srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
         log_pipeline = build_streaming_log_cmd(srun_cmd, role_log, merged_log, role)
 
         # Complete sbatch script with single srun command
@@ -1028,7 +1095,11 @@ class SlurmScheduler(Scheduler):
                 # Check if fork mode is enabled
                 if strategy.fork:
                     # Fork mode: spawn new processes on same nodes via /fork endpoint
-                    return self.fork_workers(role, colocate_role)
+                    return self.fork_workers(
+                        role,
+                        colocate_role,
+                        env_vars=[scheduling.env_vars for scheduling in schedulings],
+                    )
 
                 # Reuse existing workers - no new Slurm job submitted
                 worker_ids = [w.worker.id for w in target_workers]
@@ -1186,6 +1257,7 @@ class SlurmScheduler(Scheduler):
         """
         # Handle colocated/forked roles
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers in _workers
             if role in self._workers:
                 workers = self._workers[role]
@@ -1375,9 +1447,19 @@ class SlurmScheduler(Scheduler):
 
         # Handle colocated/forked role
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers that need cleanup
             if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
+                try:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        self._workers[role],
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup forked role '{role}': {e}")
                 del self._workers[role]
             else:
                 logger.info(f"Removing colocated role '{role}' mapping")

@@ -131,6 +131,6 @@ def test_ppo_actor_reports_one_peak_for_each_outer_phase(monkeypatch):
         ("batch", {}),
         ("exit", "ref logp"),
         ("enter", "actor ppo update"),
-        ("batch", {"unpack": False}),
+        ("batch", {"unpack": False, "pass_meta": True}),
         ("exit", "actor ppo update"),
     ]
