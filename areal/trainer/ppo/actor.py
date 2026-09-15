@@ -7,12 +7,7 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.api.cli_args import (
-    MicroBatchSpec,
-    MOPDLossConfig,
-    PPOActorConfig,
-    RejectionSamplingConfig,
-)
+from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
@@ -43,7 +38,8 @@ from areal.utils.data import (
     batched_call,
     concat_batch,
     is_multi_modal_key,
-    split_padded_tensor_dict_into_mb_list,
+    normalize_rollout_rewards,
+    split_training_batch_into_microbatches,
 )
 from areal.utils.functional import (
     apply_rejection_sampling,
@@ -52,13 +48,111 @@ from areal.utils.functional import (
     reward_overlong_penalty,
     sapo_loss_fn,
 )
-from areal.utils.functional.loss_aggregation import PolicyGradientReduction
+from areal.utils.functional.loss_aggregation import (
+    LossAggregationMode,
+    PolicyGradientReduction,
+)
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
 
 logger = logging.getLogger("PPOActor")
+
+
+def _group_training_metrics(
+    loss_mask: torch.Tensor,
+    group_sizes: list[int],
+    logical_group_sizes: list[int] | None = None,
+    loss_aggregation: LossAggregationMode = "token_mean",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = loss_mask.shape[0]
+    if any(size < 1 for size in group_sizes) or sum(group_sizes) != batch_size:
+        raise ValueError(
+            f"group_sizes must be positive and sum to batch size {batch_size}, "
+            f"got {group_sizes}"
+        )
+
+    group_starts = torch.zeros(batch_size, dtype=torch.bool, device=loss_mask.device)
+    usable_group_sizes = torch.zeros(
+        batch_size, dtype=torch.float32, device=loss_mask.device
+    )
+    group_loss_weights = torch.zeros_like(usable_group_sizes)
+    sizes = torch.tensor(group_sizes, dtype=torch.long, device=loss_mask.device)
+    ends = sizes.cumsum(0)
+    starts = ends - sizes
+    token_counts = loss_mask.reshape(batch_size, -1).sum(1, dtype=torch.float32)
+    unit_counts = (
+        token_counts if loss_aggregation == "token_mean" else (token_counts > 0).float()
+    )
+    cumulative_units = torch.nn.functional.pad(unit_counts.cumsum(0), (1, 0))
+
+    group_starts[starts] = True
+    usable_group_sizes[starts] = torch.tensor(
+        logical_group_sizes if logical_group_sizes is not None else group_sizes,
+        dtype=usable_group_sizes.dtype,
+        device=loss_mask.device,
+    )
+    weights = cumulative_units[ends] - cumulative_units[starts]
+    if loss_aggregation == "prompt_mean":
+        weights = (weights > 0).float()
+    group_loss_weights[starts] = weights
+    return group_starts, usable_group_sizes, group_loss_weights
+
+
+def _shape_advantages_with_gvpo(
+    advantages: torch.Tensor,
+    token_advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    negative_scale: float,
+    zero_penalty: float,
+    zero_eps: float,
+) -> torch.Tensor:
+    """Shape outcome advantages where a negative process signal marks failure."""
+    for name, value in (
+        ("negative_scale", negative_scale),
+        ("zero_penalty", zero_penalty),
+        ("zero_eps", zero_eps),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"GVPO {name} must be finite and non-negative, got {value}"
+            )
+
+    failed_mask = (token_advantages < 0) & loss_mask.bool()
+    negative_mask = failed_mask & (advantages < -zero_eps)
+    zero_mask = failed_mask & (advantages.abs() <= zero_eps)
+    positive_mask = failed_mask & (advantages > zero_eps)
+
+    shaped = torch.where(
+        negative_mask,
+        advantages * (1.0 + negative_scale),
+        advantages,
+    )
+    shaped = torch.where(zero_mask, torch.full_like(shaped, -zero_penalty), shaped)
+    return shaped.masked_fill(positive_mask, 0.0)
+
+
+def _shape_advantages_with_process_weighting(
+    advantages: torch.Tensor,
+    process_rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Combine outcome advantages with process rewards in ``[0, 1]``."""
+    active_mask = loss_mask.bool()
+    rewards_in_range = (process_rewards >= 0) & (process_rewards <= 1)
+    torch._assert_async(
+        torch.all(rewards_in_range | ~active_mask),
+        "Process-weighted advantage shaping requires process rewards in [0, 1]",
+    )
+
+    shaped = torch.where(
+        advantages >= 0,
+        advantages * process_rewards,
+        torch.where(process_rewards > 0, process_rewards, advantages),
+    )
+    return torch.where(active_mask, shaped, advantages)
 
 
 def _infer_prompt_lens(
@@ -119,6 +213,7 @@ class PPOActor:
         )
         self.gae_timestep_unit = config.gae_timestep_unit
         self.mask_no_eos_with_zero = config.mask_no_eos_with_zero
+        self.token_rewards_as_adv = config.token_rewards_as_adv
 
         self.temperature = config.temperature
 
@@ -227,8 +322,23 @@ class PPOActor:
         self.engine.assert_mopd_runtime_topology()
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
-    def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data, pass_meta=True)
+    def compute_advantages(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        advantage_shaping_mode: str = "additive",
+        gvpo_negative_scale: float = 0.2,
+        gvpo_zero_penalty: float = 0.4,
+        gvpo_zero_eps: float = 1e-6,
+    ) -> list[dict[str, Any]]:
+        compute_fn = functools.partial(
+            self._compute_advantages,
+            advantage_shaping_mode=advantage_shaping_mode,
+            gvpo_negative_scale=gvpo_negative_scale,
+            gvpo_zero_penalty=gvpo_zero_penalty,
+            gvpo_zero_eps=gvpo_zero_eps,
+        )
+        return batched_call(compute_fn, data, pass_meta=True)
 
     @trace_perf("ppo_actor.prepare_mopd_batch", category="compute")
     def prepare_mopd_batch(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -250,15 +360,47 @@ class PPOActor:
         return data
 
     def _compute_advantages(
-        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+        self,
+        data: dict[str, Any],
+        meta: TrajBatchMeta | None = None,
+        *,
+        advantage_shaping_mode: str = "additive",
+        gvpo_negative_scale: float = 0.2,
+        gvpo_zero_penalty: float = 0.4,
+        gvpo_zero_eps: float = 1e-6,
     ) -> dict[str, Any]:
+        if advantage_shaping_mode not in {"additive", "gvpo", "process_weighted"}:
+            raise ValueError(
+                f"Invalid PRM advantage shaping mode: {advantage_shaping_mode!r}"
+            )
+        if (
+            advantage_shaping_mode in {"gvpo", "process_weighted"}
+            and not self.token_rewards_as_adv
+        ):
+            raise ValueError(
+                f"{advantage_shaping_mode!r} advantage shaping requires "
+                "token_rewards_as_adv=True"
+            )
+        if advantage_shaping_mode == "process_weighted" and self.mask_no_eos_with_zero:
+            raise ValueError(
+                "'process_weighted' advantage shaping is incompatible with "
+                "mask_no_eos_with_zero=True"
+            )
+
         bs = data["input_ids"].shape[0]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
 
+        unpenalized_rewards = None
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
+            if (
+                self.reward_norm
+                and meta is not None
+                and meta.rollout_groups is not None
+            ):
+                unpenalized_rewards = data["rewards"].clone()
             overlong_tokens = self.config.overlong_tokens
             overlong_penalty_factor = self.config.overlong_penalty_factor
 
@@ -283,9 +425,21 @@ class PPOActor:
         # fixed-group-size behavior.
         group_sizes = meta.traj_group_sizes if meta is not None else None
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
+            if meta is not None and meta.rollout_groups is not None:
+                reward_score = normalize_rollout_rewards(
+                    data["rewards"],
+                    self.reward_norm,
+                    meta,
+                    reward_bias=self.reward_bias,
+                    reward_scaling=self.reward_scaling,
+                    reward_clip=self.reward_clip,
+                    unpenalized_rewards=unpenalized_rewards,
+                )
+            else:
+                reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
-        loss_mask = data["loss_mask"].float()
+        token_loss_mask = data["loss_mask"].bool()
+        loss_mask = token_loss_mask.float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
 
         if "mopd_teacher_logp_sum" in data:
@@ -355,6 +509,51 @@ class PPOActor:
         else:
             rewards = gae_kl_rewards + gae_outcome_rewards
 
+        token_advantages = None
+        token_rewards = data.get("token_rewards")
+        if token_rewards is not None:
+            if token_rewards.shape != rewards.shape:
+                raise ValueError(
+                    "token_rewards must match the padded sequence shape: "
+                    f"expected {tuple(rewards.shape)}, got {tuple(token_rewards.shape)}"
+                )
+            aligned_token_rewards = token_rewards.to(
+                device=rewards.device, dtype=rewards.dtype
+            )
+            if self.mask_no_eos_with_zero:
+                aligned_token_rewards = torch.where(
+                    seq_truncated_mask.unsqueeze(-1),
+                    torch.zeros_like(aligned_token_rewards),
+                    aligned_token_rewards,
+                )
+            rolled_token_rewards = torch.roll(
+                aligned_token_rewards,
+                shifts=-1,
+                dims=-1,
+            )
+            if self.token_rewards_as_adv:
+                token_advantages = rolled_token_rewards * loss_mask
+            else:
+                adjacent_turn_tokens = token_loss_mask[:, :-1] & token_loss_mask[:, 1:]
+                if turn_ids is not None:
+                    raw_turn_ids = data["turn_ids"]
+                    adjacent_turn_tokens &= raw_turn_ids[:, :-1] == raw_turn_ids[:, 1:]
+                adjacent_rewards_match = (
+                    aligned_token_rewards[:, :-1] == aligned_token_rewards[:, 1:]
+                ) | ~adjacent_turn_tokens.to(device=aligned_token_rewards.device)
+                torch._assert_async(
+                    torch.all(adjacent_rewards_match),
+                    "token_rewards_as_adv=False requires uniform token rewards "
+                    "within each turn; use token_rewards_as_adv=True for dense "
+                    "or sparse per-token rewards.",
+                )
+                next_mask = torch.zeros_like(loss_mask)
+                next_mask[:, :-1] = loss_mask[:, 1:]
+                if turn_ids is not None:
+                    next_mask[:, :-1] *= turn_ids[:, :-1] == turn_ids[:, 1:]
+                is_turn_end = loss_mask * (1 - next_mask)
+                rewards = rewards + rolled_token_rewards * is_turn_end
+
         # Compute GAE.
         if "values" not in data:
             values = torch.zeros_like(rewards)
@@ -396,12 +595,43 @@ class PPOActor:
         if self.adv_norm is not None:
             # Use the same actual trajectory group sizes as reward normalization;
             # ignored when adv_norm is batch-level.
-            advantages = self.adv_norm(advantages, loss_mask, group_sizes=group_sizes)
+            advantages = self.adv_norm(
+                advantages,
+                loss_mask,
+                group_sizes=group_sizes,
+                group_member_counts=meta.logical_group_sizes
+                if meta is not None
+                else None,
+            )
+
+        if token_advantages is not None:
+            if advantage_shaping_mode == "gvpo":
+                advantages = _shape_advantages_with_gvpo(
+                    advantages,
+                    token_advantages,
+                    loss_mask,
+                    negative_scale=gvpo_negative_scale,
+                    zero_penalty=gvpo_zero_penalty,
+                    zero_eps=gvpo_zero_eps,
+                )
+            elif advantage_shaping_mode == "process_weighted":
+                advantages = _shape_advantages_with_process_weighting(
+                    advantages,
+                    token_advantages,
+                    loss_mask,
+                )
+            else:
+                advantages = advantages + token_advantages
 
         # Store data in the dict.
         data["advantages"] = advantages
         data["kl_rewards"] = kl_rewards
-        data["tot_rewards"] = gae_kl_rewards + gae_outcome_rewards
+        # ``rewards`` contains every signal consumed by GAE, including folded
+        # process rewards. Turn-level GAE deliberately excludes token-level KL
+        # from ``rewards``, so add it back only for the monitoring metric.
+        data["tot_rewards"] = (
+            rewards + gae_kl_rewards if self.gae_timestep_unit == "turn" else rewards
+        )
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
@@ -455,9 +685,11 @@ class PPOActor:
             # Each input dict is one prompt group; concat_batch records that
             # batch dim so microbatch splits cannot cut a group in half.
             batched["group_sizes"] = meta.traj_group_sizes
-        self._ppo_update(batched)
+        self._ppo_update(batched, meta)
 
-    def _ppo_update(self, data: dict[str, Any]) -> None:
+    def _ppo_update(
+        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+    ) -> None:
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -490,6 +722,15 @@ class PPOActor:
             n_valid_tokens=loss_mask.bool(),
             **result_denominators,
         )
+        group_metrics = None
+        if meta is not None:
+            group_metrics = _group_training_metrics(
+                loss_mask,
+                meta.traj_group_sizes,
+                meta.logical_group_sizes,
+                self.config.loss_aggregation,
+            )
+            global_denominators["n_groups"] = group_metrics[0]
         stats_tracker.denominator(**global_denominators)
         stats_tracker.stat(
             correct_seq_len=seqlens.float(), denominator="correct_n_seqs"
@@ -519,6 +760,22 @@ class PPOActor:
             seq_len=seqlens.float(),
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
+        if group_metrics is not None:
+            group_starts, usable_group_sizes, group_loss_weights = group_metrics
+            stats_tracker.stat(
+                usable_group_size=usable_group_sizes,
+                group_loss_weight=group_loss_weights,
+                denominator="n_groups",
+            )
+            for group_size in sorted(set(meta.logical_group_sizes)):
+                denominator = f"n_groups_size_{group_size}"
+                stats_tracker.denominator(
+                    **{denominator: group_starts & (usable_group_sizes == group_size)}
+                )
+                stats_tracker.stat(
+                    denominator=denominator,
+                    **{f"group_loss_weight_size_{group_size}": group_loss_weights},
+                )
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
@@ -544,7 +801,13 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards", "is_truncated"]:
+        for key in [
+            "rewards",
+            "tot_rewards",
+            "kl_rewards",
+            "is_truncated",
+            "token_rewards",
+        ]:
             data.pop(key, None)
         # Megatron keeps the full batch on CPU and streams only the current
         # microbatch to the accelerator. Stage before the outer PPO split so
@@ -552,9 +815,10 @@ class PPOActor:
         stage_batch_for_engine(data, self.engine)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
-        mb_inputs = split_padded_tensor_dict_into_mb_list(
+        mb_inputs = split_training_batch_into_microbatches(
             data,
-            mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            n_mbs=self.config.ppo_n_minibatches,
+            group=self.engine.data_parallel_group,
         )
 
         with stats_tracker.scope("update"):
@@ -565,7 +829,7 @@ class PPOActor:
                 divisor=self.config.loss_aggregation_divisor,
             )
 
-            for mb in mb_inputs.mbs:
+            for mb in mb_inputs:
                 loss_fn = functools.partial(
                     grpo_loss_fn,
                     eps_clip=self.config.eps_clip,

@@ -7,8 +7,13 @@ import torch
 from omegaconf import OmegaConf
 
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig
-from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
-from areal.utils.data import split_padded_tensor_dict_into_mb_list
+from areal.trainer.ppo.actor import PPOActor, _group_training_metrics, grpo_loss_fn
+from areal.utils.data import (
+    RolloutGroup,
+    make_transport_microbatch,
+    split_padded_tensor_dict_into_mb_list,
+    split_training_batch_into_microbatches,
+)
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 
 LOSS = torch.tensor(
@@ -258,15 +263,23 @@ def test_nested_split_preserves_prompt_group_sizes():
         "group_sizes": [2, 2],
     }
 
-    ppo_mbs = split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(n_mbs=2))
-    assert sorted(tuple(mb["group_sizes"]) for mb in ppo_mbs.mbs) == [(2,), (2,)]
+    ppo_mbs = split_training_batch_into_microbatches(data, n_mbs=2)
+    assert sorted(tuple(mb["group_sizes"]) for mb in ppo_mbs) == [(2,), (2,)]
 
-    for mb in ppo_mbs.mbs:
+    for mb in ppo_mbs:
         engine_mbs = split_padded_tensor_dict_into_mb_list(mb, MicroBatchSpec(n_mbs=1))
         assert len(engine_mbs.mbs) == 1
         nested = engine_mbs.mbs[0]
         assert nested["group_sizes"] == [2]
         assert nested["attention_mask"].shape[0] == 2
+
+    with pytest.raises(RuntimeError, match="at least 3 groups"):
+        split_training_batch_into_microbatches(data, n_mbs=3)
+    dummy = make_transport_microbatch(data)
+    assert "group_sizes" not in dummy
+    assert (
+        len(split_padded_tensor_dict_into_mb_list(dummy, MicroBatchSpec(n_mbs=1))) == 1
+    )
 
 
 def test_prompt_mean_uses_trajectory_group_metadata():
@@ -274,7 +287,11 @@ def test_prompt_mean_uses_trajectory_group_metadata():
     actor.config = PPOActorConfig(loss_aggregation="prompt_mean")
     actor._ppo_update = MagicMock()
     data = [
-        {"attention_mask": torch.ones(2, 2), "loss_mask": torch.ones(2, 2)},
+        {
+            "attention_mask": torch.ones(2, 2),
+            "loss_mask": torch.ones(2, 2),
+            "rollout_group": RolloutGroup((2,)),
+        },
         {"attention_mask": torch.ones(1, 2), "loss_mask": torch.ones(1, 2)},
     ]
 
@@ -282,6 +299,36 @@ def test_prompt_mean_uses_trajectory_group_metadata():
 
     batched = actor._ppo_update.call_args.args[0]
     assert batched["group_sizes"] == [2, 1]
+    meta = actor._ppo_update.call_args.args[1]
+    assert meta.logical_group_sizes == [1, 1]
+
+
+def test_transport_padding_accepts_explicitly_absent_group_sizes():
+    data = {
+        "input_ids": torch.ones(1, 2, dtype=torch.long),
+        "attention_mask": torch.ones(1, 2),
+        "group_sizes": None,
+    }
+    result = split_padded_tensor_dict_into_mb_list(
+        data, MicroBatchSpec(n_mbs=2), allow_transport_padding=True, sync_mbs=False
+    )
+    assert result.transport_dummy_count == 1
+    assert len(result) == 2
+
+
+@pytest.mark.parametrize(
+    "mode,weights",
+    [
+        ("token_mean", [5.0, 1.0]),
+        ("seq_mean", [2.0, 1.0]),
+        ("prompt_mean", [1.0, 1.0]),
+        ("constant", [2.0, 1.0]),
+    ],
+)
+def test_group_weight_metrics_follow_loss_aggregation(mode, weights):
+    starts, sizes, actual = _group_training_metrics(MASK, [2, 1], [1, 1], mode)
+    torch.testing.assert_close(actual[starts], torch.tensor(weights), rtol=0, atol=0)
+    torch.testing.assert_close(sizes[starts], torch.ones(2), rtol=0, atol=0)
 
 
 def test_m2_mask_narrows_numerator_but_preserves_original_denominator():

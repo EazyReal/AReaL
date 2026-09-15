@@ -21,6 +21,16 @@ def _check_atomic_group_failure(rank, rendezvous, scenario, explicit_group):
     )
     try:
         group = dist.new_group(backend="gloo") if explicit_group else None
+        # Only one rank splits here: sync_mbs=False must stay entirely local.
+        if rank == 0:
+            local = {
+                "input_ids": torch.ones(2, 1, dtype=torch.long),
+                "attention_mask": torch.ones(2, 1),
+                "group_sizes": [2],
+            }
+            split_padded_tensor_dict_into_mb_list(
+                local, MicroBatchSpec(n_mbs=1), sync_mbs=False
+            )
         if scenario == "oversized":
             lengths = [8] if rank == 0 else [4]
         else:

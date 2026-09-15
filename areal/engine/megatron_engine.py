@@ -52,6 +52,7 @@ from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConf
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
+    compute_microbatch_loss_weight,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
 )
@@ -68,6 +69,11 @@ from areal.engine.core.model import (
     resolve_sequence_packing_mode,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils.bailing_v3 import (
+    BailingV3MlaWeightPairs,
+    is_bailing_v3,
+    validate_bailing_v3_weight_update,
+)
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -89,6 +95,7 @@ from areal.engine.megatron_utils.packed_context_parallel import (
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
+from areal.engine.megatron_utils.transport import validate_transport_padding
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
@@ -1017,6 +1024,7 @@ class MegatronEngine(TrainEngine):
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
@@ -1024,6 +1032,7 @@ class MegatronEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )
@@ -1038,6 +1047,7 @@ class MegatronEngine(TrainEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -1046,6 +1056,7 @@ class MegatronEngine(TrainEngine):
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -1130,9 +1141,41 @@ class MegatronEngine(TrainEngine):
                         "(e.g., LoRA path without distributed optimizer support). "
                         "Please use weight_format='hf' for adapter/full-model export."
                     )
-                self.checkpointer.save_checkpoint(
-                    meta.path, with_optimizer=meta.with_optim
+                pointer_fields = (
+                    meta.checkpoint_pointer_path,
+                    meta.checkpoint_pointer_value,
                 )
+                if (pointer_fields[0] is None) != (pointer_fields[1] is None):
+                    raise ValueError(
+                        "checkpoint_pointer_path and checkpoint_pointer_value "
+                        "must be provided together"
+                    )
+                finalize_fn = None
+                if meta.checkpoint_pointer_path is not None:
+                    from areal.utils.checkpoint_pointer import (
+                        LATEST_FILENAME,
+                        publish_latest,
+                    )
+
+                    if (
+                        os.path.basename(meta.checkpoint_pointer_path)
+                        != LATEST_FILENAME
+                    ):
+                        raise ValueError(
+                            "checkpoint_pointer_path must name the recovery "
+                            f"pointer {LATEST_FILENAME!r}"
+                        )
+                    finalize_fn = functools.partial(
+                        publish_latest,
+                        os.path.dirname(meta.checkpoint_pointer_path),
+                        meta.checkpoint_pointer_value,
+                    )
+                save_kwargs: dict[str, Any] = {"with_optimizer": meta.with_optim}
+                if finalize_fn is not None:
+                    save_kwargs["finalize_fn"] = finalize_fn
+                self.checkpointer.save_checkpoint(meta.path, **save_kwargs)
+                if meta.wait_for_async_save:
+                    self.checkpointer.wait_async_saves()
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
@@ -1216,6 +1259,12 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
+        validate_transport_padding(
+            mb_list,
+            has_internal_objectives=bool(self.tf_config.num_moe_experts)
+            or self.mcore_config.enable_mtp_training,
+            cpu_group=self.cpu_group,
+        )
 
         def forward_step(batch_iter, model):
             source_mb: MicroBatchItem = next(batch_iter)
@@ -1477,7 +1526,9 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
+        mb_list = self._prepare_mb_list(
+            tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+        )
 
         # Step 2: Compute total loss weight.
         # Use DP+CP group: after CP all-gather each rank computes the full-sequence
@@ -1570,7 +1621,9 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
+        mb_list = self._prepare_mb_list(
+            tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+        )
 
         # Step 2: Compute total loss weight (DP+CP, see train_batch comment).
         total_loss_weight = compute_total_loss_weight(
@@ -1634,7 +1687,9 @@ class MegatronEngine(TrainEngine):
         batch_size = len(output_seqlens)
 
         # Step 2: Prepare micro-batches
-        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
+        mb_list = self._prepare_mb_list(
+            tensor_container_to(input_batched, "cpu"), allow_transport_padding=True
+        )
 
         # Step 3: Forward using Megatron's pipeline function, collecting results
         outputs: list[torch.Tensor] = []
@@ -2266,13 +2321,17 @@ class MegatronEngine(TrainEngine):
         converted_named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
         buffer_size: int,
         weight_chunked_mem_size: int,
+        mla_weight_pairs: BailingV3MlaWeightPairs | None = None,
     ) -> int:
         param, param_size = self._collect_param(name, param)
 
         if not self.is_pipeline_parallel_head():
             return buffer_size
 
-        if buffer_size + param_size > weight_chunked_mem_size:
+        if (
+            mla_weight_pairs is None
+            and buffer_size + param_size > weight_chunked_mem_size
+        ):
             self._update_bucket_weights_from_distributed(meta, converted_named_tensors)
             buffer_size = 0
 
@@ -2280,17 +2339,27 @@ class MegatronEngine(TrainEngine):
         if self.config.use_lora:
             model_name = f"{model_name}_lora"
 
-        converted_named_tensors.extend(
-            convert_to_hf(
-                self.tf_config,
-                model_name,
-                name,
-                param,
-                quantization_config=self.quantization_config,
-                fp8_direct_convert=self.fp8_direct_convert,
-                hf_config=self.hf_config,
-            )
+        converted = convert_to_hf(
+            self.tf_config,
+            model_name,
+            name,
+            param,
+            quantization_config=self.quantization_config,
+            fp8_direct_convert=self.fp8_direct_convert,
+            hf_config=self.hf_config,
+            bridge=getattr(self, "bridge", None),
         )
+        if mla_weight_pairs is not None:
+            converted = mla_weight_pairs.group(converted)
+            if not converted:
+                return buffer_size
+            param_size = sum(t.numel() * t.element_size() for _, t in converted)
+            if buffer_size + param_size > weight_chunked_mem_size:
+                self._update_bucket_weights_from_distributed(
+                    meta, converted_named_tensors
+                )
+                buffer_size = 0
+        converted_named_tensors.extend(converted)
         buffer_size += param_size
         return buffer_size
 
@@ -2362,6 +2431,7 @@ class MegatronEngine(TrainEngine):
                     quantization_config=self.quantization_config,
                     fp8_direct_convert=self.fp8_direct_convert,
                     hf_config=self.hf_config,
+                    bridge=getattr(self, "bridge", None),
                 )
             )
 
@@ -2390,6 +2460,13 @@ class MegatronEngine(TrainEngine):
 
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta) -> None:
         assert meta.type == "xccl"
+        if is_bailing_v3(self.hf_config):
+            validate_bailing_v3_weight_update(
+                self.hf_config,
+                use_lora=self.config.use_lora,
+                quantization_config=self.quantization_config,
+                fp8_direct_convert=self.fp8_direct_convert,
+            )
         gen_pp_size = meta.gen_allocation.parallel.pp_size if meta.gen_allocation else 1
         gen_backend = meta.gen_allocation.backend if meta.gen_allocation else None
 
@@ -2570,6 +2647,12 @@ class MegatronEngine(TrainEngine):
 
         buffer_size = 0
         converted_named_tensors = []
+        mla_weight_pairs = (
+            BailingV3MlaWeightPairs()
+            if is_bailing_v3(self.hf_config)
+            and getattr(self.hf_config, "q_lora_rank", None) is not None
+            else None
+        )
 
         for name, param in get_named_parameters(self.model, num_moe_experts):
             if ".experts." in name and not self.config.use_lora:
@@ -2585,7 +2668,11 @@ class MegatronEngine(TrainEngine):
                 converted_named_tensors,
                 buffer_size,
                 weight_chunked_mem_size,
+                mla_weight_pairs=mla_weight_pairs,
             )
+
+        if mla_weight_pairs is not None:
+            mla_weight_pairs.finish()
 
         # Only pipeline parallel heads CAN contain named tensors here
         if converted_named_tensors:
@@ -2881,7 +2968,12 @@ class MegatronEngine(TrainEngine):
                 fp8_direct_convert=self.fp8_direct_convert,
             )
 
-    def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+    def _prepare_mb_list(
+        self,
+        input_: dict[str, Any],
+        *,
+        allow_transport_padding: bool = False,
+    ) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         # Parallel sizes
         pp_size = self.parallel_strategy.pipeline_parallel_size
@@ -2944,6 +3036,7 @@ class MegatronEngine(TrainEngine):
             input_,
             mb_spec,
             group=mpu.get_data_parallel_group(),
+            allow_transport_padding=allow_transport_padding,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         # Project each micro-batch to the model's sequence layout. Wrapper-owned
@@ -3010,7 +3103,7 @@ class MegatronEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
-        local_weight = loss_weight_fn(inputs)
+        local_weight = compute_microbatch_loss_weight(inputs, loss_weight_fn)
         if local_weight == 0:
             connected_output = (
                 output.logprobs if isinstance(output, ChunkedLMHeadOutput) else output
