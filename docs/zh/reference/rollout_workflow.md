@@ -214,7 +214,9 @@ rollout:
 1. Group 和 batch reward normalization 都对每个逻辑 rollout 使用一个参考值。若同一 rollout 各行 reward
    不同，workflow 必须在张量字典中或导出的 `InteractionWithTokenLogpReward` 上 提供有限标量
    `rollout_reward`；同一 rollout 中所有显式参考值必须一致。省略时，只能从相等的 行 reward 取得参考值。每一行保留自己的
-   reward，并使用相同的平移和缩放；leave-one-out 基线排除整个逻辑 rollout。不会从不同行 reward 猜测最终值、总和或均值。
+   reward，并使用相同的平移和缩放；leave-one-out 基线排除整个逻辑 rollout。当算出的参考值标准差不大于 normalization epsilon
+   时，保留平移并使用除数 `1`。内置 v1 agent workflow 为 `individual` 导出显式提供最终 reward 作为参考值，同时保留各行折扣后的
+   reward 和已提供的参考值。自定义 workflow 必须为不同行 reward 声明自己的参考值，不会自动猜测最终值、总和或均值。
 1. 内置按行长度计算的 overlong penalty 不改变显式参考值；actor 的 reward bias、scaling 和 clipping 同时作用于行
    reward 与参考值。未提供显式参考值时，施加长度惩罚后的行 reward 仍须相等。Advantage normalization 保持现有 masked token
    统计及按 token 的 leave-one-out 行为，逻辑计数仅用于 singleton 回退。GAE 仍分别在各行上计算。

@@ -1956,6 +1956,9 @@ def normalize_rollout_rewards(
         group_sizes=meta.logical_group_sizes,
         reduce_group=reduce_group,
     )
+    if norm.std_level is not None:
+        # affine_parameters includes epsilon in the divisor.
+        scale = torch.where(scale <= 2 * norm.eps, 1.0, scale)
     return ((scores - mean[member]) / scale[member]).float()
 
 

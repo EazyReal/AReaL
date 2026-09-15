@@ -390,11 +390,12 @@ def normalize_logical_rollout_rewards(
     std = (
         rewards.std(unbiased=False) if len(references) > 1 else rewards.new_tensor(1.0)
     )
+    scale = torch.where(std <= 1e-8, 1.0, std + 1e-8)
     row_rewards = torch.tensor(
         [v.reward for result in results for v in result.values()], dtype=torch.float32
     )
-    normalized_rows = iter(((row_rewards - mean) / (std + 1e-8)).tolist())
-    normalized_references = ((rewards - mean) / (std + 1e-8)).tolist()
+    normalized_rows = iter(((row_rewards - mean) / scale).tolist())
+    normalized_references = ((rewards - mean) / scale).tolist()
     for result, reference in zip(results, normalized_references):
         assert result is not None
         for interaction in result.values():
@@ -405,7 +406,7 @@ def normalize_logical_rollout_rewards(
                 # Cached exports can contain more than one physical row.
                 cache = interaction._cache
                 cache["original_rewards"] = cache["rewards"].clone()
-                cache["rewards"] = (cache["rewards"].float() - mean) / (std + 1e-8)
+                cache["rewards"] = (cache["rewards"].float() - mean) / scale
     return True
 
 

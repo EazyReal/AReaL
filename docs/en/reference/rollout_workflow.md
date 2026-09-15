@@ -236,8 +236,12 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
    `InteractionWithTokenLogpReward`. All supplied references within a rollout must
    agree. If omitted, equal row rewards provide the reference. The same centering and
    scaling apply to every row's own reward; leave-one-out excludes the entire logical
-   rollout from its reference baseline. No terminal, sum, or mean score is inferred from
-   differing row rewards.
+   rollout from its reference baseline. When the computed reference standard deviation
+   is at or below normalization epsilon, centering is retained with a divisor of `1`.
+   The built-in v1 agent workflow explicitly supplies its terminal reward for
+   `individual` exports, preserving discounted row rewards and any reference already
+   supplied. Custom workflows must declare their own reference for differing row
+   rewards; no terminal, sum, or mean score is inferred.
 1. An explicit reference is unchanged by the built-in row-length overlong penalty. Actor
    reward bias, scaling, and clipping apply to both rows and references. Without an
    explicit reference, penalized row rewards must still agree. Advantage normalization

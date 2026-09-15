@@ -35,7 +35,7 @@ def _norm(**kwargs):
             mean_level=kwargs.pop("mean_level", "group"),
             std_level=kwargs.pop("std_level", "group"),
             std_unbiased=kwargs.pop("std_unbiased", False),
-            eps=0.0,
+            eps=kwargs.pop("eps", 0.0),
             **kwargs,
         )
     )
@@ -103,6 +103,63 @@ def test_mixed_levels_count_logical_references(mean_level, std_level):
 def test_differing_row_rewards_require_explicit_reference():
     with pytest.raises(RuntimeError, match="explicit rollout_reward"):
         normalize_rollout_rewards(torch.tensor([1.0, 2.0, 3.0]), _norm(), _meta())
+
+
+@pytest.mark.parametrize("std_level", ["group", "batch"])
+@pytest.mark.parametrize("deviation", [0.0, 2**-10, 2**-9])
+def test_degenerate_reference_scale_preserves_centered_rows(std_level, deviation):
+    eps = 2**-10
+    rows = torch.tensor([-1.0, -deviation, deviation])
+    actual = normalize_rollout_rewards(
+        rows,
+        _norm(std_level=std_level, eps=eps),
+        _meta(rewards=(-deviation, deviation)),
+    )
+    divisor = 1.0 if deviation <= eps else deviation + eps
+    torch.testing.assert_close(actual, rows / divisor, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mean_level,std_level,divisor",
+    [("group", "group", 1.0), ("group", "batch", 1.0), ("batch", "group", 2.0)],
+)
+def test_tied_group_references_use_configured_scale_scope(
+    mean_level, std_level, divisor
+):
+    rows = torch.tensor([0.0, 1.0, 1.0, 4.0, 5.0, 5.0])
+    meta = TrajBatchMeta(
+        2,
+        [3, 3],
+        [3, 3],
+        [RolloutGroup((2, 1), (1.0, 1.0)), RolloutGroup((2, 1), (5.0, 5.0))],
+    )
+    actual = normalize_rollout_rewards(
+        rows, _norm(mean_level=mean_level, std_level=std_level, eps=0.0), meta
+    )
+    mean = 3.0 if mean_level == "batch" else torch.tensor([1.0] * 3 + [5.0] * 3)
+    torch.testing.assert_close(actual, (rows - mean) / divisor, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("deviation", [0.0, 1e-8, 2e-8])
+def test_rollout_reference_scale_fallback_agrees_for_scalars_and_cached_rows(deviation):
+    from areal.experimental.openai.types import normalize_logical_rollout_rewards
+
+    first, last = _interaction(-1.0), _interaction(deviation)
+    first.rollout_reward, last.rollout_reward = -deviation, deviation
+    first._cache["rewards"] = torch.tensor([-1.0, -0.5])
+    last._cache = None
+    assert normalize_logical_rollout_rewards([{"first": first}, {"last": last}])
+    divisor = 1.0 if deviation <= 1e-8 else deviation + 1e-8
+    assert first.reward == pytest.approx(-1.0 / divisor)
+    assert last.reward == pytest.approx(deviation / divisor)
+    assert first.rollout_reward == pytest.approx(-deviation / divisor)
+    assert last.rollout_reward == pytest.approx(deviation / divisor)
+    torch.testing.assert_close(
+        first._cache["rewards"],
+        torch.tensor([-1.0, -0.5]) / divisor,
+        rtol=1e-6,
+        atol=0,
+    )
 
 
 def test_advantage_statistics_remain_masked_token_weighted():

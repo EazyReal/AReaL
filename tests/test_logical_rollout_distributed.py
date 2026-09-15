@@ -59,6 +59,14 @@ def _check_logical_rollouts(rank, rendezvous):
             torch.testing.assert_close(
                 actual, (rows - mean) / scale, rtol=1e-6, atol=1e-6
             )
+        tied_meta = TrajBatchMeta(
+            1, [sum(counts)], [2], [RolloutGroup(counts, (1.0, 1.0))]
+        )
+        actual = normalize_rollout_rewards(
+            rows, norm, tied_meta, reduce_group=dist.group.WORLD
+        )
+        torch.testing.assert_close(actual, rows - 1.0, rtol=0, atol=0)
+
         # Only one rank has ambiguous rows; both fail before statistic collectives.
         if rank == 0:
             meta.rollout_groups = [RolloutGroup(counts)]
