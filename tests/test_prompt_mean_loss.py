@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,14 +8,24 @@ import torch
 from omegaconf import OmegaConf
 
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig
-from areal.trainer.ppo.actor import PPOActor, _group_training_metrics, grpo_loss_fn
+from areal.trainer.ppo.actor import (
+    PPOActor,
+    _group_training_metrics,
+    _policy_gradient_loss_weight,
+    grpo_loss_fn,
+)
 from areal.utils.data import (
     RolloutGroup,
     make_transport_microbatch,
     split_padded_tensor_dict_into_mb_list,
     split_training_batch_into_microbatches,
 )
-from areal.utils.functional.loss_aggregation import PolicyGradientReduction
+from areal.utils.functional.loss_aggregation import (
+    ConstantLength,
+    PolicyGradientReduction,
+    TokenMean,
+    make_policy_gradient_reduction,
+)
 
 LOSS = torch.tensor(
     [
@@ -35,7 +46,7 @@ GROUP_SIZES = [2, 1]
 
 
 def _reduction(mode: str) -> PolicyGradientReduction:
-    return PolicyGradientReduction(
+    return make_policy_gradient_reduction(
         mode=mode,
         divisor=4.0 if mode == "constant" else None,
     )
@@ -105,6 +116,22 @@ def test_token_mean_preserves_existing_dtype_and_reduction_path():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_constant_length_preserves_default_dtype_promotion():
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        expected = torch.where(MASK, LOSS, 0).float().sum() / (
+            MASK.sum(-1).count_nonzero() * math.pi
+        )
+
+        actual = ConstantLength(math.pi).aggregate(LOSS, MASK)
+
+        assert actual.dtype == expected.dtype
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
 @pytest.mark.parametrize("mode", ["seq_mean", "prompt_mean"])
 def test_denominator_mask_keeps_filtered_units_in_mean(mode):
     loss = torch.tensor([[2.0, 8.0], [6.0, 4.0]])
@@ -124,48 +151,167 @@ def test_denominator_mask_keeps_filtered_units_in_mean(mode):
 
 
 @pytest.mark.parametrize("mode", ["token_mean", "seq_mean", "prompt_mean", "constant"])
-def test_callback_pair_is_invariant_to_unit_aligned_partitions(mode):
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("empty_batch", [False, True])
+def test_callback_pair_preserves_loss_and_gradient_across_partitions(
+    mode, packed, empty_batch
+):
+    """Engine weighting preserves original denominators despite rejected tokens."""
     reduction = _reduction(mode)
-    full_data = {"loss_mask": MASK}
-    if mode == "prompt_mean":
-        full_data["group_sizes"] = GROUP_SIZES
-    full = reduction.aggregate(
-        LOSS,
-        MASK,
-        group_sizes=full_data.get("group_sizes"),
+    loss = torch.tensor(
+        [[2.0, 8.0, 1.0], [6.0, 4.0, 3.0], [9.0, 2.0, 7.0], [5.0, 3.0, 6.0]],
+        requires_grad=True,
     )
+    denominator = torch.tensor(
+        [[1, 1, 0], [1, 1, 1], [0, 0, 0], [1, 0, 0]], dtype=torch.bool
+    )
+    numerator = torch.tensor(
+        [[1, 0, 0], [0, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=torch.bool
+    )
+    if empty_batch:
+        denominator.zero_()
+        numerator.zero_()
 
-    weighted_losses = []
-    weights = []
-    for seq_slice, group_sizes in ((slice(0, 2), [2]), (slice(2, 3), [1])):
-        data = {"loss_mask": MASK[seq_slice]}
-        if mode == "prompt_mean":
-            data["group_sizes"] = group_sizes
-        weight = reduction.normalizer_fn(data)
-        local = reduction.aggregate(
-            LOSS[seq_slice],
-            MASK[seq_slice],
-            group_sizes=data.get("group_sizes"),
+    def evaluate(rows, groups):
+        local_loss = loss[rows]
+        local_numerator = numerator[rows]
+        local_denominator = denominator[rows]
+        cu_seqlens = None
+        if packed:
+            # Keep every physical token; loss masks carry the training boundary.
+            cu_seqlens = torch.arange(0, local_loss.numel() + 1, 3, dtype=torch.int32)
+            local_loss = local_loss.flatten()
+            local_numerator = local_numerator.flatten()
+            local_denominator = local_denominator.flatten()
+        metadata = dict(cu_seqlens=cu_seqlens, group_sizes=groups)
+        weight = reduction.normalizer(local_denominator, **metadata)
+        result = reduction.aggregate(
+            local_loss,
+            local_numerator,
+            denominator_mask=local_denominator,
+            **metadata,
         )
-        weighted_losses.append(local * weight)
-        weights.append(weight)
+        return result, weight
 
-    combined = torch.stack(weighted_losses).sum() / torch.stack(weights).sum()
-    torch.testing.assert_close(combined, full, rtol=1e-5, atol=1e-6)
+    full, full_weight = evaluate(slice(None), [2, 1, 1])
+    partitions = [
+        evaluate(slice(0, 2), [2]),
+        evaluate(slice(2, 3), [1]),
+        evaluate(slice(3, 4), [1]),
+    ]
+    split_weight = sum(weight for _, weight in partitions)
+    combined = sum(
+        value * weight for value, weight in partitions
+    ) / split_weight.clamp_min(1)
+    full_gradient = torch.autograd.grad(full, loss, retain_graph=True)[0]
+    split_gradient = torch.autograd.grad(combined, loss)[0]
+
+    torch.testing.assert_close(split_weight, full_weight, rtol=0, atol=0)
+    torch.testing.assert_close(combined, full, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(split_gradient, full_gradient, rtol=1e-6, atol=1e-6)
+    if empty_batch:
+        torch.testing.assert_close(full, torch.zeros_like(full), rtol=0, atol=0)
+        torch.testing.assert_close(
+            full_gradient, torch.zeros_like(loss), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "mode,divisor",
+    [
+        ("bogus", None),
+        ("constant", None),
+        ("constant", 0),
+        ("constant", -1),
+        ("constant", float("inf")),
+        ("constant", float("nan")),
+        ("token_mean", 4),
+        ("seq_mean", 4),
+        ("prompt_mean", 4),
+    ],
+)
+def test_factory_rejects_invalid_configuration(mode, divisor):
+    with pytest.raises(ValueError):
+        make_policy_gradient_reduction(mode, divisor=divisor)
+
+
+@pytest.mark.parametrize("divisor", [0, -1, float("inf"), float("nan")])
+def test_constant_length_rejects_invalid_divisor(divisor):
+    with pytest.raises(ValueError, match="positive finite"):
+        ConstantLength(divisor)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_loss_and_actor_adapter_accept_mode_free_reduction(packed):
+    """Consumers honor a structural implementation without a mode discriminator."""
+    mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.bool)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32) if packed else None
+    if packed:
+        mask = mask.flatten()
+    groups = [2]
+
+    class DoubleTokenMean:
+        def __bool__(self):
+            return False
+
+        def normalizer(self, loss_mask, *, cu_seqlens=None, group_sizes=None):
+            assert loss_mask is mask
+            assert cu_seqlens is data.get("cu_seqlens")
+            assert group_sizes is groups
+            return TokenMean().normalizer(loss_mask)
+
+        def aggregate(
+            self,
+            loss,
+            loss_mask,
+            *,
+            denominator_mask=None,
+            cu_seqlens=None,
+            group_sizes=None,
+        ):
+            assert cu_seqlens is data.get("cu_seqlens")
+            assert group_sizes is groups
+            return 2 * TokenMean().aggregate(
+                loss, loss_mask, denominator_mask=denominator_mask
+            )
+
+    reduction: PolicyGradientReduction = DoubleTokenMean()
+    logprobs = torch.zeros_like(mask, dtype=torch.float32, requires_grad=True)
+    data = {
+        "logprobs": torch.zeros_like(logprobs),
+        "advantages": torch.ones_like(logprobs),
+        "loss_mask": mask,
+        "prox_logp": torch.zeros_like(logprobs),
+        "group_sizes": groups,
+    }
+    if packed:
+        data["cu_seqlens"] = cu_seqlens
+
+    weight = _policy_gradient_loss_weight(data, reduction=reduction)
+    with patch("areal.trainer.ppo.actor.stats_tracker"):
+        loss = grpo_loss_fn(
+            logprobs=logprobs,
+            entropy=torch.zeros_like(logprobs),
+            input_data=data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            pg_reduction=reduction,
+        )
+    gradient = torch.autograd.grad(loss, logprobs)[0]
+
+    torch.testing.assert_close(weight, torch.tensor(3), rtol=0, atol=0)
+    torch.testing.assert_close(loss, torch.tensor(-2.0), rtol=0, atol=0)
+    torch.testing.assert_close(gradient, -2 * mask.float() / 3, rtol=1e-6, atol=1e-6)
 
 
 def test_normalizer_counts_only_active_units():
     mask = torch.tensor([[1, 0], [0, 0], [1, 1]], dtype=torch.bool)
 
-    assert _reduction("token_mean").normalizer_fn({"loss_mask": mask}).item() == 3
-    assert _reduction("seq_mean").normalizer_fn({"loss_mask": mask}).item() == 2
-    assert _reduction("constant").normalizer_fn({"loss_mask": mask}).item() == 2
-    assert (
-        _reduction("prompt_mean")
-        .normalizer_fn({"loss_mask": mask, "group_sizes": [2, 1]})
-        .item()
-        == 2
-    )
+    assert _reduction("token_mean").normalizer(mask).item() == 3
+    assert _reduction("seq_mean").normalizer(mask).item() == 2
+    assert _reduction("constant").normalizer(mask).item() == 2
+    assert _reduction("prompt_mean").normalizer(mask, group_sizes=[2, 1]).item() == 2
 
 
 def test_prompt_mean_requires_explicit_group_sizes():
@@ -174,7 +320,7 @@ def test_prompt_mean_requires_explicit_group_sizes():
     with pytest.raises(ValueError, match="group_sizes are required"):
         reduction.aggregate(LOSS, MASK)
     with pytest.raises(ValueError, match="group_sizes are required"):
-        reduction.normalizer_fn({"loss_mask": MASK})
+        reduction.normalizer(MASK)
     with pytest.raises(TypeError, match="sequence of ints"):
         reduction.aggregate(LOSS, MASK, group_sizes=torch.tensor(GROUP_SIZES))
 

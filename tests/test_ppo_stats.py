@@ -3,10 +3,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from areal.trainer.ppo.actor import _infer_prompt_lens, grpo_loss_fn
+from areal.api.cli_args import PPOActorConfig
+from areal.trainer.ppo.actor import PPOActor, _infer_prompt_lens, grpo_loss_fn
 from areal.trainer.ppo.critic import ppo_loss_fn
 from areal.trainer.ppo.stats import infer_token_denominator
-from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 from areal.utils.stats_tracker import DistributedStatsTracker
 
 
@@ -89,34 +89,20 @@ def test_grpo_loss_fn_uses_full_cu_seqlens_for_n_tokens():
     assert torch.all(n_tokens)
 
 
-def test_teacher_logp_requires_token_mean_loss_aggregation():
-    input_data = {
-        "input_ids": torch.tensor([[11, 12]]),
-        "logprobs": torch.zeros(1, 2),
-        "advantages": torch.ones(1, 2),
-        "loss_mask": torch.ones(1, 2, dtype=torch.bool),
-        "prox_logp": torch.zeros(1, 2),
-        "versions": torch.zeros(1, 2, dtype=torch.int32),
-        "teacher_logp": torch.zeros(1, 2),
-    }
+@pytest.mark.parametrize("mode", ["seq_mean", "prompt_mean", "constant"])
+@pytest.mark.parametrize("teacher_field", ["teacher_logp", "mopd_teacher_logp_sum"])
+def test_actor_rejects_non_token_distillation_before_batch_processing(
+    mode, teacher_field
+):
+    actor = object.__new__(PPOActor)
+    actor.config = PPOActorConfig(
+        loss_aggregation=mode,
+        loss_aggregation_divisor=4.0 if mode == "constant" else None,
+    )
+    actor._mopd_loss_config = None
 
-    with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
-        mock_tracker.denominator = MagicMock()
-        mock_tracker.stat = MagicMock()
-        mock_tracker.scope = MagicMock()
-        mock_tracker.scope.return_value.__enter__ = MagicMock()
-        mock_tracker.scope.return_value.__exit__ = MagicMock()
-
-        with pytest.raises(ValueError, match="Distillation is only supported"):
-            grpo_loss_fn(
-                logprobs=torch.zeros(1, 2),
-                entropy=torch.zeros(1, 2),
-                input_data=input_data,
-                eps_clip=0.2,
-                eps_clip_higher=None,
-                c_clip=None,
-                pg_reduction=PolicyGradientReduction(mode="seq_mean"),
-            )
+    with pytest.raises(ValueError, match="Distillation is only supported"):
+        actor._ppo_update({teacher_field: torch.zeros(1, 2)})
 
 
 def test_critic_loss_fn_uses_full_cu_seqlens_for_n_tokens():

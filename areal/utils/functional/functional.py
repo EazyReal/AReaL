@@ -12,6 +12,7 @@ from areal.api.cli_args import RejectionSamplingConfig
 from areal.utils.data import KLEstimator
 from areal.utils.functional.loss_aggregation import (
     PolicyGradientReduction,
+    TokenMean,
 )
 
 
@@ -506,8 +507,8 @@ def ppo_actor_loss_fn(
             Not needed for 2D padded inputs (sequences identified by batch dimension).
         group_sizes: Trajectory count of each prompt group, summing to the number
             of sequences. Required for loss_aggregation='prompt_mean'.
-        pg_reduction: PolicyGradientReduction selecting the loss aggregation mode.
-            None uses the default token-mean reduction.
+        pg_reduction: PolicyGradientReduction pairing loss aggregation with its
+            engine weight. None uses the default token-mean reduction.
         denominator_mask: Original loss mask kept as the aggregation denominator
             when rejection sampling narrows loss_mask.
     """
@@ -577,7 +578,7 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    reduction = pg_reduction or PolicyGradientReduction()
+    reduction = TokenMean() if pg_reduction is None else pg_reduction
     pg_loss = reduction.aggregate(
         pg_loss,
         loss_mask,
@@ -640,7 +641,8 @@ def sapo_loss_fn(
         importance_sampling_level: "token" or "sequence" level importance sampling
         cu_seqlens: Cumulative sequence lengths for sequence-level IS
         group_sizes: Per-prompt trajectory counts, required for prompt_mean aggregation
-        pg_reduction: PolicyGradientReduction selecting the loss aggregation mode
+        pg_reduction: PolicyGradientReduction pairing loss aggregation with its
+            engine weight
         denominator_mask: Original loss mask kept as the aggregation denominator
 
     Returns:
@@ -678,7 +680,7 @@ def sapo_loss_fn(
     # Compute loss
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
-    reduction = pg_reduction or PolicyGradientReduction()
+    reduction = TokenMean() if pg_reduction is None else pg_reduction
     pg_loss = reduction.aggregate(
         pg_loss,
         loss_mask,
@@ -760,8 +762,8 @@ def cispo_loss_fn(
             ``rejection_sampling.level == "sequence"``.
         group_sizes: Trajectory count of each prompt group, summing to the number
             of sequences; required for ``loss_aggregation='prompt_mean'``.
-        pg_reduction: :class:`PolicyGradientReduction` selecting the aggregation
-            mode; ``None`` uses the default token-mean reduction.
+        pg_reduction: :class:`PolicyGradientReduction` implementing the aggregation;
+            ``None`` uses the default token-mean reduction.
         denominator_mask: Original loss mask kept as the aggregation denominator
             when rejection sampling narrows ``loss_mask``.
 
@@ -808,7 +810,7 @@ def cispo_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    reduction = pg_reduction or PolicyGradientReduction()
+    reduction = TokenMean() if pg_reduction is None else pg_reduction
     pg_loss = reduction.aggregate(
         pg_loss,
         loss_mask,

@@ -15,7 +15,7 @@ import torch
 
 from areal.api.cli_args import PPOActorConfig, RejectionSamplingConfig
 from areal.utils.functional import cispo_loss_fn
-from areal.utils.functional.loss_aggregation import PolicyGradientReduction
+from areal.utils.functional.loss_aggregation import make_policy_gradient_reduction
 
 # (eps_clip, eps_clip_higher): a PPO-like band that clips most tokens, and the
 # wide MiniMax-M1 band [0, 5] that clips none of the fixture ratios.
@@ -169,7 +169,7 @@ def test_cispo_respects_sequence_loss_aggregation():
         eps_clip=1.0,
         eps_clip_higher=4.0,
         loss_mask=loss_mask,
-        pg_reduction=PolicyGradientReduction(mode="seq_mean"),
+        pg_reduction=make_policy_gradient_reduction(mode="seq_mean"),
     )
 
     torch.testing.assert_close(loss, torch.tensor(3.0), rtol=0, atol=0)
@@ -190,7 +190,7 @@ def test_cispo_prompt_mean_accepts_partial_group_sizes():
         eps_clip=1.0,
         eps_clip_higher=4.0,
         loss_mask=loss_mask,
-        pg_reduction=PolicyGradientReduction(mode="prompt_mean"),
+        pg_reduction=make_policy_gradient_reduction(mode="prompt_mean"),
         group_sizes=[2, 1],
     )
 

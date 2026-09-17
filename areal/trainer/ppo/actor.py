@@ -51,6 +51,8 @@ from areal.utils.functional import (
 from areal.utils.functional.loss_aggregation import (
     LossAggregationMode,
     PolicyGradientReduction,
+    TokenMean,
+    make_policy_gradient_reduction,
 )
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
@@ -58,6 +60,17 @@ from areal.v2.training_service.controller.controller import (
 )
 
 logger = logging.getLogger("PPOActor")
+
+
+def _policy_gradient_loss_weight(
+    data: dict[str, Any], *, reduction: PolicyGradientReduction
+) -> torch.Tensor:
+    """Adapt engine batch metadata to the reduction's tensor-only contract."""
+    return reduction.normalizer(
+        data["loss_mask"],
+        cu_seqlens=data.get("cu_seqlens"),
+        group_sizes=data.get("group_sizes"),
+    )
 
 
 def _group_training_metrics(
@@ -690,6 +703,17 @@ class PPOActor:
     def _ppo_update(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> None:
+        if self.config.loss_aggregation != "token_mean" and (
+            data.get("teacher_logp") is not None
+            or data.get("mopd_teacher_logp_sum") is not None
+            or (
+                self._mopd_loss_config is not None
+                and self._mopd_loss_config.distillation_coefficient != 0
+            )
+        ):
+            raise ValueError(
+                "Distillation is only supported with loss_aggregation='token_mean'."
+            )
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -824,7 +848,7 @@ class PPOActor:
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
-            pg_reduction = PolicyGradientReduction(
+            pg_reduction = make_policy_gradient_reduction(
                 mode=self.config.loss_aggregation,
                 divisor=self.config.loss_aggregation_divisor,
             )
@@ -851,7 +875,9 @@ class PPOActor:
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=loss_fn,
-                    loss_weight_fn=pg_reduction.normalizer_fn,
+                    loss_weight_fn=functools.partial(
+                        _policy_gradient_loss_weight, reduction=pg_reduction
+                    ),
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -1017,20 +1043,13 @@ def grpo_loss_fn(
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
 ):
-    """Loss function for actor step, all inputs should be splitted into
-    pipeline micro batches, returns loss and logging stats."""
-    pg_reduction = pg_reduction or PolicyGradientReduction()
-    if pg_reduction.mode != "token_mean" and (
-        input_data.get("teacher_logp") is not None
-        or input_data.get("mopd_teacher_logp_sum") is not None
-        or (
-            mopd_loss_config is not None
-            and mopd_loss_config.distillation_coefficient != 0
-        )
-    ):
-        raise ValueError(
-            "Distillation is only supported with loss_aggregation='token_mean'."
-        )
+    """Compute loss and logging stats for an engine microbatch.
+
+    The actor validates objective compatibility before splitting the batch:
+    distillation requires token-mean aggregation, and prompt-mean aggregation
+    requires atomic prompt groups. This function consumes the assembled reduction.
+    """
+    pg_reduction = TokenMean() if pg_reduction is None else pg_reduction
     denominator_mask = input_data["loss_mask"].bool()
     loss_mask = denominator_mask
     if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:

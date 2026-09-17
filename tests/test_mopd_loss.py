@@ -8,7 +8,7 @@ import torch
 from areal.api.cli_args import MOPDLossConfig, PPOActorConfig, RejectionSamplingConfig
 from areal.trainer.mopd.loss import compose_mopd_loss, mopd_loss_fn
 from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
-from areal.utils.functional.loss_aggregation import PolicyGradientReduction
+from areal.utils.functional.loss_aggregation import make_policy_gradient_reduction
 
 
 def test_actor_binds_one_mopd_loss_config():
@@ -362,7 +362,7 @@ def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets(mode):
         eps_clip=0.2,
         eps_clip_higher=None,
         c_clip=None,
-        pg_reduction=PolicyGradientReduction(
+        pg_reduction=make_policy_gradient_reduction(
             mode=mode, divisor=4.0 if mode == "constant" else None
         ),
     )
@@ -509,19 +509,11 @@ def test_mopd_rejects_non_token_aggregation_before_training(mode, rl_coefficient
         actor.configure_mopd_loss(config)
     assert actor._mopd_loss_config is None
 
+    # A materialized batch must still be guarded if configuration was bound
+    # before the aggregation configuration changed.
+    actor._mopd_loss_config = config
     with pytest.raises(ValueError, match="only supported with"):
-        grpo_loss_fn(
-            logprobs=torch.zeros(1, 2),
-            entropy=torch.zeros(1, 2),
-            input_data={"loss_mask": torch.ones(1, 2, dtype=torch.bool)},
-            eps_clip=0.2,
-            eps_clip_higher=None,
-            c_clip=None,
-            pg_reduction=PolicyGradientReduction(
-                mode=mode, divisor=actor.config.loss_aggregation_divisor
-            ),
-            mopd_loss_config=config,
-        )
+        actor._ppo_update({})
 
 
 @pytest.mark.parametrize("rl_coefficient", [0.0, 0.5])
@@ -541,7 +533,7 @@ def test_mopd_m2_filtering_preserves_loss_and_gradient_across_microbatches(
         "mopd_teacher_weight_sum": torch.ones_like(logprobs),
         "mopd_behavior_logprobs": torch.zeros_like(logprobs),
     }
-    reduction = PolicyGradientReduction()
+    reduction = make_policy_gradient_reduction()
 
     # Isolate reduction from M2's own microbatch-dependent threshold selection.
     def filter_tokens(old_logp, prox_logp, mask, threshold):
@@ -571,7 +563,7 @@ def test_mopd_m2_filtering_preserves_loss_and_gradient_across_microbatches(
     # reveals any post-filter denominator paired with a pre-filter engine weight.
     data["prox_logp"] = torch.tensor([[0.0, 1.0], [1.0, 1.0]], dtype=torch.float64)
     full_loss = evaluate(slice(None))
-    weights = [reduction.normalizer_fn({"loss_mask": row}) for row in original_mask]
+    weights = [reduction.normalizer(row) for row in original_mask]
     split_loss = sum(evaluate(slice(i, i + 1)) * weights[i] for i in range(2)) / sum(
         weights
     )
