@@ -992,6 +992,7 @@ class ArchonEngine(TrainEngine):
         inputs.pop("turn_ids", None)
         inputs.pop("is_truncated", None)
         inputs.pop("group_sizes", None)
+        inputs.pop("prompt_token_weights", None)
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)

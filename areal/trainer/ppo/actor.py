@@ -53,6 +53,7 @@ from areal.utils.functional.loss_aggregation import (
     PolicyGradientReduction,
     TokenMean,
     make_policy_gradient_reduction,
+    prepare_prompt_token_weights,
 )
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
@@ -69,7 +70,7 @@ def _policy_gradient_loss_weight(
     return reduction.normalizer(
         data["loss_mask"],
         cu_seqlens=data.get("cu_seqlens"),
-        group_sizes=data.get("group_sizes"),
+        prompt_token_weights=data.get("prompt_token_weights"),
     )
 
 
@@ -695,9 +696,12 @@ class PPOActor:
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
         batched, meta = concat_batch(data)
         if self.config.loss_aggregation == "prompt_mean":
-            # Each input dict is one prompt group; concat_batch records that
-            # batch dim so microbatch splits cannot cut a group in half.
+            # Keep each physical prompt group in one optimizer step. Its token
+            # weights let the engine split the group across microbatches.
             batched["group_sizes"] = meta.traj_group_sizes
+            batched["prompt_token_weights"] = prepare_prompt_token_weights(
+                batched["loss_mask"], meta.traj_group_sizes
+            )
         self._ppo_update(batched, meta)
 
     def _ppo_update(
@@ -854,6 +858,9 @@ class PPOActor:
             )
 
             for mb in mb_inputs:
+                # Group boundaries govern optimizer steps; token weights carry
+                # the full-group denominator through engine microbatch packing.
+                mb.pop("group_sizes", None)
                 loss_fn = functools.partial(
                     grpo_loss_fn,
                     eps_clip=self.config.eps_clip,
@@ -1162,7 +1169,7 @@ def grpo_loss_fn(
             old_logprobs=old_logp,
             rejection_sampling=rejection_sampling,
             cu_seqlens=input_data.get("cu_seqlens"),
-            group_sizes=input_data.get("group_sizes"),
+            prompt_token_weights=input_data.get("prompt_token_weights"),
             pg_reduction=pg_reduction,
             denominator_mask=denominator_mask,
         )
@@ -1181,7 +1188,7 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
-            group_sizes=input_data.get("group_sizes"),
+            prompt_token_weights=input_data.get("prompt_token_weights"),
             pg_reduction=pg_reduction,
             denominator_mask=denominator_mask,
         )
@@ -1198,7 +1205,7 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
-            group_sizes=input_data.get("group_sizes"),
+            prompt_token_weights=input_data.get("prompt_token_weights"),
             pg_reduction=pg_reduction,
             denominator_mask=denominator_mask,
         )

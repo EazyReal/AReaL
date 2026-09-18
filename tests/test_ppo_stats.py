@@ -7,7 +7,10 @@ from areal.api.cli_args import MOPDLossConfig, PPOActorConfig
 from areal.trainer.ppo.actor import PPOActor, _infer_prompt_lens, grpo_loss_fn
 from areal.trainer.ppo.critic import ppo_loss_fn
 from areal.trainer.ppo.stats import infer_token_denominator
-from areal.utils.functional.loss_aggregation import make_policy_gradient_reduction
+from areal.utils.functional.loss_aggregation import (
+    make_policy_gradient_reduction,
+    prepare_prompt_token_weights,
+)
 from areal.utils.stats_tracker import DistributedStatsTracker
 
 
@@ -207,13 +210,14 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
     )
     mask = torch.tensor([[1, 1, 0], [1, 1, 1], [1, 0, 0]], dtype=torch.bool)
     advantages = -torch.tensor([[1.0, 3.0, 0.0], [2.0, 4.0, 6.0], [10.0, 0.0, 0.0]])
+    prompt_weights = prepare_prompt_token_weights(mask, [2, 1])
     # This fixed selection isolates aggregation from M2's own selection scope.
     retained = torch.tensor([[1, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=torch.bool)
 
     def evaluate(partitions):
         tracker = DistributedStatsTracker()
         losses, weights = [], []
-        for rows, groups in partitions:
+        for rows in partitions:
             local_mask = mask[rows]
             logprobs = torch.zeros_like(advantages[rows])
             inputs = {
@@ -221,7 +225,7 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
                 "prox_logp": logprobs,
                 "advantages": advantages[rows],
                 "loss_mask": local_mask,
-                "group_sizes": groups,
+                "prompt_token_weights": prompt_weights[rows],
             }
             with (
                 patch("areal.trainer.ppo.actor.stats_tracker", tracker),
@@ -242,7 +246,11 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
                         m2_threshold=0.1,
                     )
                 )
-            weights.append(reduction.normalizer(local_mask, group_sizes=groups))
+            weights.append(
+                reduction.normalizer(
+                    local_mask, prompt_token_weights=prompt_weights[rows]
+                )
+            )
         expected = sum(loss * weight for loss, weight in zip(losses, weights)) / sum(
             weights
         )
@@ -251,8 +259,8 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
         assert "actor_loss_token_mean/avg" in exported
         return exported
 
-    full = evaluate([(slice(None), [2, 1])])
-    split = evaluate([(slice(0, 2), [2]), (slice(2, 3), [1])])
+    full = evaluate([slice(None)])
+    split = evaluate([slice(0, 1), slice(1, 3)])
     assert split["actor_loss/avg"] == pytest.approx(full["actor_loss/avg"])
     if mode != "token_mean":
         assert full["actor_loss/avg"] != pytest.approx(

@@ -1138,19 +1138,21 @@ def split_training_batch_into_microbatches(
     n_mbs: int,
     group: dist.ProcessGroup | None = None,
 ) -> list[dict[str, Any]]:
-    """Build a synchronized PPO schedule without all-dummy global steps."""
+    """Build a synchronized PPO schedule without all-dummy global steps.
+
+    Explicit prompt groups remain intact within each optimizer step. When
+    fewer groups or rows are available than requested steps, adapt the local
+    split and use transport-only batches to align the data-parallel schedule.
+    """
     if n_mbs < 1:
         raise ValueError(f"n_mbs must be positive, got {n_mbs}")
     batch_size = get_batch_size(data)
     if batch_size < 1:
         raise ValueError("Cannot split an empty training batch")
 
-    if data.get("group_sizes") is not None:
-        return split_padded_tensor_dict_into_mb_list(
-            data, MicroBatchSpec(n_mbs=n_mbs), group=group
-        ).mbs
-
-    local_n_mbs = min(batch_size, n_mbs)
+    group_sizes = data.get("group_sizes")
+    local_units = len(group_sizes) if group_sizes is not None else batch_size
+    local_n_mbs = min(local_units, n_mbs)
     local_mbs = split_padded_tensor_dict_into_mb_list(
         data,
         MicroBatchSpec(n_mbs=local_n_mbs),
@@ -1159,10 +1161,11 @@ def split_training_batch_into_microbatches(
     if not dist.is_initialized():
         if local_n_mbs < n_mbs:
             logger.warning(
-                "Reducing PPO minibatches from %d to %d for a batch of %d rows",
+                "Reducing PPO minibatches from %d to %d for a batch of %d %s",
                 n_mbs,
                 local_n_mbs,
-                batch_size,
+                local_units,
+                "prompt groups" if group_sizes is not None else "rows",
             )
         return local_mbs
 

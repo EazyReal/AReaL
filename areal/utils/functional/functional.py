@@ -465,7 +465,7 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    group_sizes: list[int] | None = None,
+    prompt_token_weights: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
     denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
@@ -505,8 +505,8 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
-        group_sizes: Trajectory count of each prompt group, summing to the number
-            of sequences. Required for loss_aggregation='prompt_mean'.
+        prompt_token_weights: Precomputed full-prompt token weights carried through
+            microbatch splitting. Required for prompt_mean aggregation.
         pg_reduction: PolicyGradientReduction pairing loss aggregation with its
             engine weight. None uses the default token-mean reduction.
         denominator_mask: Original loss mask kept as the aggregation denominator
@@ -584,7 +584,7 @@ def ppo_actor_loss_fn(
         loss_mask,
         denominator_mask=orig_loss_mask,
         cu_seqlens=cu_seqlens,
-        group_sizes=group_sizes,
+        prompt_token_weights=prompt_token_weights,
     )
     clip_mask.logical_and_(stat_loss_mask)
     dual_clip_mask.logical_and_(stat_loss_mask)
@@ -622,7 +622,7 @@ def sapo_loss_fn(
     loss_mask: torch.Tensor,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    group_sizes: list[int] | None = None,
+    prompt_token_weights: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
     denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
@@ -640,7 +640,8 @@ def sapo_loss_fn(
         loss_mask: Mask for valid tokens
         importance_sampling_level: "token" or "sequence" level importance sampling
         cu_seqlens: Cumulative sequence lengths for sequence-level IS
-        group_sizes: Per-prompt trajectory counts, required for prompt_mean aggregation
+        prompt_token_weights: Precomputed full-prompt token weights, required for
+            prompt_mean aggregation
         pg_reduction: PolicyGradientReduction pairing loss aggregation with its
             engine weight
         denominator_mask: Original loss mask kept as the aggregation denominator
@@ -686,7 +687,7 @@ def sapo_loss_fn(
         loss_mask,
         denominator_mask=denominator_mask,
         cu_seqlens=cu_seqlens,
-        group_sizes=group_sizes,
+        prompt_token_weights=prompt_token_weights,
     )
 
     # Return stat dict compatible with PPO (fake clip_mask for logging compatibility)
@@ -715,7 +716,7 @@ def cispo_loss_fn(
     old_logprobs: torch.Tensor | None = None,
     rejection_sampling: RejectionSamplingConfig | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    group_sizes: list[int] | None = None,
+    prompt_token_weights: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
     denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
@@ -760,8 +761,8 @@ def cispo_loss_fn(
             None disables it (pure on-policy CISPO).
         cu_seqlens: Cumulative sequence lengths for 1D packed inputs; required when
             ``rejection_sampling.level == "sequence"``.
-        group_sizes: Trajectory count of each prompt group, summing to the number
-            of sequences; required for ``loss_aggregation='prompt_mean'``.
+        prompt_token_weights: Precomputed full-prompt token weights carried through
+            microbatch splitting; required for ``loss_aggregation='prompt_mean'``.
         pg_reduction: :class:`PolicyGradientReduction` implementing the aggregation;
             ``None`` uses the default token-mean reduction.
         denominator_mask: Original loss mask kept as the aggregation denominator
@@ -816,7 +817,7 @@ def cispo_loss_fn(
         loss_mask,
         denominator_mask=orig_loss_mask,
         cu_seqlens=cu_seqlens,
-        group_sizes=group_sizes,
+        prompt_token_weights=prompt_token_weights,
     )
 
     clip_mask = (ratio_clipped != ratio).logical_and(loss_mask)

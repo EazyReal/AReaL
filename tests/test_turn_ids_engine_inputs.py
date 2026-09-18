@@ -14,6 +14,7 @@ def _make_microbatch() -> MicroBatchItem:
         "turn_ids": torch.tensor([[-1, 0, 0]], dtype=torch.int32),
         "is_truncated": torch.tensor([True]),
         "group_sizes": [1],
+        "prompt_token_weights": torch.tensor([[0.0, 0.5, 0.5]]),
     }
     return MicroBatchItem(
         orig_mb=data,
@@ -32,6 +33,8 @@ def test_fsdp_prepare_inputs_strips_algorithm_metadata_without_mutating_context(
 
     assert "turn_ids" not in inputs
     assert "is_truncated" not in inputs
+    assert "prompt_token_weights" not in inputs
+    assert "prompt_token_weights" in context.mb_input
     assert "group_sizes" not in inputs
     assert "turn_ids" in context.mb_input
     assert "is_truncated" in context.mb_input
@@ -51,6 +54,8 @@ def test_archon_prepare_inputs_strips_algorithm_metadata_without_mutating_contex
 
     assert "turn_ids" not in inputs
     assert "is_truncated" not in inputs
+    assert "prompt_token_weights" not in inputs
+    assert "prompt_token_weights" in context.mb_input
     assert "group_sizes" not in inputs
     assert "turn_ids" in context.mb_input
     assert "is_truncated" in context.mb_input

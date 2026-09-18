@@ -21,13 +21,15 @@ class PolicyGradientReduction(Protocol):
     """A microbatch mean paired with its engine weight.
 
     The engine combines microbatches as
-    ``sum(local_mean * local_weight) / sum(local_weight)``. Both operations must
-    count units from the original denominator mask, even when filtering narrows
-    the numerator. Empty units contribute zero loss and zero weight.
+    ``sum(local_mean * local_weight) / sum(local_weight)``. Both operations use
+    the original denominator data, even when filtering narrows the numerator.
+    Weights count averaging units or a fragment's fractional share of them;
+    originally empty units contribute zero loss and zero weight.
 
-    Callers must preserve the averaging units across microbatches: sequences for
-    sequence-based reductions, and whole prompt groups for prompt mean. Pipeline
-    setup owns compatibility with other objectives such as distillation.
+    Sequences remain intact across microbatches. Prompt groups remain intact
+    across optimizer steps; their precomputed token weights preserve prompt mean
+    across microbatch splits. Pipeline setup owns compatibility with other
+    objectives such as distillation.
     """
 
     def normalizer(
@@ -35,9 +37,9 @@ class PolicyGradientReduction(Protocol):
         loss_mask: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the engine weight from the original, unfiltered loss mask."""
+        """Return the engine weight from the original mask or prepared weights."""
         ...
 
     def aggregate(
@@ -47,7 +49,7 @@ class PolicyGradientReduction(Protocol):
         *,
         denominator_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reduce token-shaped loss, retaining the supplied denominator mask."""
         ...
@@ -61,7 +63,7 @@ class TokenMean:
         loss_mask: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return loss_mask.count_nonzero()
 
@@ -72,7 +74,7 @@ class TokenMean:
         *,
         denominator_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         numerator_mask, denominator_mask = _resolve_masks(
             loss, loss_mask, denominator_mask
@@ -90,7 +92,7 @@ class SequenceMean:
         loss_mask: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return _active_sequences(loss_mask, cu_seqlens)
 
@@ -101,7 +103,7 @@ class SequenceMean:
         *,
         denominator_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         numerators, denominators = _sequence_loss_sums(
             loss, loss_mask, denominator_mask, cu_seqlens
@@ -110,10 +112,11 @@ class SequenceMean:
 
 
 class PromptMean:
-    """Average per-prompt token means; weight by active prompt group count.
+    """Average full-prompt token means across freely split microbatches.
 
-    ``group_sizes`` describes physical sequence boundaries. Every prompt group
-    must remain intact when the training batch is split into microbatches.
+    ``prompt_token_weights`` comes from :func:`prepare_prompt_token_weights`
+    before splitting. Its sum is this fragment's share of active prompt groups.
+    Filtering narrows the numerator without changing these original weights.
     """
 
     def normalizer(
@@ -121,13 +124,9 @@ class PromptMean:
         loss_mask: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        denominators = _sequence_sums(loss_mask.bool().to(torch.float32), cu_seqlens)
-        ids, n_groups = _prompt_ids(denominators.numel(), group_sizes, loss_mask.device)
-        return (
-            _prompt_sums(denominators, ids, n_groups).count_nonzero().to(torch.float32)
-        )
+        return _require_prompt_token_weights(loss_mask, prompt_token_weights).sum()
 
     def aggregate(
         self,
@@ -136,16 +135,13 @@ class PromptMean:
         *,
         denominator_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        numerators, denominators = _sequence_loss_sums(
-            loss, loss_mask, denominator_mask, cu_seqlens
-        )
-        ids, n_groups = _prompt_ids(numerators.numel(), group_sizes, loss.device)
-        return _reduce_unit_means(
-            _prompt_sums(numerators, ids, n_groups),
-            _prompt_sums(denominators, ids, n_groups),
-        )
+        numerator_mask, _ = _resolve_masks(loss, loss_mask, denominator_mask)
+        weights = _require_prompt_token_weights(loss_mask, prompt_token_weights)
+        numerator = (torch.where(numerator_mask, loss, 0).float() * weights).sum()
+        weight = weights.sum()
+        return numerator / torch.where(weight > 0, weight, 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +163,7 @@ class ConstantLength:
         loss_mask: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return _active_sequences(loss_mask, cu_seqlens)
 
@@ -178,7 +174,7 @@ class ConstantLength:
         *,
         denominator_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-        group_sizes: GroupSizes | None = None,
+        prompt_token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         numerator_mask, denominator_mask = _resolve_masks(
             loss, loss_mask, denominator_mask
@@ -209,6 +205,35 @@ def make_policy_gradient_reduction(
     if mode == "seq_mean":
         return SequenceMean()
     return PromptMean()
+
+
+def prepare_prompt_token_weights(
+    loss_mask: torch.Tensor, group_sizes: GroupSizes
+) -> torch.Tensor:
+    """Derive original token weights from complete physical prompt groups.
+
+    The padded mask must precede M2/rejection filtering. Each valid token gets
+    the reciprocal of its full prompt group's valid-token count, so every
+    active group has total weight one and empty groups have total weight zero.
+    Carry this tensor through optimizer scheduling, packing and microbatching;
+    never recompute it from a prompt fragment.
+    """
+    if loss_mask.ndim != 2:
+        raise ValueError("Preparing prompt token weights requires a 2D loss_mask.")
+    mask = loss_mask.bool().float()
+    ids, n_groups = _prompt_ids(mask.shape[0], group_sizes, mask.device)
+    denominators = _prompt_sums(mask.sum(dim=-1), ids, n_groups)
+    return mask / denominators[ids].unsqueeze(-1).clamp_min(1)
+
+
+def _require_prompt_token_weights(
+    loss_mask: torch.Tensor, prompt_token_weights: torch.Tensor | None
+) -> torch.Tensor:
+    if prompt_token_weights is None:
+        raise ValueError("prompt_token_weights are required for prompt_mean.")
+    if prompt_token_weights.shape != loss_mask.shape:
+        raise ValueError("prompt_token_weights shape must match loss_mask shape.")
+    return prompt_token_weights.float()
 
 
 def _resolve_masks(

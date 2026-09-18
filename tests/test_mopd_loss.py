@@ -353,7 +353,7 @@ def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets(mode):
         "prox_logp": torch.tensor([[-0.5, -0.5]], dtype=torch.float64),
         "advantages": torch.ones_like(logprobs),
         "loss_mask": torch.ones_like(logprobs, dtype=torch.bool),
-        "group_sizes": [1],
+        "prompt_token_weights": torch.full_like(logprobs, 0.5),
     }
     kwargs = dict(
         logprobs=logprobs,
