@@ -1110,6 +1110,11 @@ def grpo_loss_fn(
             entropy=entropy.detach().float(),
             denominator="n_mopd_tokens",
         )
+        stats_tracker.weighted_mean(
+            "actor_loss/avg",
+            loss,
+            _policy_gradient_loss_weight(input_data, reduction=pg_reduction),
+        )
         return loss
 
     old_logp = input_data["logprobs"]
@@ -1203,8 +1208,8 @@ def grpo_loss_fn(
     mopd_normalization_mask = denominator_mask
     mopd_loss_mask = stat.get("behave_mask", loss_mask).bool()
 
-    # Multi-teacher on-policy distillation. The deprecated single-teacher
-    # fields retain their original joint-loss semantics for compatibility.
+    # Multi-teacher on-policy distillation. Legacy single-teacher numerators
+    # retain their post-M2, pre-rejection mask; both use the original denominator.
     teacher_logp = input_data.get("teacher_logp")
     mopd_teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
     rkl_stat = None
@@ -1251,14 +1256,23 @@ def grpo_loss_fn(
             loss = (
                 -distill_loss_weight
                 * rkl_weighted_term.sum()
-                / loss_mask.sum().clamp(min=1)
+                / denominator_mask.sum().clamp(min=1)
             )
             rkl_stat = -rkl_weighted_term
         else:
             rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
-            rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
+            rkl_penalty = rkl_penalty_per_token.sum() / denominator_mask.sum().clamp(
+                min=1
+            )
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
             rkl_stat = rkl_penalty_per_token
+
+    # Match the engine's aggregation across microbatches and data-parallel ranks.
+    stats_tracker.weighted_mean(
+        "actor_loss/avg",
+        loss,
+        _policy_gradient_loss_weight(input_data, reduction=pg_reduction),
+    )
 
     # Log training statistics
     stats_tracker.denominator(
@@ -1291,7 +1305,7 @@ def grpo_loss_fn(
         new_logp=logprobs.detach(),
         old_logp=old_logp,
         entropy=entropy.float(),
-        actor_loss=stat["loss"],
+        actor_loss_token_mean=stat["loss"].float(),
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
         logp_diff=logp_diff,
