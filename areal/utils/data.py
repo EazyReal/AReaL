@@ -540,24 +540,11 @@ def allocate_balanced_mbs_synced(
     lens: list[int],
     group: dist.ProcessGroup | None = None,
 ) -> list[list[int]]:
+    group_indices = allocate_balanced_mbs(mb_spec, lens)
     if not dist.is_initialized():
-        return allocate_balanced_mbs(mb_spec, lens)
-
-    # Allocation can fail on only one rank, including after a synchronized
-    # retry increases n_mbs beyond that rank's number of atomic prompt groups.
-    # Share failures before any rank returns or enters the next collective.
-    group_indices = []
-    error = None
-    try:
-        group_indices = allocate_balanced_mbs(mb_spec, lens)
-    except (ValueError, RuntimeError) as exc:
-        error = str(exc)
-    outcomes = [None for _ in range(dist.get_world_size(group))]
-    dist.all_gather_object(outcomes, (len(group_indices), error), group=group)
-    for _, message in outcomes:
-        if message is not None:
-            raise RuntimeError(message)
-    all_n_mbs = [count for count, _ in outcomes]
+        return group_indices
+    all_n_mbs = [None for _ in range(dist.get_world_size(group))]
+    dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
     return allocate_balanced_mbs_synced(
@@ -838,56 +825,6 @@ def _resolve_microbatch_sequence_groups(
     return groups, sizes
 
 
-def _infeasible_atomic_groups_message(
-    mb_spec: MicroBatchSpec,
-    group_token_counts: Sequence[int],
-) -> str | None:
-    """Return why prompt groups cannot be packed as atomic units, if at all.
-
-    ``group_sizes`` changes the allocation unit from one sequence to one whole
-    prompt group. With distributed execution the caller all-gathers this
-    message so every rank raises together; a missing group uses WORLD.
-    """
-    counts = [int(n) for n in group_token_counts]
-    capacity = mb_spec.max_tokens_per_mb
-    if capacity is not None:
-        oversized = [n for n in counts if n > capacity]
-        if oversized:
-            return (
-                "group_sizes keeps each prompt group in one microbatch, but a "
-                f"group has {max(oversized)} tokens which exceeds "
-                f"max_tokens_per_mb={capacity}. Raise max_tokens_per_mb or "
-                "reduce n_samples / sequence length."
-            )
-    min_groups = mb_spec.n_mbs
-    n_groups_divisor = mb_spec.n_mbs_divisor
-    if min_groups is None or min_groups < n_groups_divisor:
-        min_groups = n_groups_divisor
-    min_groups = (
-        (min_groups + n_groups_divisor - 1) // n_groups_divisor
-    ) * n_groups_divisor
-    if len(counts) < min_groups:
-        return (
-            "group_sizes keeps each prompt group in one microbatch, so the "
-            f"split needs at least {min_groups} groups, but this batch has "
-            f"{len(counts)}. Lower ppo_n_minibatches / n_mbs, or include more "
-            "prompts per update."
-        )
-    return None
-
-
-def _raise_synced_infeasible_atomic_groups(
-    message: str | None,
-    group: dist.ProcessGroup | None,
-) -> None:
-    if dist.is_initialized():
-        gathered: list[str | None] = [None] * dist.get_world_size(group)
-        dist.all_gather_object(gathered, message, group=group)
-        message = next((item for item in gathered if item is not None), None)
-    if message is not None:
-        raise RuntimeError(message)
-
-
 def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
     """Create one model-valid row for collective participation."""
     batch_size = get_batch_size(template)
@@ -978,7 +915,6 @@ def split_padded_tensor_dict_into_mb_list(
             mb_spec, max_tokens_per_mb=DEFAULT_MAX_TOKENS_PER_MB
         )
     granularity = mb_spec.granularity
-    # Explicit prompt groups remain atomic and retain strict packing limits.
     allow_transport_padding = (
         allow_transport_padding and data.get("group_sizes") is None
     )
@@ -1004,12 +940,6 @@ def split_padded_tensor_dict_into_mb_list(
         max_seqlen = data["attention_mask"].shape[1]
         seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
         input_lens = [sum(seq_lens[i] for i in indices) for indices in seq_groups]
-        if explicit_group_sizes is not None:
-            message = _infeasible_atomic_groups_message(allocation_spec, input_lens)
-            if sync_mbs:
-                _raise_synced_infeasible_atomic_groups(message, group)
-            elif message is not None:
-                raise RuntimeError(message)
         if transport_dummy_count:
             input_lens[-transport_dummy_count // granularity :] = [0] * (
                 transport_dummy_count // granularity

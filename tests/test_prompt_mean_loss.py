@@ -418,50 +418,6 @@ def test_split_padded_batch_keeps_ragged_prompt_groups_atomic():
     assert sorted(mb["attention_mask"].shape[0] for mb in mb_list.mbs) == [1, 2]
 
 
-def test_atomic_prompt_groups_reject_oversize_token_cap():
-    data = {
-        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
-        "input_ids": torch.arange(8).view(2, 4),
-        "loss_mask": torch.ones(2, 4, dtype=torch.bool),
-        "group_sizes": [2],
-    }
-
-    with pytest.raises(RuntimeError, match="max_tokens_per_mb"):
-        split_padded_tensor_dict_into_mb_list(
-            data, MicroBatchSpec(n_mbs=1, max_tokens_per_mb=4)
-        )
-
-
-@pytest.mark.parametrize("n_mbs, divisor", [(4, 1), (3, 2)])
-def test_atomic_prompt_groups_reject_more_microbatches_than_groups(n_mbs, divisor):
-    data = {
-        "attention_mask": torch.ones(2, 3, dtype=torch.bool),
-        "input_ids": torch.arange(6).view(2, 3),
-        "loss_mask": torch.ones(2, 3, dtype=torch.bool),
-        "group_sizes": [1, 1],
-    }
-
-    with pytest.raises(RuntimeError, match="at least 4 groups"):
-        split_padded_tensor_dict_into_mb_list(
-            data, MicroBatchSpec(n_mbs=n_mbs, n_mbs_divisor=divisor)
-        )
-
-
-def test_token_mean_split_allows_groups_that_exceed_token_cap():
-    data = {
-        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
-        "input_ids": torch.arange(8).view(2, 4),
-        "loss_mask": torch.ones(2, 4, dtype=torch.bool),
-    }
-
-    mb_list = split_padded_tensor_dict_into_mb_list(
-        data, MicroBatchSpec(n_mbs=1, max_tokens_per_mb=4, granularity=1)
-    )
-
-    assert len(mb_list.mbs) == 2
-    assert all("group_sizes" not in mb for mb in mb_list.mbs)
-
-
 def test_nested_split_keeps_groups_in_optimizer_step_and_splits_inner_fragments():
     mask = torch.ones(4, 3, dtype=torch.bool)
     data = {

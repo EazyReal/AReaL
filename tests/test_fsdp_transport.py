@@ -96,20 +96,6 @@ def _check_fsdp_transport_ranks(rank: int, rendezvous: str) -> None:
             engine.model.reset_mock()
             engine.forward_backward_batch(mb_list, lambda *_: None, forward_only=True)
             assert engine.model.call_count == len(mb_list.mbs)
-
-        engine.config = SimpleNamespace(
-            mb_spec=MicroBatchSpec(n_mbs=1, max_tokens_per_mb=4)
-        )
-        engine.model_config = SimpleNamespace(model_type="llama")
-        engine._cpu_group = dist.new_group(backend="gloo")
-        data = {
-            "input_ids": torch.ones(2, 4, dtype=torch.long),
-            "attention_mask": torch.ones(2, 4, dtype=torch.bool),
-        }
-        if rank == 0:
-            data["group_sizes"] = [2]
-        with pytest.raises(RuntimeError, match="max_tokens_per_mb"):
-            engine._prepare_mb_list(data)
     finally:
         dist.destroy_process_group()
 

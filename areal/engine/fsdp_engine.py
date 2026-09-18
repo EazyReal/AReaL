@@ -1999,23 +1999,12 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        mb_list = None
-        error = None
-        try:
-            mb_list = split_padded_tensor_dict_into_mb_list(
-                input_,
-                self.config.mb_spec,
-                allow_transport_padding=allow_transport_padding,
-                sync_mbs=False,
-            )
-        except (ValueError, RuntimeError) as exc:
-            error = str(exc)
-        errors = [None] * dist.get_world_size(self.cpu_group)
-        dist.all_gather_object(errors, error, group=self.cpu_group)
-        for message in errors:
-            if message is not None:
-                raise RuntimeError(message)
-        assert mb_list is not None
+        mb_list = split_padded_tensor_dict_into_mb_list(
+            input_,
+            self.config.mb_spec,
+            allow_transport_padding=allow_transport_padding,
+            sync_mbs=False,
+        )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
             mb_list,

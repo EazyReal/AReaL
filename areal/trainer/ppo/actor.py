@@ -1050,12 +1050,7 @@ def grpo_loss_fn(
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
 ):
-    """Compute loss and logging stats for an engine microbatch.
-
-    The actor validates objective compatibility before splitting the batch:
-    distillation requires token-mean aggregation, and prompt-mean aggregation
-    requires atomic prompt groups. This function consumes the assembled reduction.
-    """
+    """Compute loss and logging stats using the actor's assembled reduction."""
     pg_reduction = TokenMean() if pg_reduction is None else pg_reduction
     denominator_mask = input_data["loss_mask"].bool()
     loss_mask = denominator_mask
