@@ -22,7 +22,6 @@ from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
 from areal.trainer.ppo.loss_reduction import (
     PreparedLossStep,
     prepare_policy_gradient_batch,
-    prepare_policy_gradient_steps,
 )
 from areal.trainer.ppo.stats import infer_token_denominator, log_train_inference_stats
 from areal.utils import logging, stats_tracker
@@ -848,9 +847,10 @@ class PPOActor:
         # Megatron keeps the full batch on CPU and streams only the current
         # microbatch to the accelerator. Stage before the outer PPO split so
         # that split does not retain every optimizer minibatch on GPU.
-        local_active_groups = prepare_policy_gradient_batch(
+        prepared_loss = prepare_policy_gradient_batch(
             data,
             mode=self.config.loss_aggregation,
+            divisor=self.config.loss_aggregation_divisor,
             group_sizes=meta.traj_group_sizes if meta is not None else None,
         )
         stage_batch_for_engine(data, self.engine)
@@ -862,11 +862,8 @@ class PPOActor:
             group=self.engine.data_parallel_group,
         )
 
-        loss_steps = prepare_policy_gradient_steps(
+        loss_steps = prepared_loss.for_steps(
             mb_inputs,
-            mode=self.config.loss_aggregation,
-            divisor=self.config.loss_aggregation_divisor,
-            local_active_groups=local_active_groups,
             dp_group=self.engine.data_parallel_group,
             device=self.engine.device,
         )

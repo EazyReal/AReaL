@@ -10,7 +10,6 @@ from areal.trainer.mopd.loss import compose_mopd_loss, mopd_loss_fn
 from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
 from areal.trainer.ppo.loss_reduction import (
     prepare_policy_gradient_batch,
-    prepare_policy_gradient_steps,
 )
 from areal.utils.functional.loss_aggregation import TokenMean
 
@@ -358,13 +357,13 @@ def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets(mode):
         "advantages": torch.ones_like(logprobs),
         "loss_mask": torch.ones_like(logprobs, dtype=torch.bool),
     }
-    local_groups = prepare_policy_gradient_batch(input_data, mode=mode, group_sizes=[1])
-    step = prepare_policy_gradient_steps(
-        [input_data],
+    prepared = prepare_policy_gradient_batch(
+        input_data,
         mode=mode,
+        group_sizes=[1],
         divisor=4.0 if mode == "constant" else None,
-        local_active_groups=local_groups,
-    )[0]
+    )
+    step = prepared.for_steps([input_data])[0]
     kwargs = dict(
         logprobs=logprobs,
         entropy=torch.zeros_like(logprobs),

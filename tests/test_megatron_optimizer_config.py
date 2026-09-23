@@ -147,7 +147,6 @@ def test_per_token_normalization_preserves_policy_and_auxiliary_gradients(
 ):
     from areal.trainer.ppo.loss_reduction import (
         prepare_policy_gradient_batch,
-        prepare_policy_gradient_steps,
     )
 
     mask = torch.tensor([[1, 1], [1, 1], [1, 0]], dtype=torch.bool)
@@ -156,13 +155,13 @@ def test_per_token_normalization_preserves_policy_and_auxiliary_gradients(
     values = torch.tensor([[2.0, 8.0], [6.0, 4.0], [10.0, 0.0]], requires_grad=True)
     auxiliary = torch.tensor(2.0, requires_grad=True)
     data = {"loss_mask": mask}
-    active_groups = prepare_policy_gradient_batch(data, mode=mode, group_sizes=[2, 1])
-    step = prepare_policy_gradient_steps(
-        [data],
+    prepared = prepare_policy_gradient_batch(
+        data,
         mode=mode,
-        local_active_groups=active_groups,
+        group_sizes=[2, 1],
         divisor=4.0 if mode == "constant" else None,
-    )[0]
+    )
+    step = prepared.for_steps([data])[0]
     partitions = (slice(0, 1), slice(1, 3))
     batches = [{key: value[rows] for key, value in data.items()} for rows in partitions]
     engine = megatron_engine_module.MegatronEngine.__new__(

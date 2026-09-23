@@ -6,7 +6,7 @@ import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
@@ -41,22 +41,115 @@ class PreparedLossStep:
         return self.bind(data).normalizer()
 
 
+class PreparedLossBatch(Protocol):
+    def for_steps(
+        self,
+        microbatches: Sequence[dict[str, Any]],
+        *,
+        dp_group: dist.ProcessGroup | None = None,
+        device: torch.device | str | None = None,
+    ) -> list[PreparedLossStep]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _IndependentSteps:
+    step: PreparedLossStep
+
+    def for_steps(
+        self,
+        microbatches: Sequence[dict[str, Any]],
+        *,
+        dp_group: dist.ProcessGroup | None = None,
+        device: torch.device | str | None = None,
+    ) -> list[PreparedLossStep]:
+        if not microbatches:
+            raise ValueError("Cannot prepare an empty optimizer schedule.")
+        return [self.step] * len(microbatches)
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptMeanBatch:
+    local_active_groups: torch.Tensor
+
+    def for_steps(
+        self,
+        microbatches: Sequence[dict[str, Any]],
+        *,
+        dp_group: dist.ProcessGroup | None = None,
+        device: torch.device | str | None = None,
+    ) -> list[PreparedLossStep]:
+        """Fix K/G and each microbatch's physical-response share after scheduling.
+
+        The scheduler owns identical step counts across ranks. Reduce exact group
+        and response counts over DP, excluding CP replicas, then copy the small
+        counts to the host once so binding needs no device synchronization.
+        """
+        if not microbatches:
+            raise ValueError("Cannot prepare an empty optimizer schedule.")
+        collective_device = (
+            device if device is not None else self.local_active_groups.device
+        )
+        if dist.is_initialized() and dist.get_backend(dp_group) == "gloo":
+            collective_device = "cpu"
+        row_counts = torch.tensor(
+            [
+                0 if mb.get(TRANSPORT_DUMMY_KEY) is True else get_batch_size(mb)
+                for mb in microbatches
+            ],
+            dtype=torch.int64,
+            device=collective_device,
+        )
+        counts = torch.cat(
+            [
+                self.local_active_groups.reshape(1).to(device=collective_device),
+                row_counts,
+            ]
+        )
+        if dist.is_initialized():
+            dist.all_reduce(counts, group=dp_group)
+        active_groups, *global_rows = counts.cpu().tolist()
+        if active_groups == 0:
+            raise ValueError("Prompt mean requires active prompt groups in the update.")
+        if any(rows <= 0 for rows in global_rows):
+            raise ValueError("Every optimizer step must contain real responses.")
+        step_scale = len(microbatches) / active_groups
+        return [
+            PreparedLossStep(
+                functools.partial(
+                    _bind_prompt_mean, step_scale=step_scale, global_rows=rows
+                )
+            )
+            for rows in global_rows
+        ]
+
+
 def prepare_policy_gradient_batch(
     data: dict[str, Any],
     *,
     mode: LossAggregationMode,
+    divisor: float | None = None,
     group_sizes: GroupSizes | None = None,
-) -> torch.Tensor | None:
-    """Prepare original coefficients before response-level batch splitting.
+) -> PreparedLossBatch:
+    """Prepare loss metadata before response-level splitting.
 
-    Prompt mean adds one token-shaped internal tensor and returns the exact
-    local count of active full groups. Other modes need no prepared metadata.
-    Group boundaries never enter the batch dictionary or affect scheduling.
+    Token coefficients travel with the batch through splitting and packing. The
+    returned context retains only configuration or the active-group scalar;
+    optimizer-step constants are resolved once the schedule is known.
     """
     if mode not in _MODES:
         raise ValueError(f"loss_aggregation must be one of {_MODES}, got {mode!r}.")
-    if mode != "prompt_mean":
-        return None
+    if mode == "constant":
+        if divisor is None or not math.isfinite(divisor) or divisor <= 0:
+            raise ValueError("divisor must be a positive finite value.")
+        return _IndependentSteps(
+            PreparedLossStep(functools.partial(_bind_constant_length, divisor=divisor))
+        )
+    if divisor is not None:
+        raise ValueError("divisor is only valid for loss_aggregation='constant'.")
+    if mode == "token_mean":
+        return _IndependentSteps(PreparedLossStep(_bind_token_mean))
+    if mode == "seq_mean":
+        return _IndependentSteps(PreparedLossStep(_bind_sequence_mean))
     mask = data["loss_mask"].bool()
     if mask.ndim != 2:
         raise ValueError("Preparing prompt mean requires a 2D loss_mask.")
@@ -78,83 +171,7 @@ def prepare_policy_gradient_batch(
     counts = torch.zeros(len(sizes), dtype=torch.int64, device=mask.device)
     counts.scatter_add_(0, ids, mask.sum(dim=-1, dtype=torch.int64))
     data[PG_TOKEN_WEIGHTS] = mask.float() / counts[ids].unsqueeze(-1).clamp_min(1)
-    return counts.count_nonzero()
-
-
-def prepare_policy_gradient_steps(
-    microbatches: Sequence[dict[str, Any]],
-    *,
-    mode: LossAggregationMode,
-    divisor: float | None = None,
-    local_active_groups: torch.Tensor | None = None,
-    dp_group: dist.ProcessGroup | None = None,
-    device: torch.device | str | None = None,
-) -> list[PreparedLossStep]:
-    """Prepare callbacks after the synchronized optimizer schedule is known.
-
-    For prompt mean, reduce exact active-group and real-response counts over DP
-    once. The realized step count K and global active groups G fix the objective
-    scale K/G; each microbatch receives its step's physical-response share q.
-    A real all-masked step remains in the schedule, while transport rows have
-    zero share. An update with G=0 is rejected on every participating rank.
-
-    The scheduler owns identical step counts across ranks. The collective group
-    excludes CP replicas; engines retain their existing CP/DDP compensation.
-    Small counts are copied to the host once here, so binding needs no tensor
-    transfers or host synchronization for CPU versus accelerator batches.
-    """
-    if mode not in _MODES:
-        raise ValueError(f"loss_aggregation must be one of {_MODES}, got {mode!r}.")
-    if mode == "constant":
-        if divisor is None or not math.isfinite(divisor) or divisor <= 0:
-            raise ValueError("divisor must be a positive finite value.")
-    elif divisor is not None:
-        raise ValueError("divisor is only valid for loss_aggregation='constant'.")
-    if not microbatches:
-        raise ValueError("Cannot prepare an empty optimizer schedule.")
-
-    if mode == "token_mean":
-        step = PreparedLossStep(_bind_token_mean)
-    elif mode == "seq_mean":
-        step = PreparedLossStep(_bind_sequence_mean)
-    elif mode == "constant":
-        step = PreparedLossStep(
-            functools.partial(_bind_constant_length, divisor=divisor)
-        )
-    else:
-        if local_active_groups is None:
-            raise ValueError("Prompt mean requires the prepared active-group count.")
-        collective_device = device if device is not None else local_active_groups.device
-        if dist.is_initialized() and dist.get_backend(dp_group) == "gloo":
-            collective_device = "cpu"
-        row_counts = torch.tensor(
-            [
-                0 if mb.get(TRANSPORT_DUMMY_KEY) is True else get_batch_size(mb)
-                for mb in microbatches
-            ],
-            dtype=torch.int64,
-            device=collective_device,
-        )
-        counts = torch.cat(
-            [local_active_groups.reshape(1).to(device=collective_device), row_counts]
-        )
-        if dist.is_initialized():
-            dist.all_reduce(counts, group=dp_group)
-        active_groups, *global_rows = counts.cpu().tolist()
-        if active_groups == 0:
-            raise ValueError("Prompt mean requires active prompt groups in the update.")
-        if any(rows <= 0 for rows in global_rows):
-            raise ValueError("Every optimizer step must contain real responses.")
-        step_scale = len(microbatches) / active_groups
-        return [
-            PreparedLossStep(
-                functools.partial(
-                    _bind_prompt_mean, step_scale=step_scale, global_rows=rows
-                )
-            )
-            for rows in global_rows
-        ]
-    return [step] * len(microbatches)
+    return _PromptMeanBatch(counts.count_nonzero())
 
 
 def _bind_token_mean(data: dict[str, Any]) -> TokenMean:

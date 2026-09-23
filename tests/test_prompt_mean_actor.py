@@ -169,7 +169,6 @@ def _distributed_fixed_prompt_objective(rank, rendezvous, requested_steps=6):
     )
     from areal.trainer.ppo.loss_reduction import (
         prepare_policy_gradient_batch,
-        prepare_policy_gradient_steps,
     )
     from areal.utils.data import TRANSPORT_DUMMY_KEY
 
@@ -203,16 +202,14 @@ def _distributed_fixed_prompt_objective(rank, rendezvous, requested_steps=6):
         dist.all_reduce(oracle)
         expected_gradient = oracle[0] / oracle[1]
 
-        local_groups = prepare_policy_gradient_batch(
+        prepared = prepare_policy_gradient_batch(
             data, mode="prompt_mean", group_sizes=meta.traj_group_sizes
         )
         schedule = split_training_batch_into_microbatches(
             data, n_mbs=requested_steps, group=dist.group.WORLD
         )
-        steps = prepare_policy_gradient_steps(
+        steps = prepared.for_steps(
             schedule,
-            mode="prompt_mean",
-            local_active_groups=local_groups,
             dp_group=dist.group.WORLD,
             device="cpu",
         )
@@ -270,14 +267,12 @@ def _distributed_fixed_prompt_objective(rank, rendezvous, requested_steps=6):
 
         # Every DP participant rejects the same globally undefined objective.
         data["loss_mask"].zero_()
-        local_groups = prepare_policy_gradient_batch(
+        prepared = prepare_policy_gradient_batch(
             data, mode="prompt_mean", group_sizes=meta.traj_group_sizes
         )
         with pytest.raises(ValueError, match="active prompt groups"):
-            prepare_policy_gradient_steps(
+            prepared.for_steps(
                 [data],
-                mode="prompt_mean",
-                local_active_groups=local_groups,
                 dp_group=dist.group.WORLD,
                 device="cpu",
             )

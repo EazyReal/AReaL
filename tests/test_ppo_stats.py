@@ -8,7 +8,6 @@ from areal.trainer.ppo.actor import PPOActor, _infer_prompt_lens, grpo_loss_fn
 from areal.trainer.ppo.critic import ppo_loss_fn
 from areal.trainer.ppo.loss_reduction import (
     prepare_policy_gradient_batch,
-    prepare_policy_gradient_steps,
 )
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils.stats_tracker import DistributedStatsTracker
@@ -208,13 +207,13 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
     mask = torch.tensor([[1, 1, 0], [1, 1, 1], [1, 0, 0]], dtype=torch.bool)
     advantages = -torch.tensor([[1.0, 3.0, 0.0], [2.0, 4.0, 6.0], [10.0, 0.0, 0.0]])
     data = {"loss_mask": mask}
-    local_groups = prepare_policy_gradient_batch(data, mode=mode, group_sizes=[2, 1])
-    step = prepare_policy_gradient_steps(
-        [data],
+    prepared = prepare_policy_gradient_batch(
+        data,
         mode=mode,
+        group_sizes=[2, 1],
         divisor=4.0 if mode == "constant" else None,
-        local_active_groups=local_groups,
-    )[0]
+    )
+    step = prepared.for_steps([data])[0]
     # This fixed selection isolates aggregation from M2's own selection scope.
     retained = torch.tensor([[1, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=torch.bool)
 
@@ -300,13 +299,11 @@ def test_prompt_objective_metric_averages_optimizer_steps_equally(filtered):
     values = torch.tensor([[1.0, 3.0, 0.0], [2.0, 4.0, 6.0], [10.0, 0.0, 0.0]])
     retained = torch.tensor([[1, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=torch.bool)
     data = {"loss_mask": mask}
-    active_groups = prepare_policy_gradient_batch(
+    prepared = prepare_policy_gradient_batch(
         data, mode="prompt_mean", group_sizes=[2, 1]
     )
     batches = [{key: value[i : i + 1] for key, value in data.items()} for i in range(3)]
-    steps = prepare_policy_gradient_steps(
-        batches, mode="prompt_mean", local_active_groups=active_groups
-    )
+    steps = prepared.for_steps(batches)
     tracker = DistributedStatsTracker()
     for i, (batch, step) in enumerate(zip(batches, steps, strict=True)):
         logprobs = torch.zeros_like(values[i : i + 1])

@@ -13,7 +13,6 @@ from areal.trainer.ppo.loss_reduction import (
     PG_TOKEN_WEIGHTS,
     PreparedLossStep,
     prepare_policy_gradient_batch,
-    prepare_policy_gradient_steps,
 )
 from areal.utils.functional.loss_aggregation import (
     ConstantLength,
@@ -27,15 +26,13 @@ MASK = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0], [1, 0, 0, 0]], dtype=torch.bool
 
 
 def _prepare(data, mode, group_sizes):
-    local_groups = prepare_policy_gradient_batch(
-        data, mode=mode, group_sizes=group_sizes
-    )
-    return prepare_policy_gradient_steps(
-        [data],
+    prepared = prepare_policy_gradient_batch(
+        data,
         mode=mode,
+        group_sizes=group_sizes,
         divisor=4.0 if mode == "constant" else None,
-        local_active_groups=local_groups,
-    )[0]
+    )
+    return prepared.for_steps([data])[0]
 
 
 @pytest.mark.parametrize(
@@ -173,11 +170,11 @@ def test_callback_pair_preserves_loss_and_gradient_across_partitions(
 )
 def test_preparation_rejects_invalid_configuration(mode, divisor):
     with pytest.raises(ValueError):
-        prepare_policy_gradient_steps(
-            [{"loss_mask": MASK}],
+        prepare_policy_gradient_batch(
+            {"loss_mask": MASK},
             mode=mode,
             divisor=divisor,
-            local_active_groups=torch.tensor(2),
+            group_sizes=[2, 1],
         )
 
 
@@ -243,13 +240,11 @@ def test_normalizer_counts_original_active_units():
 
 def test_prompt_preparation_rejects_globally_empty_objective():
     data = {"loss_mask": torch.zeros_like(MASK)}
-    local_groups = prepare_policy_gradient_batch(
+    prepared = prepare_policy_gradient_batch(
         data, mode="prompt_mean", group_sizes=[2, 1]
     )
     with pytest.raises(ValueError, match="active prompt groups"):
-        prepare_policy_gradient_steps(
-            [data], mode="prompt_mean", local_active_groups=local_groups
-        )
+        prepared.for_steps([data])
 
 
 @pytest.mark.parametrize("mode", ["seq_mean", "constant"])
