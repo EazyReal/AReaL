@@ -6,11 +6,11 @@ import torch
 from areal.api.cli_args import MOPDLossConfig, PPOActorConfig
 from areal.trainer.ppo.actor import PPOActor, _infer_prompt_lens, grpo_loss_fn
 from areal.trainer.ppo.critic import ppo_loss_fn
-from areal.trainer.ppo.stats import infer_token_denominator
-from areal.utils.functional.loss_aggregation import (
-    make_policy_gradient_reduction,
-    prepare_prompt_token_weights,
+from areal.trainer.ppo.loss_reduction import (
+    prepare_policy_gradient_batch,
+    prepare_policy_gradient_steps,
 )
+from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils.stats_tracker import DistributedStatsTracker
 
 
@@ -205,12 +205,16 @@ def test_infer_prompt_lens_falls_back_to_seqlen_when_nothing_is_trained():
 def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
     mode, filtered
 ):
-    reduction = make_policy_gradient_reduction(
-        mode, divisor=4.0 if mode == "constant" else None
-    )
     mask = torch.tensor([[1, 1, 0], [1, 1, 1], [1, 0, 0]], dtype=torch.bool)
     advantages = -torch.tensor([[1.0, 3.0, 0.0], [2.0, 4.0, 6.0], [10.0, 0.0, 0.0]])
-    prompt_weights = prepare_prompt_token_weights(mask, [2, 1])
+    data = {"loss_mask": mask}
+    local_groups = prepare_policy_gradient_batch(data, mode=mode, group_sizes=[2, 1])
+    step = prepare_policy_gradient_steps(
+        [data],
+        mode=mode,
+        divisor=4.0 if mode == "constant" else None,
+        local_active_groups=local_groups,
+    )[0]
     # This fixed selection isolates aggregation from M2's own selection scope.
     retained = torch.tensor([[1, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=torch.bool)
 
@@ -225,7 +229,7 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
                 "prox_logp": logprobs,
                 "advantages": advantages[rows],
                 "loss_mask": local_mask,
-                "prompt_token_weights": prompt_weights[rows],
+                **{key: value[rows] for key, value in data.items()},
             }
             with (
                 patch("areal.trainer.ppo.actor.stats_tracker", tracker),
@@ -242,15 +246,11 @@ def test_actor_objective_metric_matches_weighted_loss_across_microbatches(
                         eps_clip=0.2,
                         eps_clip_higher=None,
                         c_clip=None,
-                        pg_reduction=reduction,
+                        loss_step=step,
                         m2_threshold=0.1,
                     )
                 )
-            weights.append(
-                reduction.normalizer(
-                    local_mask, prompt_token_weights=prompt_weights[rows]
-                )
-            )
+            weights.append(step.loss_weight(inputs))
         expected = sum(loss * weight for loss, weight in zip(losses, weights)) / sum(
             weights
         )
@@ -292,3 +292,43 @@ def test_actor_objective_metric_includes_mopd_composition(rl_coefficient):
             mopd_loss_config=MOPDLossConfig(rl_coefficient=rl_coefficient),
         )
     assert tracker.export()["actor_loss/avg"] == pytest.approx(loss.item())
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_prompt_objective_metric_averages_optimizer_steps_equally(filtered):
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1], [1, 0, 0]], dtype=torch.bool)
+    values = torch.tensor([[1.0, 3.0, 0.0], [2.0, 4.0, 6.0], [10.0, 0.0, 0.0]])
+    retained = torch.tensor([[1, 0, 0], [0, 0, 0], [1, 0, 0]], dtype=torch.bool)
+    data = {"loss_mask": mask}
+    active_groups = prepare_policy_gradient_batch(
+        data, mode="prompt_mean", group_sizes=[2, 1]
+    )
+    batches = [{key: value[i : i + 1] for key, value in data.items()} for i in range(3)]
+    steps = prepare_policy_gradient_steps(
+        batches, mode="prompt_mean", local_active_groups=active_groups
+    )
+    tracker = DistributedStatsTracker()
+    for i, (batch, step) in enumerate(zip(batches, steps, strict=True)):
+        logprobs = torch.zeros_like(values[i : i + 1])
+        batch.update(
+            logprobs=logprobs, prox_logp=logprobs, advantages=-values[i : i + 1]
+        )
+        with (
+            patch("areal.trainer.ppo.actor.stats_tracker", tracker),
+            patch(
+                "areal.trainer.ppo.actor._apply_m2po_masking",
+                return_value=retained[i : i + 1] if filtered else batch["loss_mask"],
+            ),
+        ):
+            grpo_loss_fn(
+                logprobs=logprobs,
+                entropy=logprobs,
+                input_data=batch,
+                eps_clip=0.2,
+                eps_clip_higher=None,
+                c_clip=None,
+                m2_threshold=0.1,
+                loss_step=step,
+            )
+    expected = (1 / 5 + 10) / 2 if filtered else (16 / 5 + 10) / 2
+    assert tracker.export()["actor_loss/avg"] == pytest.approx(expected)

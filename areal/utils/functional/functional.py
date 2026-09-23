@@ -465,9 +465,7 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    prompt_token_weights: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
-    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -505,15 +503,11 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
-        prompt_token_weights: Precomputed full-prompt token weights carried through
-            microbatch splitting. Required for prompt_mean aggregation.
         pg_reduction: PolicyGradientReduction pairing loss aggregation with its
             engine weight. None uses the default token-mean reduction.
-        denominator_mask: Original loss mask kept as the aggregation denominator
-            when rejection sampling narrows loss_mask.
     """
     # Rejection masking narrows the numerator but keeps the original denominator.
-    orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
+    orig_loss_mask = loss_mask
     # Pre-filter mask kept for ratio/clip statistics: rejection sampling below
     # narrows loss_mask for the loss, but stats stay on the original mask so
     # importance_weight/avg reads 1.0 under proximal reuse instead of
@@ -578,14 +572,8 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    reduction = TokenMean() if pg_reduction is None else pg_reduction
-    pg_loss = reduction.aggregate(
-        pg_loss,
-        loss_mask,
-        denominator_mask=orig_loss_mask,
-        cu_seqlens=cu_seqlens,
-        prompt_token_weights=prompt_token_weights,
-    )
+    reduction = TokenMean(orig_loss_mask) if pg_reduction is None else pg_reduction
+    pg_loss = reduction.aggregate(pg_loss, loss_mask)
     clip_mask.logical_and_(stat_loss_mask)
     dual_clip_mask.logical_and_(stat_loss_mask)
     # One host sync per microbatch: the count feeds three derived stats.
@@ -622,9 +610,7 @@ def sapo_loss_fn(
     loss_mask: torch.Tensor,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    prompt_token_weights: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
-    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
@@ -640,11 +626,8 @@ def sapo_loss_fn(
         loss_mask: Mask for valid tokens
         importance_sampling_level: "token" or "sequence" level importance sampling
         cu_seqlens: Cumulative sequence lengths for sequence-level IS
-        prompt_token_weights: Precomputed full-prompt token weights, required for
-            prompt_mean aggregation
         pg_reduction: PolicyGradientReduction pairing loss aggregation with its
             engine weight
-        denominator_mask: Original loss mask kept as the aggregation denominator
 
     Returns:
         Tuple of (loss, statistics dict compatible with PPO)
@@ -681,14 +664,8 @@ def sapo_loss_fn(
     # Compute loss
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
-    reduction = TokenMean() if pg_reduction is None else pg_reduction
-    pg_loss = reduction.aggregate(
-        pg_loss,
-        loss_mask,
-        denominator_mask=denominator_mask,
-        cu_seqlens=cu_seqlens,
-        prompt_token_weights=prompt_token_weights,
-    )
+    reduction = TokenMean(loss_mask) if pg_reduction is None else pg_reduction
+    pg_loss = reduction.aggregate(pg_loss, loss_mask)
 
     # Return stat dict compatible with PPO (fake clip_mask for logging compatibility)
     stat = dict(
@@ -716,9 +693,7 @@ def cispo_loss_fn(
     old_logprobs: torch.Tensor | None = None,
     rejection_sampling: RejectionSamplingConfig | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    prompt_token_weights: torch.Tensor | None = None,
     pg_reduction: PolicyGradientReduction | None = None,
-    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
 
@@ -761,12 +736,8 @@ def cispo_loss_fn(
             None disables it (pure on-policy CISPO).
         cu_seqlens: Cumulative sequence lengths for 1D packed inputs; required when
             ``rejection_sampling.level == "sequence"``.
-        prompt_token_weights: Precomputed full-prompt token weights carried through
-            microbatch splitting; required for ``loss_aggregation='prompt_mean'``.
         pg_reduction: :class:`PolicyGradientReduction` implementing the aggregation;
             ``None`` uses the default token-mean reduction.
-        denominator_mask: Original loss mask kept as the aggregation denominator
-            when rejection sampling narrows ``loss_mask``.
 
     Returns:
         ``(loss, stat)`` matching the PPO loss signature. ``stat['clip_mask']``
@@ -780,7 +751,7 @@ def cispo_loss_fn(
             "CISPO requires a positive eps_clip_higher; the asymmetric upper "
             f"clip is the defining knob (MiniMax-M1 Eq. 4-5). Got {eps_clip_higher!r}."
         )
-    orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
+    orig_loss_mask = loss_mask
 
     # Decoupled off-policy correction: the pi_proximal/pi_behave weight.
     if rejection_sampling is not None:
@@ -811,14 +782,8 @@ def cispo_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    reduction = TokenMean() if pg_reduction is None else pg_reduction
-    pg_loss = reduction.aggregate(
-        pg_loss,
-        loss_mask,
-        denominator_mask=orig_loss_mask,
-        cu_seqlens=cu_seqlens,
-        prompt_token_weights=prompt_token_weights,
-    )
+    reduction = TokenMean(orig_loss_mask) if pg_reduction is None else pg_reduction
+    pg_loss = reduction.aggregate(pg_loss, loss_mask)
 
     clip_mask = (ratio_clipped != ratio).logical_and(loss_mask)
     stat = dict(

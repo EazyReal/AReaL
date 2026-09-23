@@ -1874,8 +1874,8 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Policy-gradient loss reduction. "
             "'token_mean': average over valid tokens. "
             "'seq_mean': average per-response token means. "
-            "'prompt_mean': average per-prompt-group token means; each prompt "
-            "group stays in one optimizer step and may span microbatches. "
+            "'prompt_mean': average per-prompt-group token means while preserving "
+            "the response-level optimizer schedule; groups may span steps. "
             "'constant': sum of masked token losses divided by "
             "(n_active_responses * loss_aggregation_divisor). Tree-packed actor "
             "training currently supports only 'token_mean'.",

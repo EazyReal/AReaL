@@ -83,20 +83,24 @@ All configurations are defined in `areal/api/cli_args.py` under `PPOActorConfig`
 `prompt_mean` averages per-prompt token means, and `constant` divides the token-loss
 sum by the active response count times `actor.loss_aggregation_divisor`.
 
-For `prompt_mean`, each physical prompt group stays in one optimizer step, but
-its responses may span engine microbatches. Before splitting, the actor assigns
-weight $1/D_g$ to every original valid token in group $g$, where $D_g$ is that
-group's valid-token count. These token weights follow slicing and packing. Each
-microbatch returns its weighted loss divided by its token-weight sum, and the
-engine uses the same sum to combine microbatches across gradient accumulation and
-data-parallel ranks. Empty groups contribute zero weight. Later loss filtering
-changes the numerator while retaining these original denominator weights.
+`prompt_mean` uses the same response-level optimizer schedule as the other
+modes. A physical prompt group can span optimizer steps and engine microbatches.
+Before splitting, loss preparation assigns weight $1/D_g$ to every original
+valid token in group $g$, where $D_g$ is the full group's valid-token count.
+These weights follow slicing and packing; later loss filtering changes only the
+numerator.
 
-The outer PPO schedule adapts to the available prompt groups on each rank and uses
-transport-only microbatches where needed. With the default packing granularity of
-one, `max_tokens_per_mb` needs to fit individual responses. Larger granularity
-values still bundle adjacent responses, but packing is independent of prompt-group
-boundaries.
+For $G$ nonempty groups across data-parallel ranks and $K$ actual optimizer steps,
+each step's objective is $K/G$ times its weighted token-loss sum. At fixed
+parameters and masks, averaging these step objectives recovers the full-batch
+prompt mean, including its gradient. This does not imply identical optimizer
+trajectories for different schedules.
+
+Empty groups contribute zero. A real step with no valid tokens retains its place
+in the schedule and contributes zero policy-gradient loss; an update with no
+valid tokens on any rank is rejected. Transport-only microbatches have zero
+accumulation weight. With the default packing granularity of one,
+`max_tokens_per_mb` only needs to fit individual responses.
 
 ### Reward and Advantage Normalization (`actor.reward_norm` and `actor.adv_norm`)
 
