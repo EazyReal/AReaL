@@ -396,7 +396,7 @@ class MegatronCheckpointManager:
             # megatron-core v0.14+ removed flattened_range support (Megatron-LM
             # PR #2126), but the sharded_state_dict default
             # (fully_sharded_model_space) still emits it, so saving optimizer
-            # state fails on the pinned 0.17.0. dp_reshardable is upstream's
+            # state fails on the pinned 0.19.0. dp_reshardable is upstream's
             # current default. Trade-off: the optimizer state (not the model
             # weights) becomes reshardable only along DP -- load hard-asserts
             # the same bucket layout (per_bucket_numel_unpadded), so save and
@@ -504,6 +504,11 @@ class MegatronCheckpointManager:
             )
             optimizer_state_dict = state_dict["optimizer"]
             self.optimizer.load_state_dict(optimizer_state_dict)
+            from areal.engine.megatron_utils.hybrid_optimizer import (
+                sync_loaded_hybrid_optimizer_state,
+            )
+
+            sync_loaded_hybrid_optimizer_state(self.optimizer)
             log_with_rank(
                 f"Loaded optimizer checkpoint from {local_path}",
                 rank=self.rank,

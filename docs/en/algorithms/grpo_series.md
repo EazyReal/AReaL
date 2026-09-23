@@ -94,7 +94,10 @@ For $G$ nonempty groups across data-parallel ranks and $K$ actual optimizer step
 each step's objective is $K/G$ times its weighted token-loss sum. At fixed
 parameters and masks, averaging these step objectives recovers the full-batch
 prompt mean, including its gradient. This does not imply identical optimizer
-trajectories for different schedules.
+trajectories for different schedules. Accumulation and objective metrics use each
+microbatch's response share within its step, so steps contribute equally to the
+reported average. Megatron's per-token path retains original token counts for
+auxiliary-gradient normalization and compensates the main objective separately.
 
 Empty groups contribute zero. A real step with no valid tokens retains its place
 in the schedule and contributes zero policy-gradient loss; an update with no

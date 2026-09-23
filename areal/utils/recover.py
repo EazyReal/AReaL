@@ -25,6 +25,7 @@ from areal.api import (
 )
 from areal.api.cli_args import RecoverConfig
 from areal.infra import TrainController
+from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import checkpoint_pointer, logging, timeutil
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -253,16 +254,20 @@ class RecoverHandler:
         if not callable(getattr(inference_engine, "pause_generation_sync", None)):
             missing.append("pause_generation_sync()")
 
-        offload = getattr(inference_engine, "offload", None)
-        if not callable(offload):
-            missing.append("offload(tags=...)")
-        else:
+        for method in ("abort_all_requests", "continue_generation"):
+            if not callable(getattr(inference_engine, method, None)):
+                missing.append(f"{method}()")
+        for method in ("offload", "onload"):
+            function = getattr(inference_engine, method, None)
+            if not callable(function):
+                missing.append(f"{method}(tags=...)")
+                continue
             try:
-                accepts_tags = "tags" in inspect.signature(offload).parameters
+                accepts_tags = "tags" in inspect.signature(function).parameters
             except (TypeError, ValueError):
                 accepts_tags = True
             if not accepts_tags:
-                missing.append("offload(tags=...)")
+                missing.append(f"{method}(tags=...)")
 
         if missing:
             raise NotImplementedError(
@@ -460,6 +465,7 @@ class RecoverHandler:
             )
             return None
         logger.info(f"Loading recover info from {source.manifest}")
+        colocate_restore_started = False
         try:
             recover_info: RecoverInfo = RecoverInfo.load(source.manifest)
             logger.info(
@@ -500,6 +506,8 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
+                colocate_restore_started = is_awex_colocate
+                can_resume_inference = not is_awex_colocate
                 try:
                     # AWEX colocate transfer requires the full engine-level
                     # pause/offload protocol, not just the controller pause. The
@@ -510,12 +518,12 @@ class RecoverHandler:
                     # Without this the recover-path transfer deadlocks: reader
                     # never consumes the queued version marker, writer blocks on
                     # weights_update_finished forever.
-                    # Mirror of the trainer's pre-update sequence; the reverse
-                    # side (kv_cache onload) happens inside update_weights.
+                    # Restore rollout after every actor worker has returned.
                     if is_awex_colocate:
                         inference_engine.pause_generation_sync()
                         inference_engine.offload(tags=["kv_cache"])
                         inference_engine.offload(tags=["weights"])
+                        inference_engine.offload(tags=["cuda_graph"])
                         # Load the actor checkpoint only after the colocated
                         # rollout engine has released its GPU memory; loading
                         # first would stack DCP weights/optimizer on top of the
@@ -525,18 +533,27 @@ class RecoverHandler:
                                 engine_, path=source.payloads[name], name=name
                             )
                     update_engine.update_weights(versioned_meta)
+                    update_engine.set_version(recovery_version)
+                    inference_engine.set_version(recovery_version)
+                    if is_awex_colocate:
+                        inference_engine.abort_all_requests()
+                        inference_engine.onload(tags=["cuda_graph"])
+                        inference_engine.onload(tags=["kv_cache"])
+                        call_maybe_async(inference_engine.continue_generation)
+                        can_resume_inference = True
                 finally:
-                    # Always resume: leaving rollout paused after a failed
-                    # checkpoint load or transfer would hang every later step.
-                    inference_engine.resume()
-                update_engine.set_version(recovery_version)
-                inference_engine.set_version(recovery_version)
+                    # Do not admit work to partially restored colocated workers.
+                    if can_resume_inference:
+                        inference_engine.resume()
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo) as e:
             if source.transactional:
                 raise checkpoint_pointer.CheckpointConsistencyError(
                     f"Published checkpoint {source.label} is not loadable: {e}"
                 ) from e
+            if colocate_restore_started:
+                # A failed restore must not fall back to training while paused.
+                raise
             logger.warning(
                 f"Resume info not found at {source.manifest}. "
                 f"This should not be a resumed experiment!"
